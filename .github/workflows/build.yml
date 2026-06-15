@@ -1,0 +1,172 @@
+name: build
+
+# Compile-verification CI for the GoldenEye game project.
+#
+# The final `ge` binary CANNOT be built in public CI: it requires generated PPC
+# code that `rexglue codegen` produces from YOUR legally-owned GoldenEye 007 XEX
+# (see README). What CI *can* do — and does here — is verify that the hand-written
+# game sources still compile against the ReXGlue SDK headers on every target
+# platform (Linux, Windows, Android), catching cross-platform breakage early.
+#
+# ge_hooks.cpp and main.cpp are intentionally excluded: they include the
+# generated ge_init.h (PPCContext + recompiled function decls) which only exists
+# after codegen. They are validated in a full local build instead.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # SDK provides the rex/* headers the game compiles against.
+  SDK_REPO: jeffory/GoldenEye-Recomp-rexglue
+  # Game translation units that depend only on SDK headers (no generated code).
+  VERIFY_SOURCES: src/ge_menu.cpp src/ge_postfx.cpp src/ge_username.cpp
+
+jobs:
+  linux-amd64:
+    name: Linux AMD64 (compile-verify)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: game
+
+      - name: Check out ReXGlue SDK (headers)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SDK_REPO }}
+          path: sdk
+
+      - name: Init SDK header submodules
+        run: |
+          git -C sdk submodule update --init --depth 1 \
+            thirdparty/imgui thirdparty/fmt thirdparty/spdlog thirdparty/tomlplusplus
+
+      - name: Install Clang
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
+
+      - name: Compile-verify game sources
+        working-directory: game
+        run: |
+          for f in $VERIFY_SOURCES; do
+            echo "::group::syntax-check $f"
+            clang++ -std=c++23 -fsyntax-only -fno-char8_t \
+              -I src \
+              -I ../sdk/include \
+              -I ../sdk/thirdparty/imgui \
+              -I ../sdk/thirdparty/fmt/include \
+              -I ../sdk/thirdparty/spdlog/include \
+              -I ../sdk/thirdparty/tomlplusplus/include \
+              "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Note on the final binary
+        if: always()
+        run: |
+          {
+            echo "### Linux compile-verify"
+            echo "Verified SDK-only sources: \`$VERIFY_SOURCES\`."
+            echo ""
+            echo "_ge_hooks.cpp / main.cpp need generated PPC code; the final \`ge\` binary requires your own GoldenEye 007 XEX + \`rexglue codegen\` and is not produced in CI._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows-amd64:
+    name: Windows AMD64 (compile-verify)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: game
+
+      - name: Check out ReXGlue SDK (headers)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SDK_REPO }}
+          path: sdk
+
+      - name: Init SDK header submodules
+        run: >
+          git -C sdk submodule update --init --depth 1
+          thirdparty/imgui thirdparty/fmt thirdparty/spdlog thirdparty/tomlplusplus
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Add LLVM to PATH
+        shell: pwsh
+        run: |
+          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "C:\Program Files\LLVM\bin\clang++.exe" --version
+
+      - name: Compile-verify game sources
+        shell: pwsh
+        working-directory: game
+        run: |
+          foreach ($f in "src/ge_menu.cpp","src/ge_postfx.cpp","src/ge_username.cpp") {
+            Write-Host "syntax-check $f"
+            clang++ -std=c++23 -fsyntax-only -fno-char8_t `
+              -I src `
+              -I ../sdk/include `
+              -I ../sdk/thirdparty/imgui `
+              -I ../sdk/thirdparty/fmt/include `
+              -I ../sdk/thirdparty/spdlog/include `
+              -I ../sdk/thirdparty/tomlplusplus/include `
+              $f
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  android-arm64:
+    name: Android arm64-v8a (compile-verify)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: game
+
+      - name: Check out ReXGlue SDK (headers)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SDK_REPO }}
+          path: sdk
+
+      - name: Init SDK header submodules
+        run: |
+          git -C sdk submodule update --init --depth 1 \
+            thirdparty/imgui thirdparty/fmt thirdparty/spdlog thirdparty/tomlplusplus
+
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          local-cache: true
+
+      - name: Compile-verify game sources (NDK clang, arm64-v8a)
+        working-directory: game
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++"
+          "$CXX" --version
+          for f in $VERIFY_SOURCES; do
+            echo "::group::syntax-check $f"
+            "$CXX" -std=c++23 -fsyntax-only -fno-char8_t \
+              -I src \
+              -I ../sdk/include \
+              -I ../sdk/thirdparty/imgui \
+              -I ../sdk/thirdparty/fmt/include \
+              -I ../sdk/thirdparty/spdlog/include \
+              -I ../sdk/thirdparty/tomlplusplus/include \
+              "$f"
+            echo "::endgroup::"
+          done
