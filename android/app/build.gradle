@@ -1,0 +1,54 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.sunjaycy.goldeneye'
+    compileSdk 34
+    ndkVersion '27.1.12297006'
+
+    defaultConfig {
+        applicationId 'com.sunjaycy.goldeneye'
+        minSdk 29          // Vulkan-capable baseline (matches ANDROID_PLATFORM)
+        targetSdk 34
+        versionCode 1
+        versionName '0.1'
+
+        ndk {
+            abiFilters 'arm64-v8a'   // 64-bit only: the guest needs a 4 GiB address space
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DREXSDK_DIR=${file(rootProject.findProperty('rexSdkDir') ?: '../../GoldenEye-Recomp-rexglue').absolutePath}",
+                          '-DCMAKE_BUILD_TYPE=RelWithDebInfo'
+                // C++23; libc++ jthread/stop_token need the experimental library.
+                cppFlags '-std=c++23', '-fexperimental-library'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            // The wrapper's CMakeLists builds target `ge` as a SHARED lib on Android.
+            // NOTE: `generated/` must exist first - run `rexglue codegen` against your
+            // own GoldenEye XEX before building (see android/README.md).
+            path '../../CMakeLists.txt'
+            version '3.25.0+'
+        }
+    }
+
+    // The CMake build emits libge.so + librexruntime.so into its own out/ dir;
+    // AGP picks up the target `ge` and its shared-lib dependencies automatically.
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  GoldenEye 007 - Android NativeActivity shell.
+
+  NativeActivity loads the native library named by android.app.lib_name ("ge" ->
+  libge.so), which exports ANativeActivity_onCreate (from android_native_app_glue,
+  linked in by the SDK's rexglue_setup_target) and runs android_main
+  (windowed_app_main_android.cpp).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.sunjaycy.goldeneye">
+
+    <!-- Vulkan is the render backend on Android; GLES 3 is pulled in by SDL3. -->
+    <uses-feature android:name="android.hardware.vulkan.version"
+        android:version="0x00400000" android:required="true" />
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+    <!-- Controllers are the intended input; optional so the app still installs. -->
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:label="GoldenEye 007"
+        android:debuggable="true"
+        android:extractNativeLibs="true"
+        android:resizeableActivity="false"
+        android:hasCode="true">
+
+        <activity
+            android:name="com.sunjaycy.goldeneye.GoldenEyeActivity"
+            android:exported="true"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|density|navigation|uiMode|smallestScreenSize"
+            android:launchMode="singleTask"
+            android:resizeableActivity="false"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+
+            <meta-data android:name="android.app.lib_name" android:value="ge" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
