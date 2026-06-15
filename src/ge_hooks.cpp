@@ -22,6 +22,9 @@
 #include <rex/system/xthread.h>
 #include <rex/system/kernel_state.h>
 #include <cstdio>
+#include <string>
+
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -30,7 +33,7 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>  // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it)
-#include <string>
+#endif
 
 namespace ge {
 // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
@@ -38,6 +41,7 @@ namespace ge {
 // ge.toml (new username / server / online-enable) at boot, then the caller tears
 // the current process down. Launching a second instance of a running exe is fine
 // on Windows -- the image file is opened share-read.
+#if defined(_WIN32)
 void LaunchSelfDetached() {
   wchar_t exe_path[MAX_PATH];
   DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
@@ -51,7 +55,59 @@ void LaunchSelfDetached() {
   ShellExecuteW(nullptr, L"open", exe_path, nullptr,
                 workdir.empty() ? nullptr : workdir.c_str(), SW_SHOWNORMAL);
 }
+#else
+// Non-Windows (incl. Android): no in-process relaunch. "Save & Restart" still
+// writes the new config; the player relaunches the app manually. An Android
+// auto-restart would require an Activity recreate via JNI - out of scope here.
+void LaunchSelfDetached() {}
+#endif
 }  // namespace ge
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+namespace {
+// Returns a pointer p <= end <= p+want such that [p, end) is safely readable,
+// or p (empty) if p itself is not. Lets the freeze watchdog walk the guest stack
+// without faulting on uncommitted / guard pages. Windows uses VirtualQuery;
+// POSIX (incl. Android) probes readability by write()ing each page to /dev/null,
+// which returns EFAULT for an unreadable address instead of faulting.
+const uint8_t* ge_readable_end(const uint8_t* p, size_t want) {
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION mbi;
+  if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT ||
+      (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                      PAGE_EXECUTE_READWRITE)) == 0) {
+    return p;
+  }
+  const uint8_t* rend = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+  const uint8_t* send = p + want;
+  return send <= rend ? send : rend;
+#else
+  static int null_fd = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+  if (null_fd < 0) {
+    return p;
+  }
+  constexpr uintptr_t kPage = 4096;
+  const uint8_t* end = p + want;
+  const uint8_t* readable_to = p;
+  for (const uint8_t* pg = reinterpret_cast<const uint8_t*>(
+           reinterpret_cast<uintptr_t>(p) & ~(kPage - 1));
+       pg < end; pg += kPage) {
+    if (::write(null_fd, pg, 1) != 1) {
+      break;  // EFAULT: page not readable
+    }
+    readable_to = pg + kPage;
+  }
+  if (readable_to <= p) {
+    return p;
+  }
+  return readable_to < end ? readable_to : end;
+#endif
+}
+}  // namespace
 
 // Probe to read CommandProcessor's protected ring read pointer (legal: a
 // derived class may touch protected base members; we only reinterpret an
@@ -245,14 +301,8 @@ void ge_watchdog_thread() {
               uint32_t sp = c->r1.u32;
               if (sp >= 0x10000u && sp < 0xC0000000u) {
                 uint8_t* hsp = base + sp;
-                MEMORY_BASIC_INFORMATION mbi;
-                if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-                    mbi.State == MEM_COMMIT &&
-                    (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) {
-                  uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-                  uint8_t* send = hsp + 0x2400u;
-                  if (send > rend) send = rend;  // never read past the committed page
+                const uint8_t* send = ge_readable_end(hsp, 0x2400u);
+                if (send > hsp) {
                   char sbuf[500];
                   int soff = 0;
                   sbuf[0] = 0;
@@ -338,12 +388,8 @@ void ge_watchdog_thread() {
                   int fo = std::snprintf(fb, sizeof(fb), "lr=%x | ", pc);
                   if (sp >= 0x10000u && sp < 0xC0000000u) {
                     uint8_t* hsp = base + sp;
-                    MEMORY_BASIC_INFORMATION mbi;
-                    if (VirtualQuery(hsp, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-                        mbi.State == MEM_COMMIT) {
-                      uint8_t* rend = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-                      uint8_t* send = hsp + 0x2800u;
-                      if (send > rend) send = rend;
+                    const uint8_t* send = ge_readable_end(hsp, 0x2800u);
+                    if (send > hsp) {
                       for (uint8_t* pp = hsp; pp + 4 <= send && fo < 580; pp += 4) {
                         uint32_t v;
                         std::memcpy(&v, pp, 4);
