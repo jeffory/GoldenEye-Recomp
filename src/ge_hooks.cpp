@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
+#include <rex/cvar.h>  // REXCVAR_DEFINE_BOOL / REXCVAR_GET (ge_freeze_diag)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
 #include <rex/runtime.h>
 #include <rex/system/xmemory.h>
@@ -34,6 +35,25 @@
 #include <windows.h>
 #include <shellapi.h>  // ShellExecuteW (WIN32_LEAN_AND_MEAN excludes it)
 #endif
+
+// Freeze watchdog + per-stall pipeline diagnostics. These were always-on while
+// the frame-pacing freeze was being diagnosed: a 250ms-polling watchdog thread
+// that, on a stall, walks every guest thread's stack (probing page readability
+// via /dev/null on POSIX) and emits heavy logs, plus a per-present heartbeat.
+// They cost CPU every frame and have no place in a shipping build, so they are
+// gated behind this debug cvar (default OFF). Flip it on to investigate a stall.
+REXCVAR_DEFINE_BOOL(ge_freeze_diag, false, "GPU",
+                    "GoldenEye: enable the freeze watchdog + per-stall pipeline diagnostics "
+                    "(heavy logging + guest-thread stack walks; OFF in shipping builds)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// CP-progress handshake, defined in the rexglue base repo's command_processor.cpp.
+// rex_ge_cp_progress_seq() snapshots a counter the CP worker bumps on every ring
+// drain; rex_ge_cp_wait_progress() blocks until that counter moves past the
+// snapshot (real CP progress) or the bounded timeout elapses -- replacing the
+// old std::this_thread::yield() busy-spin on the GPU-completion path.
+extern "C" uint64_t rex_ge_cp_progress_seq();
+extern "C" void rex_ge_cp_wait_progress(uint64_t last_seq, uint32_t timeout_us);
 
 namespace ge {
 // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
@@ -421,6 +441,7 @@ void ge_watchdog_thread() {
 }
 
 inline void ge_start_watchdog_once() {
+  if (!REXCVAR_GET(ge_freeze_diag)) return;  // diagnostics off in shipping builds
   static std::atomic<bool> started{false};
   bool expected = false;
   if (started.compare_exchange_strong(expected, true)) {
@@ -459,6 +480,9 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   g_ge_idblk.store(idblk, std::memory_order_relaxed);
   g_dbgnow_calls.fetch_add(1, std::memory_order_relaxed);
   ge_start_watchdog_once();
+  // Snapshot the CP progress counter BEFORE sampling CP state below, so a drain
+  // that lands between our sample and our wait is not lost (the wait re-checks).
+  uint64_t cp_seq = rex_ge_cp_progress_seq();
   auto* cpp = ge_cp();
   uint32_t cpc = cpp ? cpp->counter() : 0;
   uint32_t rpi = cpp ? static_cast<CPProbe*>(cpp)->rpi() : 0;
@@ -515,14 +539,17 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
       drawn = true;
       if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
     }
-    // The six GPU-completion waits poll this routine in a TIGHT busy spin. With
-    // dozens of guest threads that oversubscribes the cores and starves the
-    // rexglue CP worker thread -- which is the very thread that must advance the
-    // ring read pointer / swap counter to satisfy (a)/(b). Result: the fence
-    // never advances, the spin never exits = freeze (visual stops, audio thread
-    // keeps running on its own core). Yield here while still waiting so the CP
-    // worker reliably gets CPU and can finish the frame.
-    if (!drawn) std::this_thread::yield();
+    // The six GPU-completion waits poll this routine. The old code yielded in a
+    // TIGHT busy spin here -- with dozens of guest threads that oversubscribed
+    // the cores and starved the rexglue CP worker (the very thread that must
+    // advance the ring read pointer / swap counter to satisfy (a)/(b)), so the
+    // fence never advanced and the spin never exited = freeze, worst on low-core
+    // arm64 handhelds. Instead, BLOCK on real CP progress: the CP worker signals
+    // every drain (it bumps the seq behind rex_ge_cp_progress_seq), waking us the
+    // instant it advances.
+    // The bounded timeout is just a safety net so the ~80ms skip-bit fallback
+    // above still runs if the CP genuinely makes no progress. No core burned.
+    if (!drawn) rex_ge_cp_wait_progress(cp_seq, 2000u);  // <=2ms, woken on progress
   } else {
     s_waiting = false;
   }
@@ -557,8 +584,8 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
   g_present_tb.store((uint32_t)REX_QUERY_TIMEBASE(), std::memory_order_relaxed);
 
-  static uint32_t n = 0;                       // throttled fps heartbeat
-  if ((n++ & 0x3F) == 0)
+  static uint32_t n = 0;                       // throttled fps heartbeat (diag only)
+  if ((n++ & 0x3F) == 0 && REXCVAR_GET(ge_freeze_diag))
     REXKRNL_INFO("GEGPU present#{} dev={:#x} cpcnt={}", n, a1, cpc);
 }
 
