@@ -56,33 +56,76 @@ joiners — only the host's server port has to be reachable.
 Most people should just use the [Releases](../../releases). To build it yourself
 you need the recompiler toolchain and your own copy of the game.
 
-**Prerequisites**
-- The [ReXGlue SDK](https://github.com/jeffory/GoldenEye-Recomp-rexglue) (provides the `rexglue` CLI + runtime).
-- CMake 3.25+, a C++23 **Clang** toolchain, Python 3.
-  - **Windows:** Clang inside a Visual Studio (MSVC) environment.
-  - **Linux:** Clang 18+ with **libc++** (`-stdlib=libc++`) — the SDK uses
-    `std::expected` / `std::jthread`.
-  - **Android:** the NDK (r27) — see [`android/README.md`](android/README.md).
-- Your own GoldenEye 007 XBLA game files, placed in `assets/`.
+### Common prerequisites (all platforms)
 
-**Steps — desktop (Windows / Linux)**
+- The [ReXGlue SDK](https://github.com/jeffory/GoldenEye-Recomp-rexglue) — a local
+  checkout that provides the `rexglue` CLI + runtime. The build points at it via
+  `-DREXSDK_DIR=/path/to/GoldenEye-Recomp-rexglue`.
+- **CMake 3.25+**, a **C++23 Clang** toolchain, and **Python 3** (used by codegen).
+- Your own **GoldenEye 007 XBLA game files**, placed in `assets/`.
+
+Every build starts with the same codegen step, run once from the repo root. It
+turns *your* game copy into recompiled C++ under `generated/`:
+
 ```sh
-# 1. Generate the recompiled game code from your copy (creates generated/).
 rexglue codegen --max_jump_table_entries 2048 ge_config.toml
-
-# 2. Configure for your platform, pointing at your local ReXGlue SDK checkout.
-#    Presets: win-amd64 / win-arm64 / linux-amd64 / linux-arm64,
-#    each in -debug / -release / -relwithdebinfo.
-cmake --preset linux-amd64-relwithdebinfo -DREXSDK_DIR=/path/to/GoldenEye-Recomp-rexglue
-
-# 3. Build.
-cmake --build --preset linux-amd64-relwithdebinfo
 ```
 
-**Android (arm64-v8a, experimental)** builds an APK with Gradle + the NDK, which
-drives this same CMake — see [`android/README.md`](android/README.md). On-device
+The desktop builds use [CMake presets](CMakePresets.json). Each platform/arch has
+`-debug`, `-release`, and `-relwithdebinfo` variants
+(`win-amd64`, `win-arm64`, `linux-amd64`, `linux-arm64`); swap the preset name in
+the commands below to pick a different target or build type.
+
+### Linux (x86-64)
+
+- **Clang 18+** with **libc++** (`-stdlib=libc++`) — the SDK uses `std::expected` /
+  `std::jthread`. The presets invoke plain `clang` / `clang++`; if your distro
+  only ships versioned binaries (e.g. `clang-20`), either symlink them or override
+  `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER`.
+- **Ninja** (the presets' generator).
+
+```sh
+# After running codegen above:
+cmake --preset linux-amd64-relwithdebinfo -DREXSDK_DIR=/path/to/GoldenEye-Recomp-rexglue
+cmake --build --preset linux-amd64-relwithdebinfo
+# Binary: out/build/linux-amd64-relwithdebinfo/ge  → run with ./ge
+```
+
+### Windows (x64)
+
+- **Clang** (LLVM, `clang` / `clang++`) inside a **Visual Studio (MSVC)**
+  environment — open an *x64 Native Tools* developer prompt so the MSVC headers
+  and libs are on `PATH`.
+- **Ninja** and **CMake** (both ship with the VS installer's CMake component).
+
+```bat
+:: After running codegen above, from the x64 Native Tools prompt:
+cmake --preset win-amd64-relwithdebinfo -DREXSDK_DIR=C:\path\to\GoldenEye-Recomp-rexglue
+cmake --build --preset win-amd64-relwithdebinfo
+:: Binary: out\build\win-amd64-relwithdebinfo\ge.exe
+```
+
+### Android (arm64-v8a, experimental)
+
+Builds an APK with Gradle + the NDK, which drives this same CMake. `arm64-v8a`
+only (the guest reserves a 4 GiB address space).
+
+- Android SDK + **NDK 27.1.12297006** (Vulkan-capable).
+- The ReXGlue SDK checkout, passed as `-PrexSdkDir` (default
+  `../../GoldenEye-Recomp-rexglue`).
+
+```sh
+# After running codegen above:
+cd android
+./gradlew assembleRelease -PrexSdkDir=/path/to/GoldenEye-Recomp-rexglue
+# APK: android/app/build/outputs/apk/release/
+```
+
+Install the (debug-signed) APK on a controller-equipped device. On-device
 game-asset delivery is still being wired up, and cold boot uses an auto-retry
-watchdog (background in [`docs/boot-startup-race.md`](docs/boot-startup-race.md)).
+watchdog. See [`android/README.md`](android/README.md) for how the
+NativeActivity / Vulkan-surface shell wires together, and
+[`docs/boot-startup-race.md`](docs/boot-startup-race.md) for the boot race.
 
 > [!NOTE]
 > **Continuous integration.** Every push is compile-verified on **Linux, Windows,
