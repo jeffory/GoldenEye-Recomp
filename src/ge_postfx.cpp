@@ -13,7 +13,9 @@
 
 #include <imgui.h>
 
+#include <cstring>
 #include <string>
+#include <vector>
 
 // --- Tunable cvars (category "PostFX"; persisted via the menu's Save) ---
 REXCVAR_DEFINE_BOOL(postfx_enabled, false, "PostFX", "Enable the post-processing filter");
@@ -149,11 +151,54 @@ void PostFxOverlay::OnDraw(ImGuiIO& io) {
   }
 
   // Scanlines (CRT): thin dark horizontal lines every few pixels.
+  // Geometry is built once per unique (W, H, colour, atlas-UV) combination and
+  // submitted as a single PrimReserve+memcpy instead of one AddRectFilled per
+  // line (~360 calls at 1080p, ~720 at 4K).
   const float scan = static_cast<float>(REXCVAR_GET(postfx_scanlines));
   if (scan > 0.001f) {
-    const ImU32 line = IM_COL32(0, 0, 0, a8(scan * 0.7f));
-    for (float y = 0.0f; y < H; y += 3.0f) {
-      dl->AddRectFilled(ImVec2(0, y), ImVec2(W, y + 1.0f), line);
+    const ImU32  col = IM_COL32(0, 0, 0, a8(scan * 0.7f));
+    const ImVec2 uv  = ImGui::GetDrawListSharedData()->TexUvWhitePixel;
+
+    static float                   s_W{}, s_H{};
+    static ImU32                   s_col{};
+    static ImVec2                  s_uv{-1.f, -1.f};
+    static std::vector<ImDrawVert> s_verts;
+    static std::vector<ImDrawIdx>  s_idxs;
+
+    if (W != s_W || H != s_H || col != s_col || uv.x != s_uv.x || uv.y != s_uv.y) {
+      s_verts.clear();
+      s_idxs.clear();
+      const int n = static_cast<int>(H / 3.f) + 1;
+      s_verts.reserve(static_cast<size_t>(n) * 4);
+      s_idxs.reserve(static_cast<size_t>(n) * 6);
+      ImDrawIdx vi = 0;
+      for (float y = 0.f; y < H; y += 3.f, vi = static_cast<ImDrawIdx>(vi + 4)) {
+        const float y1 = y + 1.f;
+        s_verts.push_back({{0.f, y }, uv, col});
+        s_verts.push_back({{W,   y }, uv, col});
+        s_verts.push_back({{W,   y1}, uv, col});
+        s_verts.push_back({{0.f, y1}, uv, col});
+        s_idxs.push_back(vi);
+        s_idxs.push_back(static_cast<ImDrawIdx>(vi + 1));
+        s_idxs.push_back(static_cast<ImDrawIdx>(vi + 2));
+        s_idxs.push_back(vi);
+        s_idxs.push_back(static_cast<ImDrawIdx>(vi + 2));
+        s_idxs.push_back(static_cast<ImDrawIdx>(vi + 3));
+      }
+      s_W = W; s_H = H; s_col = col; s_uv = uv;
+    }
+
+    const int nv = static_cast<int>(s_verts.size());
+    const int ni = static_cast<int>(s_idxs.size());
+    if (nv > 0) {
+      const auto base = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+      dl->PrimReserve(ni, nv);
+      memcpy(dl->_VtxWritePtr, s_verts.data(), static_cast<size_t>(nv) * sizeof(ImDrawVert));
+      for (int i = 0; i < ni; ++i)
+        dl->_IdxWritePtr[i] = static_cast<ImDrawIdx>(s_idxs[i] + base);
+      dl->_VtxWritePtr   += nv;
+      dl->_IdxWritePtr   += ni;
+      dl->_VtxCurrentIdx += static_cast<unsigned int>(nv);
     }
   }
 
