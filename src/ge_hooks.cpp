@@ -597,8 +597,13 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
   g_present_tb.store((uint32_t)REX_QUERY_TIMEBASE(), std::memory_order_relaxed);
 
-  static uint32_t n = 0;                       // throttled fps heartbeat (diag only)
-  if ((n++ & 0x3F) == 0 && REXCVAR_GET(ge_freeze_diag))
+  // Throttled present heartbeat. This is ALSO the boot-success signal the Android
+  // loader (GoldenEyeActivity.hasStartedPresenting) greps ge.log for ("present#N",
+  // N >= PRESENT_THRESHOLD); it must NOT be gated behind ge_freeze_diag (default
+  // off) or the loader never detects a live render loop and retries/spins forever
+  // even though the guest is presenting. One line per ~64 presents is negligible.
+  static uint32_t n = 0;
+  if ((n++ & 0x3F) == 0)
     REXKRNL_INFO("GEGPU present#{} dev={:#x} cpcnt={}", n, a1, cpc);
 }
 
