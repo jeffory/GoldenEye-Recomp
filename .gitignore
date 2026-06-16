@@ -43,3 +43,10 @@ Thumbs.db
 # --- Local tooling (not for distribution) ---
 /.codegraph/
 /.cursor/
+
+# --- Android build (Gradle/AGP/CMake outputs + machine-local config) ---
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
