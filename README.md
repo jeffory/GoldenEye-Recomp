@@ -4,7 +4,7 @@ Support me on Ko-fi: https://ko-fi.com/sunjayy
 
 A native PC port of **GoldenEye 007 (Xbox 360 / XBLA)**, built by *statically
 recompiling* the original game into C++ with the
-[ReXGlue SDK](https://github.com/SunJaycy/GoldenEye-Recomp-rexglue). No emulator —
+[ReXGlue SDK](https://github.com/jeffory/GoldenEye-Recomp-rexglue). No emulator —
 the game runs as a real native executable.
 
 > [!IMPORTANT]
@@ -14,7 +14,8 @@ the game runs as a real native executable.
 
 ## Features
 
-- Runs natively on Windows — no emulator, no BIOS.
+- Runs natively on **Windows** and **Linux** — no emulator, no BIOS — with an
+  experimental **Android** (arm64) build.
 - Controller support.
 - **Online multiplayer** — host or join matches over the internet (LAN, Hamachi,
   playit.gg, or a public server). See [Playing online](#playing-online).
@@ -33,8 +34,8 @@ the `.exe` (the release notes explain exactly what's needed). Run `ge.exe`.
 - 🎮 **Want to play online?** Someone needs to run a server. Download it here →
   **[GoldenEye-Recomp-Server](https://github.com/SunJaycy/GoldenEye-Recomp-Server)**
 - 🛠️ **Want to modify the engine / recompiler?** It's built on a modified ReXGlue
-  SDK →
-  **[GoldenEye-Recomp-rexglue](https://github.com/SunJaycy/GoldenEye-Recomp-rexglue)**
+  SDK (with the Linux + Android port) →
+  **[GoldenEye-Recomp-rexglue](https://github.com/jeffory/GoldenEye-Recomp-rexglue)**
 
 ## Playing online
 
@@ -54,21 +55,40 @@ Most people should just use the [Releases](../../releases). To build it yourself
 you need the recompiler toolchain and your own copy of the game.
 
 **Prerequisites**
-- The [ReXGlue SDK](https://github.com/SunJaycy/GoldenEye-Recomp-rexglue) (provides the `rexglue` CLI + runtime).
-- CMake 3.25+, a C++23 compiler (MSVC), Python 3.
+- The [ReXGlue SDK](https://github.com/jeffory/GoldenEye-Recomp-rexglue) (provides the `rexglue` CLI + runtime).
+- CMake 3.25+, a C++23 **Clang** toolchain, Python 3.
+  - **Windows:** Clang inside a Visual Studio (MSVC) environment.
+  - **Linux:** Clang 18+ with **libc++** (`-stdlib=libc++`) — the SDK uses
+    `std::expected` / `std::jthread`.
+  - **Android:** the NDK (r27) — see [`android/README.md`](android/README.md).
 - Your own GoldenEye 007 XBLA game files, placed in `assets/`.
 
-**Steps**
+**Steps — desktop (Windows / Linux)**
 ```sh
 # 1. Generate the recompiled game code from your copy (creates generated/).
 rexglue codegen --max_jump_table_entries 2048 ge_config.toml
 
-# 2. Configure, pointing at your local ReXGlue SDK checkout.
-cmake --preset win-amd64-relwithdebinfo -DREXSDK_DIR=/path/to/GoldenEye-Recomp-rexglue
+# 2. Configure for your platform, pointing at your local ReXGlue SDK checkout.
+#    Presets: win-amd64 / win-arm64 / linux-amd64 / linux-arm64,
+#    each in -debug / -release / -relwithdebinfo.
+cmake --preset linux-amd64-relwithdebinfo -DREXSDK_DIR=/path/to/GoldenEye-Recomp-rexglue
 
 # 3. Build.
-cmake --build --preset win-amd64-relwithdebinfo
+cmake --build --preset linux-amd64-relwithdebinfo
 ```
+
+**Android (arm64-v8a, experimental)** builds an APK with Gradle + the NDK, which
+drives this same CMake — see [`android/README.md`](android/README.md). On-device
+game-asset delivery is still being wired up, and cold boot uses an auto-retry
+watchdog (background in [`docs/boot-startup-race.md`](docs/boot-startup-race.md)).
+
+> [!NOTE]
+> **Continuous integration.** Every push is compile-verified on **Linux, Windows,
+> and Android** via GitHub Actions
+> ([`.github/workflows/build.yml`](.github/workflows/build.yml)): it checks the
+> hand-written engine sources against the SDK headers on all three platforms. CI
+> can't produce the final `ge` binary — that needs generated PPC code from *your*
+> own game copy.
 
 source lives in [`src/`](src/):
 `ge_app` (app + window/menus glue), `ge_menu` (pause/settings menu),
