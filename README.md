@@ -28,9 +28,9 @@ the game runs as a real native executable.
 ## Download & Play
 
 Grab the latest prebuilt release from the **[Releases](../../releases)** page
-(a **Linux x86-64** build is attached; Windows/Android — see the release notes),
-then drop your own GoldenEye 007 game files into the `assets/` folder next to the
-binary. Run `ge.exe` on Windows or `./ge` on Linux.
+(**Windows x64** and **Linux x86-64** builds are attached; Android — see the
+release notes), then drop your own GoldenEye 007 game files into the `assets/`
+folder next to the binary. Run `ge.exe` on Windows or `./ge` on Linux.
 
 - 🎮 **Want to play online?** Someone needs to run a server. Download it here →
   **[GoldenEye-Recomp-Server](https://github.com/SunJaycy/GoldenEye-Recomp-Server)**
