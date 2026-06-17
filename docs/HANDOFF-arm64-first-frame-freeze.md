@@ -1,7 +1,24 @@
 # Handoff: arm64 (Android) first-frame freeze — GPU completion never delivered
 
+> **✅ RESOLVED 2026-06-17 — verified on the Ayn Thor (9/9 first-attempt cold boots, 30s soak @ ~60fps, 0 stalls).**
+> The fix is NOT "deliver the missing completion." The handoff's lead diagnosis below — *"completion
+> counter `idblk+0` stuck at 0"* — was a **misread**: `idblk+0` is the WAIT_REG_MEM CPU↔GPU semaphore
+> (0 = released), and the watchdog's `submit > completed` test trivially read "GPU BEHIND" against it.
+> The real cause was the **arm64 blocking wait `rex_ge_cp_wait_progress`** itself (exactly what the
+> desktop bisect `9dd0258` pinned): its ~2ms re-check cadence let `ge_dbg_now`'s 80ms skip-bit fallback
+> latch, skipping render forever. The blocking wait only existed to stop yield-spinning guest threads
+> starving the single CP worker on few-core handhelds — so the fix **boosts the CP worker to
+> kAboveNormal at creation** (`command_processor.cpp`, `creation_flags 0 → 0x20`, applied un-gated by the
+> `XThread::Create` priority path) and **unifies both arches on `std::this_thread::yield()`** (removed the
+> `#if __aarch64__` blocking-wait branch + dead `cp_seq` plumbing in `ge_dbg_now`). Cleanups: the watchdog
+> `completion=`/`completed=` diagnostic was relabeled `semaphore=`/`render=` (no longer infers "GPU
+> behind" from the semaphore); and the Android loader now gates on a freeze-proof `GEGPU rendered#N`
+> heartbeat (emitted only from the drawn branch, keyed on real frame advancement) instead of `present#`
+> (which advances even on a frozen boot). The detailed evidence/hypotheses below are kept for history;
+> treat the resolution above as authoritative.
+
 **Audience:** a fresh Claude session picking up *only* the arm64 GPU-completion freeze.
-**Status:** root cause localized, fix NOT done. The user chose "fix the arm64 GPU completion (root cause)".
+**Status:** ✅ FIXED & verified (see banner above). Original status when handed off: root cause localized, fix NOT done.
 **Date handed off:** 2026-06-17. Target device: **Ayn Thor handheld** (Adreno/Qualcomm, arm64-v8a, NDK 27.1).
 
 ---

@@ -47,14 +47,6 @@ REXCVAR_DEFINE_BOOL(ge_freeze_diag, false, "GPU",
                     "(heavy logging + guest-thread stack walks; OFF in shipping builds)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-// CP-progress handshake, defined in the rexglue base repo's command_processor.cpp.
-// rex_ge_cp_progress_seq() snapshots a counter the CP worker bumps on every ring
-// drain; rex_ge_cp_wait_progress() blocks until that counter moves past the
-// snapshot (real CP progress) or the bounded timeout elapses -- replacing the
-// old std::this_thread::yield() busy-spin on the GPU-completion path.
-extern "C" uint64_t rex_ge_cp_progress_seq();
-extern "C" void rex_ge_cp_wait_progress(uint64_t last_seq, uint32_t timeout_us);
-
 namespace ge {
 // Relaunch this same executable as a fresh, detached process. Used by the ONLINE
 // pause-menu tab's "Save & Restart": the new instance reads the just-written
@@ -239,17 +231,24 @@ void ge_watchdog_thread() {
         logged = true;
         uint32_t presented = dev ? LD32(base, dev + 16552) : 0;
         uint32_t target = dev ? LD32(base, dev + 10908) : 0;
-        uint32_t completed = idblk ? LD32(base, idblk + 0) : 0;
+        // idblk+0 is the WAIT_REG_MEM CPU<->GPU semaphore (the render writes 0 to
+        // RELEASE the CP), NOT a completion counter -- so a value of 0 is the
+        // normal released state. Report it as "semaphore=" and never infer "GPU
+        // behind" from it (the old "submit > completed" test compared a frame
+        // count against this semaphore and so trivially read "GPU BEHIND").
+        uint32_t semaphore = idblk ? LD32(base, idblk + 0) : 0;
         uint32_t skip = dev ? (base[dev + 10941] & 2) : 0;
         REXKRNL_INFO(
             "GEWATCHDOG STALL: ring rpi={:#x} wpi={:#x} [{}] | present#={} (+{}/stall) | "
-            "dbgnow_polls={} (+{}/stall) | submit={} completed={} target={} presented={} skipbit={} "
-            "| dev={:#x} idblk={:#x}",
+            "dbgnow_polls={} (+{}/stall) | submit={} presented={} target={} semaphore(idblk+0)={} "
+            "skipbit={} | dev={:#x} idblk={:#x}",
             rpi, wpi, (rpi == wpi ? "DRAINED" : "PENDING"), present, present - present_at_stall_start,
-            dbg, dbg - dbg_at_stall_start, submit, completed, target, presented, skip, dev, idblk);
+            dbg, dbg - dbg_at_stall_start, submit, presented, target, semaphore, skip, dev, idblk);
         REXKRNL_INFO(
-            "GEWATCHDOG -> completion={} | presenting={} | producer={} | polling={}",
-            (submit > completed ? "GPU BEHIND (completion not delivered)" : "caught up"),
+            "GEWATCHDOG -> render={} | presenting={} | producer={} | polling={}",
+            // The real freeze mechanism: the guest latched the skip bit and is
+            // bypassing the GPU-completion wait, so render is skipped every frame.
+            (skip ? "SKIP-BIT LATCHED (render skipped every frame)" : "skip-bit clear"),
             (submit > presented ? "frames NOT presenting" : "caught up"),
             (submit != submit_at_stall_start ? "ALIVE (submitting)" : "STALLED (not submitting)"),
             (dbg != dbg_at_stall_start ? "guest spinning in sub_82198C28" : "guest NOT polling"));
@@ -480,10 +479,6 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   g_ge_idblk.store(idblk, std::memory_order_relaxed);
   g_dbgnow_calls.fetch_add(1, std::memory_order_relaxed);
   ge_start_watchdog_once();
-  // Snapshot the CP progress counter BEFORE sampling CP state below, so a drain
-  // that lands between our sample and our wait is not lost (the wait re-checks).
-  // Only consumed by the arm64 blocking-wait path below; unused on desktop.
-  [[maybe_unused]] uint64_t cp_seq = rex_ge_cp_progress_seq();
   auto* cpp = ge_cp();
   uint32_t cpc = cpp ? cpp->counter() : 0;
   uint32_t rpi = cpp ? static_cast<CPProbe*>(cpp)->rpi() : 0;
@@ -540,28 +535,24 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
       drawn = true;
       if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
     }
-    // The six GPU-completion waits poll this routine. How we wait here is
-    // arch-gated, because the right answer depends on core count:
+    // The six GPU-completion waits poll this routine. Yield the core back so the
+    // rexglue CP worker (the thread that advances the ring read pointer / swap
+    // counter to satisfy (a)/(b)) can run; we re-check (a)/(b) on the next poll.
     //
-    //  - arm64 handhelds (few cores): a TIGHT yield busy-spin oversubscribes the
-    //    cores and starves the rexglue CP worker (the very thread that must
-    //    advance the ring read pointer / swap counter to satisfy (a)/(b)), so the
-    //    fence never advances and the spin never exits = freeze. Instead BLOCK on
-    //    real CP progress: the CP worker bumps the seq behind rex_ge_cp_progress_seq
-    //    on every drain, waking us the instant it advances. Bounded timeout just
-    //    lets the ~80ms skip-bit fallback above still run. No core burned.
-    //
-    //  - desktop x86-64 (many cores): the CP worker always gets a core, so the
-    //    plain yield is correct AND the blocking wait actively regresses boot --
-    //    it froze GoldenEye on the very first intro screen (render skipped every
-    //    frame while the loop ran at 60fps). Confirmed by bisect: main (yield)
-    //    boots to the menu, the blocking-wait commit freezes. Keep the yield here.
+    // This is now unified across arches. It used to be arch-gated: arm64 blocked
+    // on rex_ge_cp_wait_progress because a tight yield busy-spin from dozens of
+    // guest threads oversubscribed the few handheld cores and starved the CP
+    // worker (the fence never advanced -> freeze). But the blocking wait
+    // re-checks only every ~2ms, so the ~80ms skip-bit fallback above latches and the game
+    // wedges (render skipped every frame) -- the SAME freeze the desktop bisect
+    // (commit 9dd0258) pinned on the blocking wait. The real fix is to stop the
+    // starvation at its source: the CP worker is now created at kAboveNormal
+    // priority (command_processor.cpp), so it stays scheduled even while guest
+    // threads yield-spin -- making the proven-good desktop yield path correct on
+    // arm64 too. Keep the yield; the rexglue handshake API stays defined as a
+    // cheap escape hatch if the priority boost ever proves insufficient.
     if (!drawn) {
-#if defined(__aarch64__)
-      rex_ge_cp_wait_progress(cp_seq, 2000u);  // <=2ms, woken on progress
-#else
       std::this_thread::yield();
-#endif
     }
   } else {
     s_waiting = false;
@@ -576,6 +567,26 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
     // >60ms deadlock-breaker log polling exactly this address.)
     ST32(base, dev + 16552, LD32(base, dev + 16544));   // presented := submit
     ST32(base, idblk + 60, rpi);                        // ring RPTR write-back
+
+    // Real-render heartbeat. This branch runs ONLY when the guest actually
+    // consumed a GPU completion (drawn) and advanced presented:=submit -- i.e. a
+    // frame really reached the screen. Unlike the "GEGPU present#" heartbeat (and
+    // the CP swap counter), which keep advancing on a FROZEN boot (VdSwap still
+    // fires, render skipped), this one stops the instant the game wedges. The
+    // Android boot loader (GoldenEyeActivity.hasStartedPresenting) greps for it so
+    // a frozen boot is detected and relaunched instead of mistaken for "live".
+    //
+    // Count REAL frames, not poll iterations: this branch runs thousands of times
+    // per frame (the guest polls the GPU wait in a tight loop), so gate on the
+    // submit counter (dev+16544) actually advancing, then log once per 64 frames.
+    uint32_t submit = LD32(base, dev + 16544);
+    static uint32_t s_last_submit = 0;  // heartbeat-only; a benign race just
+    static uint32_t rendered = 0;       // skips/dups a log line, never matters.
+    if (submit != s_last_submit) {
+      s_last_submit = submit;
+      if ((rendered++ & 0x3F) == 0)
+        REXKRNL_INFO("GEGPU rendered#{} dev={:#x} submit={}", rendered, dev, submit);
+    }
   }
 }
 
