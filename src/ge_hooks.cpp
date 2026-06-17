@@ -22,7 +22,13 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/system/xthread.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/keybinds.h>      // ParseVirtualKey (keyboard rebinding)
+#include <rex/ui/virtual_key.h>
+#include <rex/ui/window.h>        // mouse capture / cursor / warp (cross-platform)
+#include <rex/ui/window_listener.h>
+#include <rex/ui/ui_event.h>
 #include <cstdio>
+#include <mutex>
 #include <string>
 
 #if defined(_WIN32)
@@ -172,6 +178,16 @@ inline void ST32(uint8_t* b, uint32_t ga, uint32_t val) {
 inline void STF32(uint8_t* b, uint32_t ga, float f) {
   uint32_t v; std::memcpy(&v, &f, 4); v = __builtin_bswap32(v);
   std::memcpy(b + ga, &v, 4);
+}
+inline float LDF32(uint8_t* b, uint32_t ga) {
+  uint32_t v; std::memcpy(&v, b + ga, 4); v = __builtin_bswap32(v);
+  float f; std::memcpy(&f, &v, 4); return f;
+}
+inline uint16_t LD16(uint8_t* b, uint32_t ga) {
+  uint16_t v; std::memcpy(&v, b + ga, 2); return __builtin_bswap16(v);
+}
+inline void ST16(uint8_t* b, uint32_t ga, uint16_t val) {
+  uint16_t v = __builtin_bswap16(val); std::memcpy(b + ga, &v, 2);
 }
 }  // namespace
 
@@ -732,4 +748,401 @@ void ge_hook_830E0750(PPCRegister& r7, PPCRegister& r8, PPCRegister& r11,
   ST32(base, r11.u32 + 0x1ECu, t);
   r8.u32 = 0;
   ST32(base, r11.u32 + 0x200u, 0);
+}
+
+// ===========================================================================
+// Mouse-look (real 1:1 keyboard/mouse looking, replacing the stick-emulation
+// path). We inject raw mouse deltas straight into the guest's per-frame look
+// state inside ge_bondview_control (sub_820B99E8), so the mouse drives the same
+// heading/pitch the right stick does -- but without the analog deadzone/accel/
+// turn-rate cap that makes the built-in MnK stick emulation feel terrible.
+//
+// The look injection is platform-neutral (pure guest-memory writes). The input
+// SOURCE (relative mouse delta, key-down state, cursor capture) is supplied by
+// GameInputListener below, a cross-platform rex::ui::WindowInputListener built
+// on the Window abstraction (Win32 + GTK), replacing upstream's Win32-only raw
+// input thread.
+//
+// Mouse and controller both work AT ONCE (additive). While mouse-look is on we
+// capture the OS cursor (hidden + centered) during play, and release it whenever
+// the pause menu is open or the window loses focus.
+// ===========================================================================
+
+namespace {
+// Direct 1:1 look: mouse delta -> absolute yaw/pitch, written straight into the
+// camera state every frame (tune via sens).
+constexpr float kYawDegPerCount = 0.10f;       // guest yaw DEGREES per mouse count @ sens 1
+constexpr float kPitchPerCount = 0.10f;        // guest pitch (+612) units per mouse count @ sens 1
+constexpr float kPitchMin = -60.0f;
+constexpr float kPitchMax = 60.0f;
+constexpr uint32_t GE_BONDVIEW_CUR = 0x82F1FAACu; // dword_82F1FAAC -> current bondview struct
+constexpr uint32_t GE_CUTSCENE = 0x82F1F8DCu;     // gBondViewCutscene ptr; non-zero = cutscene/non-playable
+constexpr uint32_t GE_CAMERA_MODE = 0x82F1F920u;  // g_CameraMode. 1/2/3=intro fly-in, 4=FP playable
+constexpr uint32_t GE_CAM_FP = 4u;                // first-person playable mode (only state the player aims)
+constexpr uint32_t GE_BV_YAW = 596u;              // +596 facing yaw (degrees, HUD/radar copy)
+constexpr uint32_t GE_BV_PITCH = 612u;            // +612 pitch angle
+constexpr uint32_t GE_BV_CENTER_FLAG = 524u;      // +524 auto-center-this-frame flag
+// Camera yaw is built from the heading -- drive it + its smoother steady-state.
+constexpr uint32_t GE_YAW_HEADING = 0x82F1F900u;  // flt_82F1F900 heading (rad)
+constexpr uint32_t GE_YAW_SMOOTH = 0x82F1F904u;   // flt_82F1F904 smoothed (= heading*12.5)
+constexpr uint32_t GE_YAW_TARGET = 0x82F1F910u;   // flt_82F1F910 target heading (rad)
+constexpr uint32_t GE_YAW_OFFSET = 0x82F1F8F0u;   // flt_82F1F8F0 yaw offset added to heading
+constexpr float GE_TWO_PI = 6.2831855f;
+constexpr float GE_RAD2DEG = 57.29578f;
+}  // namespace
+
+namespace {
+float g_look_yaw_deg = 0.0f;  // our absolute yaw (deg, [0,360))
+float g_look_pitch = 0.0f;    // our absolute pitch (+612 units)
+uint32_t g_look_bv = 0;       // bondview struct we're tracking
+}  // namespace
+
+REXCVAR_DEFINE_DOUBLE(ge_mouse_sens, 1.0, "Input", "Mouse look sensitivity").range(0.05, 20.0);
+// Mouse-look on/off. ON: the mouse looks (added on top of the pad -- both work
+// at once, so you can put the controller down) and the cursor is captured during
+// play. OFF: no mouse-look, cursor free, controller only.
+REXCVAR_DEFINE_BOOL(ge_mouselook_enable, true, "Input",
+                    "Mouse look (works alongside the controller; captures the cursor in-game)");
+
+namespace {
+bool ge_mouselook_on() { return REXCVAR_GET(ge_mouselook_enable); }
+
+// Cross-platform mouse/keyboard source. Registered on the rexglue display
+// window, it accumulates relative mouse delta + a key-down table (read by the
+// guest mid-asm hooks) and owns the cursor-capture lifecycle through the Window
+// abstraction. Modeled on rexglue's MnkInputDriver, which uses the identical
+// Win32+GTK capture/warp/delta pattern. Listener callbacks fire on the UI
+// thread; the guest hooks read on guest threads, so shared state is guarded.
+class GameInputListener final : public rex::ui::WindowInputListener,
+                                public rex::ui::WindowListener {
+ public:
+  void Attach(rex::ui::Window* w) {
+    window_ = w;
+    if (window_) {
+      window_->AddInputListener(this, /*z_order=*/0);
+      window_->AddListener(this);
+    }
+  }
+
+  // Per-frame consumption by the look hook (reset-on-read).
+  int take_dx() { std::lock_guard<std::mutex> l(m_); int v = dx_; dx_ = 0; return v; }
+  int take_dy() { std::lock_guard<std::mutex> l(m_); int v = dy_; dy_ = 0; return v; }
+
+  bool key_down(rex::ui::VirtualKey vk) const {
+    uint16_t idx = static_cast<uint16_t>(vk);
+    if (idx >= 256) return false;
+    std::lock_guard<std::mutex> l(m_);
+    return key_down_[idx];
+  }
+
+  bool focused() const { return window_ && window_->HasFocus(); }
+  bool suppressed() const { return suppressed_.load(std::memory_order_relaxed); }
+
+  void set_suppressed(bool v) {
+    suppressed_.store(v, std::memory_order_relaxed);
+    if (v) { std::lock_guard<std::mutex> l(m_); dx_ = 0; dy_ = 0; }  // drop queued motion
+    tick_capture();  // release the cursor immediately when the menu opens
+  }
+
+  // Engage/release capture + recenter. Independent of the FP-mode gate (matches
+  // upstream): keeps the cursor hidden + pinned whenever look is on and focused.
+  void tick_capture() {
+    if (!window_) return;
+    std::lock_guard<std::mutex> cl(cap_m_);
+    const bool want = ge_mouselook_on() && !suppressed_.load(std::memory_order_relaxed) &&
+                      window_->HasFocus();
+    if (want && !captured_) {
+      captured_ = true;
+      window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+      window_->CaptureMouse();
+      std::lock_guard<std::mutex> l(m_);  // no spike on capture start
+      dx_ = 0; dy_ = 0; have_prev_ = false;
+    } else if (!want && captured_) {
+      captured_ = false;
+      window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+      window_->ReleaseMouse();
+    }
+    if (captured_) {
+      // Re-center each tick (prevents edge clamping). Seed prev to the center
+      // first so the warp's echoed OnMouseMove yields a zero delta.
+      const int cx = static_cast<int>(window_->GetActualLogicalWidth() / 2);
+      const int cy = static_cast<int>(window_->GetActualLogicalHeight() / 2);
+      { std::lock_guard<std::mutex> l(m_); prev_x_ = cx; prev_y_ = cy; have_prev_ = true; }
+      window_->WarpMouseToClient(cx, cy);
+    }
+  }
+
+  // WindowInputListener
+  void OnMouseMove(rex::ui::MouseEvent& e) override {
+    std::lock_guard<std::mutex> l(m_);
+    const int x = e.x(), y = e.y();
+    if (have_prev_) { dx_ += x - prev_x_; dy_ += y - prev_y_; }
+    prev_x_ = x; prev_y_ = y; have_prev_ = true;
+  }
+  void OnMouseDown(rex::ui::MouseEvent& e) override { set_mouse_button(e.button(), true); }
+  void OnMouseUp(rex::ui::MouseEvent& e) override { set_mouse_button(e.button(), false); }
+  void OnKeyDown(rex::ui::KeyEvent& e) override { set_key(e.virtual_key(), true); }
+  void OnKeyUp(rex::ui::KeyEvent& e) override { set_key(e.virtual_key(), false); }
+
+  // WindowListener: drop held keys / queued motion on focus loss (no stuck keys
+  // or view snap on alt-tab). Capture itself auto-releases via tick_capture.
+  void OnLostFocus(rex::ui::UISetupEvent&) override {
+    std::lock_guard<std::mutex> l(m_);
+    std::memset(key_down_, 0, sizeof(key_down_));
+    dx_ = 0; dy_ = 0; have_prev_ = false;
+  }
+
+ private:
+  void set_key(rex::ui::VirtualKey vk, bool down) {
+    uint16_t idx = static_cast<uint16_t>(vk);
+    if (idx >= 256) return;
+    std::lock_guard<std::mutex> l(m_);
+    key_down_[idx] = down;
+  }
+  void set_mouse_button(rex::ui::MouseEvent::Button b, bool down) {
+    using B = rex::ui::MouseEvent::Button;
+    rex::ui::VirtualKey vk = rex::ui::VirtualKey::kNone;
+    switch (b) {
+      case B::kLeft: vk = rex::ui::VirtualKey::kLButton; break;
+      case B::kRight: vk = rex::ui::VirtualKey::kRButton; break;
+      case B::kMiddle: vk = rex::ui::VirtualKey::kMButton; break;
+      case B::kX1: vk = rex::ui::VirtualKey::kXButton1; break;
+      case B::kX2: vk = rex::ui::VirtualKey::kXButton2; break;
+      default: return;
+    }
+    set_key(vk, down);
+  }
+
+  mutable std::mutex m_;     // guards dx_/dy_/prev_*/have_prev_/key_down_
+  std::mutex cap_m_;         // serializes capture transitions (captured_)
+  rex::ui::Window* window_ = nullptr;
+  int dx_ = 0, dy_ = 0;
+  int prev_x_ = 0, prev_y_ = 0;
+  bool have_prev_ = false;
+  bool captured_ = false;
+  std::atomic<bool> suppressed_{false};  // true while the pause menu is open
+  bool key_down_[256] = {};
+};
+
+GameInputListener g_listener;
+std::atomic<bool> g_listener_attached{false};
+
+// Attach the listener to the display window the first time it exists (it may be
+// null at OnCreateDialogs time). Called from InitMouseLook and the per-frame
+// hooks, so attachment is robust regardless of startup ordering.
+void ge_ensure_listener() {
+  if (g_listener_attached.load(std::memory_order_relaxed)) return;
+  rex::Runtime* rt = rex::Runtime::instance();
+  rex::ui::Window* w = rt ? rt->display_window() : nullptr;
+  if (!w) return;
+  bool expected = false;
+  if (g_listener_attached.compare_exchange_strong(expected, true)) {
+    g_listener.Attach(w);
+    REXKRNL_INFO("GEMOUSE listener attached window={}", (void*)w);
+  }
+}
+
+int ge_take_mouse_dx() { return g_listener.take_dx(); }
+int ge_take_mouse_dy() { return g_listener.take_dy(); }
+}  // namespace
+
+namespace ge {
+// Attach the cross-platform mouse/keyboard listener at app startup (or lazily on
+// the first guest frame if the window isn't ready yet).
+void InitMouseLook() {
+  REXKRNL_INFO("GEMOUSE InitMouseLook (enable={})", REXCVAR_GET(ge_mouselook_enable));
+  ge_ensure_listener();
+}
+
+// Called by the app when the pause menu opens/closes so mouse motion isn't
+// turned into look while the player is in menus (the cursor is needed there).
+void SetMouselookSuppressed(bool v) { g_listener.set_suppressed(v); }
+}  // namespace ge
+
+// YAW: this stick-yaw write site only runs in control mode 2, which normal
+// gameplay does NOT use -- so mouse YAW is applied in ge_mouselook_pitch instead
+// (that site runs every frame). Kept only to confirm firing / lazily attach.
+void ge_mouselook_yaw(PPCRegister& /*r11*/) { ge_ensure_listener(); }
+
+// PITCH: runs every frame in ge_bondview_control (unconditional pitch site).
+// Keep our own absolute yaw/pitch from raw mouse deltas and write them straight
+// into the camera state: +596 (HUD yaw), +612 (pitch), and the heading
+// (flt_82F1F900/904/910) the view matrix is built from. Re-sync to the game's
+// values when the active view changes.
+void ge_mouselook_pitch(PPCRegister& /*r11*/) {
+  ge_ensure_listener();
+  g_listener.tick_capture();  // capture lifecycle (matches upstream: independent of FP gate)
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  uint32_t bv = LD32(base, GE_BONDVIEW_CUR);
+  if (!bv) return;
+
+  // Suspend mouse-look whenever the player isn't in first-person control:
+  //   * g_CameraMode != FP  -> level-start intro fly-in (modes 1/2/3), swirl,
+  //     death cam, ending pose, fade-to-title, etc. (gameplay = 4).
+  //   * gBondViewCutscene   -> a scripted camera took over mid-level in FP mode.
+  // Clear g_look_bv so the view re-syncs to the game's angle when control returns
+  // (no snap) instead of fighting the scripted/intro camera.
+  if (!ge_mouselook_on() || LD32(base, GE_CAMERA_MODE) != GE_CAM_FP ||
+      LD32(base, GE_CUTSCENE) != 0) {
+    g_look_bv = 0;
+    return;
+  }
+
+  float game_yaw = LDF32(base, bv + GE_BV_YAW);
+  float game_pitch = LDF32(base, bv + GE_BV_PITCH);
+  if (bv != g_look_bv) {  // new view -> adopt the game's current angles
+    g_look_bv = bv;
+    g_look_yaw_deg = game_yaw;
+    g_look_pitch = game_pitch;
+  }
+
+  const float sens = static_cast<float>(REXCVAR_GET(ge_mouse_sens));
+  int dx = ge_take_mouse_dx();
+  int dy = ge_take_mouse_dy();
+
+  g_look_yaw_deg += static_cast<float>(dx) * sens * kYawDegPerCount;   // right = +yaw
+  while (g_look_yaw_deg >= 360.0f) g_look_yaw_deg -= 360.0f;
+  while (g_look_yaw_deg < 0.0f) g_look_yaw_deg += 360.0f;
+
+  g_look_pitch += static_cast<float>(-dy) * sens * kPitchPerCount;     // up = look up
+  if (g_look_pitch > kPitchMax) g_look_pitch = kPitchMax;
+  if (g_look_pitch < kPitchMin) g_look_pitch = kPitchMin;
+
+  STF32(base, bv + GE_BV_YAW, g_look_yaw_deg);   // HUD/radar copy
+  STF32(base, bv + GE_BV_PITCH, g_look_pitch);
+  ST32(base, bv + GE_BV_CENTER_FLAG, 0u);  // suppress vertical auto-center
+
+  // YAW: drive the heading the camera is built from (+ its smoother steady-state).
+  float offset = LDF32(base, GE_YAW_OFFSET);
+  float h = g_look_yaw_deg / GE_RAD2DEG - offset;
+  while (h >= GE_TWO_PI) h -= GE_TWO_PI;
+  while (h < 0.0f) h += GE_TWO_PI;
+  STF32(base, GE_YAW_HEADING, h);
+  STF32(base, GE_YAW_SMOOTH, h * 12.5f);
+  STF32(base, GE_YAW_TARGET, h);
+}
+
+// No-op (kept hooked, harmless). Pitch is driven via +612 in ge_mouselook_pitch.
+void ge_tick_pitch(PPCRegister& /*r11*/) {}
+
+// THE pitch auto-level. ge_bondview_tick @0x820bcb30 eases +612 toward neutral
+// when walking. When mouse-look is on, restore our pitch right after this write
+// so it HOLDS where the mouse put it.
+void ge_pitch_hold(PPCRegister& /*r11*/) {
+  if (!ge_mouselook_on() || !g_look_bv) return;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  uint32_t bv = LD32(base, GE_BONDVIEW_CUR);
+  if (bv) STF32(base, bv + GE_BV_PITCH, g_look_pitch);
+}
+
+// GE move-to-centre: ge_bondview_control @0x820bb460 sets +524 = 1 when you move
+// without pushing the look stick; the next block eases pitch back to neutral.
+// Clear +524 here -- before that ease reads it -- so mouse-look pitch never
+// auto-levels. Gated on FP control (intro fly-in / cutscenes keep native behavior).
+void ge_no_autolevel(PPCRegister& /*r11*/) {
+  if (!ge_mouselook_on()) return;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  if (LD32(base, GE_CAMERA_MODE) != GE_CAM_FP) return;
+  if (LD32(base, GE_CUTSCENE) != 0) return;
+  uint32_t bv = LD32(base, GE_BONDVIEW_CUR);
+  if (bv) ST32(base, bv + GE_BV_CENTER_FLAG, 0u);
+}
+
+// ===========================================================================
+// Keyboard buttons -> guest gamepad. The right stick (look) is the mouse; every
+// other controller input is mapped to a rebindable keyboard key here, injected
+// into the polled gamepad buffer so it works alongside a real pad. We do this
+// ourselves (not via the SDK's MnK driver) so it can't fight the mouse capture.
+//
+// Slot-0 gamepad buffer (filled by XamInputGetState in ge_input_poll_controllers,
+// Xbox360 big-endian): +0 buttons(u16), +2 LT, +3 RT, +4 LX(s16), +6 LY(s16).
+// ===========================================================================
+namespace {
+constexpr uint32_t GE_PAD0 = 0x830C8B9Cu;  // unk_830C8B9C, slot-0 gamepad
+
+// XInput button bits (match the masks the guest unpacks).
+constexpr uint16_t BTN_DPAD_UP = 0x0001, BTN_DPAD_DOWN = 0x0002, BTN_DPAD_LEFT = 0x0004,
+                   BTN_DPAD_RIGHT = 0x0008, BTN_START = 0x0010, BTN_BACK = 0x0020,
+                   BTN_LTHUMB = 0x0040, BTN_RTHUMB = 0x0080, BTN_LSHOULDER = 0x0100,
+                   BTN_RSHOULDER = 0x0200, BTN_A = 0x1000, BTN_B = 0x2000, BTN_X = 0x4000,
+                   BTN_Y = 0x8000;
+
+bool ge_input_active() {  // keyboard counts only when focused + not in the menu
+  return !g_listener.suppressed() && g_listener.focused();
+}
+
+// Is the key currently bound to cvar `name` held down? Reads the bind by name,
+// parses it to a virtual key, and polls the cross-platform key-down table.
+bool ge_key_down(const char* name) {
+  std::string keyname = rex::cvar::GetFlagByName(name);
+  if (keyname.empty()) return false;
+  rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(keyname);
+  if (vk == rex::ui::VirtualKey::kNone) return false;
+  return g_listener.key_down(vk);
+}
+}  // namespace
+
+// Keyboard binds. Defaults are a placeholder layout; rebindable in the menu.
+REXCVAR_DEFINE_BOOL(ge_keyboard_enable, true, "Input", "Map keyboard keys to controller buttons");
+REXCVAR_DEFINE_STRING(ge_key_mv_up, "W", "Input/Keybinds", "Move forward (left stick up)");
+REXCVAR_DEFINE_STRING(ge_key_mv_down, "S", "Input/Keybinds", "Move back (left stick down)");
+REXCVAR_DEFINE_STRING(ge_key_mv_left, "A", "Input/Keybinds", "Move left (left stick left)");
+REXCVAR_DEFINE_STRING(ge_key_mv_right, "D", "Input/Keybinds", "Move right (left stick right)");
+REXCVAR_DEFINE_STRING(ge_key_a, "Space", "Input/Keybinds", "A button");
+REXCVAR_DEFINE_STRING(ge_key_b, "Control", "Input/Keybinds", "B button");
+REXCVAR_DEFINE_STRING(ge_key_x, "R", "Input/Keybinds", "X button");
+REXCVAR_DEFINE_STRING(ge_key_y, "E", "Input/Keybinds", "Y button");
+REXCVAR_DEFINE_STRING(ge_key_lt, "RMB", "Input/Keybinds", "Left trigger");
+REXCVAR_DEFINE_STRING(ge_key_rt, "LMB", "Input/Keybinds", "Right trigger");
+REXCVAR_DEFINE_STRING(ge_key_lb, "Q", "Input/Keybinds", "Left shoulder");
+REXCVAR_DEFINE_STRING(ge_key_rb, "F", "Input/Keybinds", "Right shoulder");
+REXCVAR_DEFINE_STRING(ge_key_l3, "C", "Input/Keybinds", "Left stick press");
+REXCVAR_DEFINE_STRING(ge_key_r3, "V", "Input/Keybinds", "Right stick press");
+REXCVAR_DEFINE_STRING(ge_key_dup, "Up", "Input/Keybinds", "D-pad up");
+REXCVAR_DEFINE_STRING(ge_key_ddown, "Down", "Input/Keybinds", "D-pad down");
+REXCVAR_DEFINE_STRING(ge_key_dleft, "Left", "Input/Keybinds", "D-pad left");
+REXCVAR_DEFINE_STRING(ge_key_dright, "Right", "Input/Keybinds", "D-pad right");
+REXCVAR_DEFINE_STRING(ge_key_start, "Return", "Input/Keybinds", "Start button");
+REXCVAR_DEFINE_STRING(ge_key_back, "Tab", "Input/Keybinds", "Back button");
+
+// Runs once per controller poll, after XamInputGetState fills the slot-0 buffer
+// and before the guest dispatches it. OR our keyboard buttons in, and set the
+// left stick / triggers when their keys are held (pad input is preserved).
+void ge_inject_keyboard(PPCRegister& /*r11*/) {
+  // Attach the input listener from the controller-poll path too. InitMouseLook()
+  // runs at OnCreateDialogs when Runtime::display_window() can still be null, and
+  // the look hooks (ge_mouselook_*) only fire in-level -- so without this, the
+  // listener never attaches while in menus and keyboard/mouse stay dead until a
+  // level loads. This poll runs every frame (incl. menus), so it attaches early.
+  ge_ensure_listener();
+  if (!REXCVAR_GET(ge_keyboard_enable) || !ge_input_active()) return;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+
+  uint16_t add = 0;
+  if (ge_key_down("ge_key_a")) add |= BTN_A;
+  if (ge_key_down("ge_key_b")) add |= BTN_B;
+  if (ge_key_down("ge_key_x")) add |= BTN_X;
+  if (ge_key_down("ge_key_y")) add |= BTN_Y;
+  if (ge_key_down("ge_key_lb")) add |= BTN_LSHOULDER;
+  if (ge_key_down("ge_key_rb")) add |= BTN_RSHOULDER;
+  if (ge_key_down("ge_key_l3")) add |= BTN_LTHUMB;
+  if (ge_key_down("ge_key_r3")) add |= BTN_RTHUMB;
+  if (ge_key_down("ge_key_dup")) add |= BTN_DPAD_UP;
+  if (ge_key_down("ge_key_ddown")) add |= BTN_DPAD_DOWN;
+  if (ge_key_down("ge_key_dleft")) add |= BTN_DPAD_LEFT;
+  if (ge_key_down("ge_key_dright")) add |= BTN_DPAD_RIGHT;
+  if (ge_key_down("ge_key_start")) add |= BTN_START;
+  if (ge_key_down("ge_key_back")) add |= BTN_BACK;
+  if (add) ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | add);
+
+  if (ge_key_down("ge_key_lt")) base[GE_PAD0 + 2] = 0xFF;
+  if (ge_key_down("ge_key_rt")) base[GE_PAD0 + 3] = 0xFF;
+
+  int16_t lx = 0, ly = 0;
+  if (ge_key_down("ge_key_mv_left")) lx = -32767;
+  if (ge_key_down("ge_key_mv_right")) lx = 32767;
+  if (ge_key_down("ge_key_mv_up")) ly = 32767;
+  if (ge_key_down("ge_key_mv_down")) ly = -32767;
+  if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
+  if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
 }

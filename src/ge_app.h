@@ -25,6 +25,12 @@
 // boot -- they are read at startup (UserProfile ctor, online client start).
 namespace ge {
 void LaunchSelfDetached();
+// Attach the cross-platform mouse/keyboard look listener at startup (implemented
+// in ge_hooks.cpp).
+void InitMouseLook();
+// Suppress mouse-look while the pause menu is open (cursor is needed for the
+// menu, and motion shouldn't turn into look). Implemented in ge_hooks.cpp.
+void SetMouselookSuppressed(bool suppressed);
 }
 
 class GeApp : public rex::ReXApp {
@@ -45,6 +51,10 @@ class GeApp : public rex::ReXApp {
     rex::cvar::SetFlagByName("max_fps", "60");  // default 60 (clamped to native refresh)
     rex::cvar::SetFlagByName("window_width", "2560");
     rex::cvar::SetFlagByName("window_height", "1440");
+    // Our 1:1 mouse-look + keyboard injection (ge_hooks.cpp) is the sole MnK
+    // path. Force the SDK's mouse-as-stick driver off so a stale ge.toml can't
+    // re-enable it alongside ours (double-input / cursor fight).
+    rex::cvar::SetFlagByName("mnk_mode", "false");
     // NOTE: fullscreen is NOT forced here. Its default is set to true at the
     // framework level (window.cpp) instead. That makes "windowed" the
     // non-default value, so toggling to windowed actually saves to ge.toml --
@@ -60,6 +70,7 @@ class GeApp : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     rex::ui::RegisterBind("bind_pause_menu", "Escape", "Pause menu",
                           [this] { TogglePauseMenu(); });
+    ge::InitMouseLook();  // attach the cross-platform mouse/keyboard look listener
     postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
     // Username/server are set in the ONLINE pause-menu tab now -- no first-boot
     // prompt. They apply on the Save & Restart the ONLINE tab triggers.
@@ -85,7 +96,10 @@ class GeApp : public rex::ReXApp {
       return;
     }
     GeMenuDialog::Callbacks cb;
-    cb.on_closed = [this] { menu_ = nullptr; };
+    cb.on_closed = [this] {
+      menu_ = nullptr;
+      ge::SetMouselookSuppressed(false);  // re-enable mouse-look on menu close
+    };
     cb.on_quit = [this] {
       if (runtime() && runtime()->kernel_state()) {
         runtime()->kernel_state()->TerminateTitle();
@@ -120,6 +134,7 @@ class GeApp : public rex::ReXApp {
         app_context().QuitFromUIThread();
       });
     };
+    ge::SetMouselookSuppressed(true);  // freeze mouse-look + free the cursor while the menu is up
     menu_ = new GeMenuDialog(imgui_drawer(), std::move(cb));
   }
 
