@@ -172,14 +172,19 @@ NOTES="$DIST/notes.md"
 } > "$NOTES"
 
 # --- publish ----------------------------------------------------------------
+# Resolve the target repo from origin explicitly: with both origin + upstream
+# remotes and no default set, `gh release create` fails with a misleading
+# "workflow scope may be required" error. The tag is already pushed, so no
+# --target is needed.
 step "Publishing GitHub release"
+REPO="$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')"
 PRE_FLAG=""; [ "$PRERELEASE" -eq 1 ] && PRE_FLAG="--prerelease"
 gh release create "$TAG" $PRE_FLAG \
+  --repo "$REPO" \
   --title "GoldenEye Recomp $TAG" \
   --notes-file "$NOTES" \
-  --target "$(git rev-parse HEAD)" \
   "$APK_OUT" "$TARBALL"
 
 step "Done"
-gh release view "$TAG" --json url,isPrerelease,assets \
+gh release view "$TAG" --repo "$REPO" --json url,isPrerelease,assets \
   -q '"url=" + .url + "  prerelease=" + (.isPrerelease|tostring) + "  assets=" + ([.assets[].name]|join(", "))'
