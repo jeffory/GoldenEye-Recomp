@@ -2,6 +2,12 @@
 /out/
 /build/
 /cmake-build-*/
+/dist/
+
+# --- Release signing (LOCAL ONLY - never commit; back these up separately) ---
+*.jks
+*.keystore
+android/keystore.properties
 *.pdb
 *.exe
 *.ilk
