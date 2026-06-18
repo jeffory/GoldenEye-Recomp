@@ -18,6 +18,7 @@ include(generated/rexglue.cmake)
 # Sources
 set(GE_SOURCES
     src/main.cpp
+    src/ge_fps.cpp
     src/ge_hooks.cpp
     src/ge_menu.cpp
     src/ge_postfx.cpp

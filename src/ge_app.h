@@ -16,6 +16,7 @@
 
 #include <string>
 
+#include "ge_fps.h"
 #include "ge_menu.h"
 #include "ge_postfx.h"
 
@@ -55,6 +56,14 @@ class GeApp : public rex::ReXApp {
     // path. Force the SDK's mouse-as-stick driver off so a stale ge.toml can't
     // re-enable it alongside ours (double-input / cursor fight).
     rex::cvar::SetFlagByName("mnk_mode", "false");
+#if defined(__ANDROID__)
+    // No config file / CLI on Android: turn the guest-FPS benchmark recorder on
+    // here so the on-screen readout + periodic GEFPS ge.log lines are available
+    // for measuring framerate on the handheld. (Desktop leaves these default-off
+    // and toggles them with --ge_fps_overlay / --ge_fps_log.)
+    rex::cvar::SetFlagByName("ge_fps_overlay", "true");
+    rex::cvar::SetFlagByName("ge_fps_log", "true");
+#endif
     // NOTE: fullscreen is NOT forced here. Its default is set to true at the
     // framework level (window.cpp) instead. That makes "windowed" the
     // non-default value, so toggling to windowed actually saves to ge.toml --
@@ -72,6 +81,10 @@ class GeApp : public rex::ReXApp {
                           [this] { TogglePauseMenu(); });
     ge::InitMouseLook();  // attach the cross-platform mouse/keyboard look listener
     postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
+    fps_overlay_ = std::make_unique<ge::FpsOverlay>(drawer);  // guest-FPS readout
+    // F2 starts a fresh benchmark window (clears avg / 1%-low / min / max).
+    rex::ui::RegisterBind("bind_fps_reset", "F2", "Reset FPS benchmark",
+                          [] { ge::FpsReset(); });
     // Username/server are set in the ONLINE pause-menu tab now -- no first-boot
     // prompt. They apply on the Save & Restart the ONLINE tab triggers.
   }
@@ -79,6 +92,8 @@ class GeApp : public rex::ReXApp {
   // Tear down the menu, overlay and keybind before the drawer is destroyed.
   void OnShutdown() override {
     rex::ui::UnregisterBind("bind_pause_menu");
+    rex::ui::UnregisterBind("bind_fps_reset");
+    fps_overlay_.reset();
     if (menu_) {
       // Direct delete (not Close()) so we don't re-enter pause bookkeeping
       // during shutdown; removes itself from the drawer in its destructor.
@@ -140,4 +155,5 @@ class GeApp : public rex::ReXApp {
 
   GeMenuDialog* menu_ = nullptr;  // non-owning; self-deletes via the drawer
   std::unique_ptr<ge::PostFxOverlay> postfx_;       // always-on filter layer
+  std::unique_ptr<ge::FpsOverlay> fps_overlay_;     // guest-FPS benchmark readout
 };

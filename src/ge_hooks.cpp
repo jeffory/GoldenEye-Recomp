@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
+#include "ge_fps.h"    // ge::FpsOnFrame (guest-FPS benchmark recorder)
 #include <rex/cvar.h>  // REXCVAR_DEFINE_BOOL / REXCVAR_GET (ge_freeze_diag)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
 #include <rex/runtime.h>
@@ -624,12 +625,23 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
     // per frame (the guest polls the GPU wait in a tight loop), so gate on the
     // submit counter (dev+16544) actually advancing, then log once per 64 frames.
     uint32_t submit = LD32(base, dev + 16544);
-    static uint32_t s_last_submit = 0;  // heartbeat-only; a benign race just
-    static uint32_t rendered = 0;       // skips/dups a log line, never matters.
-    if (submit != s_last_submit) {
-      s_last_submit = submit;
-      if ((rendered++ & 0x3F) == 0)
-        REXKRNL_INFO("GEGPU rendered#{} dev={:#x} submit={}", rendered, dev, submit);
+    // Dedup the frame transition ATOMICALLY. The six GPU-completion waits poll
+    // this branch from multiple guest threads; a plain read-modify-write let two
+    // of them observe the same submit advance and both run the body -- a benign
+    // dup for the heartbeat, but it double-counted the frame in the FPS recorder
+    // (two OnFrame() calls microseconds apart -> bogus sub-ms frames that wrecked
+    // the best-frame metric). A CAS makes exactly one caller win each distinct
+    // submit value, so OnFrame() fires once per real frame.
+    static std::atomic<uint32_t> s_last_submit{0};
+    static std::atomic<uint32_t> rendered{0};
+    uint32_t prev_submit = s_last_submit.load(std::memory_order_relaxed);
+    if (submit != prev_submit &&
+        s_last_submit.compare_exchange_strong(prev_submit, submit,
+                                              std::memory_order_relaxed)) {
+      ge::FpsOnFrame();  // one real rendered frame -> feed the FPS benchmark recorder
+      uint32_t old = rendered.fetch_add(1, std::memory_order_relaxed);
+      if ((old & 0x3F) == 0)  // log #1, #65, #129... (boot loader greps >= 65)
+        REXKRNL_INFO("GEGPU rendered#{} dev={:#x} submit={}", old + 1, dev, submit);
     }
   }
 }
