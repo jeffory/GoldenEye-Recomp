@@ -425,7 +425,94 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
         }
         ImGui::EndCombo();
       }
-      ImGui::TextColored(ImColor(kInkDim), "(resolution applies after restart)");
+      ImGui::TextColored(ImColor(kInkDim),
+                         "(renders the 3D scene at this resolution; needs a restart)");
+      // Internal resolution can't change live without a full GPU device reset
+      // (the EDRAM buffer + render-target/texture caches are sized at init --
+      // changing them mid-run corrupts in-flight GPU state). So instead of a
+      // manual save+restart, apply it in one click: persist + relaunch now.
+      if (ImGui::Button("Apply Resolution (quick restart)")) {
+        if (callbacks_.persist_config) callbacks_.persist_config();
+        if (callbacks_.request_restart) callbacks_.request_restart();
+      }
+
+      ImGui::Spacing();
+
+      // --- Graphics API. "Auto" detects the GPU at boot: AMD -> Vulkan (the
+      //     D3D12 path times out / black-screens on AMD for this title), all
+      //     others -> Direct3D 12. Override here if needed; applied on restart. ---
+      static const struct { const char* label; const char* value; } kApi[] = {
+          {"Auto (recommended)", "auto"}, {"Direct3D 12", "d3d12"}, {"Vulkan", "vulkan"}};
+      const std::string cur_api = rex::cvar::GetFlagByName("gpu");
+      int api_idx = 0;
+      for (int i = 0; i < IM_ARRAYSIZE(kApi); ++i)
+        if (cur_api == kApi[i].value) api_idx = i;
+      ImGui::SetNextWindowSizeConstraints(
+          ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 6.0f));
+      if (ImGui::BeginCombo("Graphics API", kApi[api_idx].label)) {
+        for (int i = 0; i < IM_ARRAYSIZE(kApi); ++i) {
+          bool sel = (i == api_idx);
+          if (ImGui::Selectable(kApi[i].label, sel)) {
+            rex::cvar::SetFlagByName("gpu", kApi[i].value);
+            if (callbacks_.persist_config) callbacks_.persist_config();
+          }
+          if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::TextColored(ImColor(kInkDim), "(AMD uses Vulkan automatically; applies after restart)");
+
+      ImGui::Spacing();
+
+      // --- Texture filtering. Drives the engine's anisotropic_override cvar,
+      //     which is hot-reload: the sampler cache re-reads it per draw, so this
+      //     applies instantly. Values: 0 = off (bilinear), 3 = 4x .. 5 = 16x. ---
+      static const struct { const char* label; const char* value; } kAniso[] = {
+          {"Off (bilinear)", "0"}, {"4x", "3"}, {"8x", "4"}, {"16x", "5"}};
+      const std::string cur_aniso = rex::cvar::GetFlagByName("anisotropic_override");
+      int aniso_idx = 1;  // default 4x (engine default = 3)
+      for (int i = 0; i < IM_ARRAYSIZE(kAniso); ++i)
+        if (cur_aniso == kAniso[i].value) aniso_idx = i;
+      ImGui::SetNextWindowSizeConstraints(
+          ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 6.0f));
+      if (ImGui::BeginCombo("Texture Filtering", kAniso[aniso_idx].label)) {
+        for (int i = 0; i < IM_ARRAYSIZE(kAniso); ++i) {
+          bool sel = (i == aniso_idx);
+          if (ImGui::Selectable(kAniso[i].label, sel)) {
+            rex::cvar::SetFlagByName("anisotropic_override", kAniso[i].value);
+            if (callbacks_.persist_config) callbacks_.persist_config();
+          }
+          if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::TextColored(ImColor(kInkDim), "(anisotropic filtering; applies instantly)");
+
+      ImGui::Spacing();
+
+      // --- Anti-aliasing. Drives swap_post_effect (FXAA post-process). Now
+      //     hot-reload: the GPU vsync worker re-applies it each tick, so it
+      //     switches live. MSAA isn't user-selectable (it's guest-driven). ---
+      static const struct { const char* label; const char* value; } kAA[] = {
+          {"Off", "none"}, {"FXAA", "fxaa"}, {"FXAA (Extreme)", "fxaa_extreme"}};
+      const std::string cur_aa = rex::cvar::GetFlagByName("swap_post_effect");
+      int aa_idx = 0;
+      for (int i = 0; i < IM_ARRAYSIZE(kAA); ++i)
+        if (cur_aa == kAA[i].value) aa_idx = i;
+      ImGui::SetNextWindowSizeConstraints(
+          ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 6.0f));
+      if (ImGui::BeginCombo("Anti-Aliasing", kAA[aa_idx].label)) {
+        for (int i = 0; i < IM_ARRAYSIZE(kAA); ++i) {
+          bool sel = (i == aa_idx);
+          if (ImGui::Selectable(kAA[i].label, sel)) {
+            rex::cvar::SetFlagByName("swap_post_effect", kAA[i].value);
+            if (callbacks_.persist_config) callbacks_.persist_config();
+          }
+          if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::TextColored(ImColor(kInkDim), "(FXAA post-process AA; applies instantly)");
 
       ImGui::Spacing();
       ImGui::Separator();

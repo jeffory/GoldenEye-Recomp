@@ -43,6 +43,9 @@
 0x820A3E9C = { name = "ge_cont_820A3E9C" }  # F7 continuation (sub_820A3C20)
 0x820F79F0 = { name = "ge_body_820F79F0" }  # F2 loop body (one r26 iteration)
 0x820F7D0C = { name = "ge_epi_820F7D0C" }   # F2 epilogue (post-loop, returns)
+# watch-volume save continuations (CE enters the save routine past its clamp)
+0x82184E18 = { name = "ge_cont_82184E18" }
+0x82184E48 = { name = "ge_cont_82184E48" }
 [[midasm_hook]]
 address = 0x82198C94
 name = "ge_dbg_now"
@@ -109,41 +112,9 @@ name = "ge_f2_skip"
 registers = ["r3"]
 after_instruction = false
 return_on_true = true
-# --- Mouse-look (real 1:1 looking; see ge_hooks.cpp). All in ge_bondview_control
-# (sub_820B99E8) + the right-stick setter. ---
-# YAW: after the guest stores the per-frame yaw delta (rad) to flt_82F1F914.
-[[midasm_hook]]
-address = 0x820BAB6C
-name = "ge_mouselook_yaw"
-registers = ["r11"]
-after_instruction = true
-# PITCH: after the guest integrates pitch into bondview(+612).
-[[midasm_hook]]
-address = 0x820BB79C
-name = "ge_mouselook_pitch"
-registers = ["r11"]
-after_instruction = true
-# CAMERA PITCH: in ge_bondview_tick, right after flt_82F1F8F8 is finalized
-# (after the clamp + walking auto-level) -> force our pitch on for full range.
-[[midasm_hook]]
-address = 0x820BCF14
-name = "ge_tick_pitch"
-registers = ["r11"]
-after_instruction = true
-# PITCH AUTO-LEVEL DEFEAT: right after the tick eases +612 toward neutral
-# (flt_82F1F8B0), restore our pitch so the view holds (when mouse-look is on).
-[[midasm_hook]]
-address = 0x820BCB30
-name = "ge_pitch_hold"
-registers = ["r11"]
-after_instruction = true
-# MOVE-TO-CENTRE DEFEAT: clear field_104 (+524) right after ge_bondview_control
-# sets it, so the "auto look ahead when moving" pitch ease never runs.
-[[midasm_hook]]
-address = 0x820BB460
-name = "ge_no_autolevel"
-registers = ["r11"]
-after_instruction = true
+# Mouse-look is now a once-per-frame port of the xenia-canary mousehook
+# (ge_mouse_camera in ge_hooks.cpp), driven from ge_inject_keyboard below. The
+# old per-site ge_bondview_control look hooks are gone.
 # KEYBOARD: after XamInputGetState fills the slot-0 gamepad buffer (unk_830C8B9C)
 # and before ge_input_poll_controllers dispatches it -> OR keyboard buttons in.
 [[midasm_hook]]
@@ -151,3 +122,184 @@ address = 0x823B25E4
 name = "ge_inject_keyboard"
 registers = ["r11"]
 after_instruction = true
+# NOTE: upstream's ge_debug_gate (hidden debug-menu enable @0x82189F2C) is NOT
+# pulled in -- its implementation lives in an earlier upstream commit that isn't on
+# this branch, and it is not part of the CE patch set.
+# --- BeanTools Community Edition CODE fixes (instruction patches; see ge_hooks.cpp) ---
+# fix_door_volume_clamp @0x820DD814: li r3,0 -> li r3,1
+[[midasm_hook]]
+address = 0x820DD814
+name = "ge_ce_door_vol"
+registers = ["r3"]
+after_instruction = true
+# remove_beta_string_at_logo @0x820ED678: ori r3,r3,0x9D97 -> ...0x9CE3
+[[midasm_hook]]
+address = 0x820ED678
+name = "ge_ce_beta_str"
+registers = ["r3"]
+after_instruction = true
+# extend_audio_distance: re-store 6500.0f into CurveDistanceScaler (stfs r31+0x5C)
+[[midasm_hook]]
+address = 0x8214438C
+name = "ge_ce_audio_dist"
+registers = ["r31"]
+after_instruction = true
+# hardcode_near_clip_to_2: re-store 2.0f at the per-fog near-clip store site
+[[midasm_hook]]
+address = 0x82117B44
+name = "ge_ce_near_clip"
+registers = ["r11"]
+after_instruction = true
+# remove_original_graphics_mode_blur @0x82188E70: NOOP `bne cr6,+0x19C`
+[[midasm_hook]]
+address = 0x82188E70
+name = "ge_ce_blur"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x8218900C
+jump_address_on_false = 0x82188E74
+# remove_original_graphics_mode_from_intro @0x8209972C: force `b 0x82099750`
+[[midasm_hook]]
+address = 0x8209972C
+name = "ge_ce_intro_gfx"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x82099750
+jump_address_on_false = 0x82099730
+# --- BeanTools CE MP / network hack-functions (see ge_hooks.cpp) -------------
+# disable_doors_autoclosing_on_mp @0x820E4F1C
+[[midasm_hook]]
+address = 0x820E4F1C
+name = "ge_ce_mp_door"
+registers = ["r11"]
+after_instruction = true
+# disable_player_collisions_for_network_mp @0x820CDFA4 (replaces bl sub_820B3E90)
+[[midasm_hook]]
+address = 0x820CDFA4
+name = "ge_ce_mp_collision"
+registers = []
+after_instruction = false
+return = true
+# fix_golden_gun_respawn_visiblity_flag @0x820CF940 (replaces cmpwi/bne)
+[[midasm_hook]]
+address = 0x820CF940
+name = "ge_ce_golden_gun"
+registers = ["r11"]
+after_instruction = false
+jump_address_on_true = 0x820CF948
+jump_address_on_false = 0x820CF94C
+# make_mp_always_use_p2_fog @0x82117CB0
+[[midasm_hook]]
+address = 0x82117CB0
+name = "ge_ce_p2_fog"
+registers = ["r3"]
+after_instruction = false
+jump_address_on_true = 0x82117CB8
+jump_address_on_false = 0x82117CB4
+# fix_network_armor_bug @0x8216BC1C (after stw r12,0x64(r30); cal_dam)
+[[midasm_hook]]
+address = 0x8216BC1C
+name = "ge_ce_armor_fix"
+registers = ["r30"]
+after_instruction = true
+# increase_mp_characters: li r11,0x21 -> li r11,0x32 at the two unlock sites
+[[midasm_hook]]
+address = 0x820EF350
+name = "ge_ce_mp_charcount"
+registers = ["r11"]
+after_instruction = true
+[[midasm_hook]]
+address = 0x82106C54
+name = "ge_ce_mp_charcount"
+registers = ["r11"]
+after_instruction = true
+# add_sfx_to_remote_player_weapons @0x8216E25C (before `add r11,r10,r11`)
+[[midasm_hook]]
+address = 0x8216E25C
+name = "ge_ce_remote_weapon_sfx"
+registers = ["r11"]
+after_instruction = false
+# set_mp_sfx_to_use_player_location: 4 sfx sites -> play + 3D-position (replaces
+# `bl sub_82144920`; jump_address skips the original bl). gasp / slapper / knife /
+# item-equip.
+[[midasm_hook]]
+address = 0x820BF264
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820BF268
+[[midasm_hook]]
+address = 0x820CDC5C
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820CDC60
+[[midasm_hook]]
+address = 0x820ACF54
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820ACF58
+[[midasm_hook]]
+address = 0x820AC4D0
+name = "ge_ce_sfx_3d"
+registers = []
+after_instruction = false
+jump_address = 0x820AC4D4
+# gasp/argh for remote players (set_mp_sfx gasp half) @0x820BF408
+[[midasm_hook]]
+address = 0x820BF408
+name = "ge_ce_gasp"
+registers = []
+after_instruction = false
+jump_address = 0x820BF40C
+# only_trigger_mp_death_tune @0x820BFB04 (skip the death-tune bl if flag set)
+[[midasm_hook]]
+address = 0x820BFB04
+name = "ge_ce_death_tune"
+registers = []
+after_instruction = false
+jump_address_on_true = 0x820BFB08
+# kill-tune 5.0f relocation @0x8209D88C (read +0x3A8 not +0x3AC)
+[[midasm_hook]]
+address = 0x8209D88C
+name = "ge_ce_killtune_float"
+registers = ["r11", "f1"]
+after_instruction = true
+# fix_watch_volume_sliders_range: read (halve for display) + save (double) sites
+[[midasm_hook]]
+address = 0x820C82C4
+name = "ge_ce_watch_music_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C82C8
+[[midasm_hook]]
+address = 0x820C8324
+name = "ge_ce_watch_music_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C8328
+[[midasm_hook]]
+address = 0x820C8154
+name = "ge_ce_watch_sfx_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C8158
+[[midasm_hook]]
+address = 0x820C81B4
+name = "ge_ce_watch_sfx_read"
+registers = ["r3"]
+after_instruction = false
+jump_address = 0x820C81B8
+[[midasm_hook]]
+address = 0x820C831C
+name = "ge_ce_watch_music_save"
+registers = []
+after_instruction = false
+jump_address = 0x820C8320
+[[midasm_hook]]
+address = 0x820C81AC
+name = "ge_ce_watch_sfx_save"
+registers = []
+after_instruction = false
+jump_address = 0x820C81B0

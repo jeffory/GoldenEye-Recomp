@@ -1,5 +1,7 @@
 // ge - project mid-ASM hooks: 0x830E0xxx fragment reconstruction.
 #include <thread>
+#include <algorithm>  // std::min/std::max (ge_mouse_camera aim/sway clamps)
+#include <cmath>      // sqrtf (ge_mouse_camera crosshair distance)
 //
 // 8 functions branch to 0x830E0xxx, ZERO in the static XEX (rexglue codegen
 // stubs it) but at runtime real PPC code (identical to fragments IDA
@@ -808,33 +810,17 @@ void ge_hook_830E0750(PPCRegister& r7, PPCRegister& r8, PPCRegister& r11,
 // the pause menu is open or the window loses focus.
 // ===========================================================================
 
-namespace {
-// Direct 1:1 look: mouse delta -> absolute yaw/pitch, written straight into the
-// camera state every frame (tune via sens).
-constexpr float kYawDegPerCount = 0.10f;       // guest yaw DEGREES per mouse count @ sens 1
-constexpr float kPitchPerCount = 0.10f;        // guest pitch (+612) units per mouse count @ sens 1
-constexpr float kPitchMin = -60.0f;
-constexpr float kPitchMax = 60.0f;
-constexpr uint32_t GE_BONDVIEW_CUR = 0x82F1FAACu; // dword_82F1FAAC -> current bondview struct
-constexpr uint32_t GE_CUTSCENE = 0x82F1F8DCu;     // gBondViewCutscene ptr; non-zero = cutscene/non-playable
-constexpr uint32_t GE_CAMERA_MODE = 0x82F1F920u;  // g_CameraMode. 1/2/3=intro fly-in, 4=FP playable
-constexpr uint32_t GE_CAM_FP = 4u;                // first-person playable mode (only state the player aims)
-constexpr uint32_t GE_BV_YAW = 596u;              // +596 facing yaw (degrees, HUD/radar copy)
-constexpr uint32_t GE_BV_PITCH = 612u;            // +612 pitch angle
-constexpr uint32_t GE_BV_CENTER_FLAG = 524u;      // +524 auto-center-this-frame flag
-// Camera yaw is built from the heading -- drive it + its smoother steady-state.
-constexpr uint32_t GE_YAW_HEADING = 0x82F1F900u;  // flt_82F1F900 heading (rad)
-constexpr uint32_t GE_YAW_SMOOTH = 0x82F1F904u;   // flt_82F1F904 smoothed (= heading*12.5)
-constexpr uint32_t GE_YAW_TARGET = 0x82F1F910u;   // flt_82F1F910 target heading (rad)
-constexpr uint32_t GE_YAW_OFFSET = 0x82F1F8F0u;   // flt_82F1F8F0 yaw offset added to heading
-constexpr float GE_TWO_PI = 6.2831855f;
-constexpr float GE_RAD2DEG = 57.29578f;
-}  // namespace
-
-namespace {
-float g_look_pitch = 0.0f;    // last pitch we wrote (+612 units); held vs auto-level
-uint32_t g_look_bv = 0;       // bondview struct we're tracking
-}  // namespace
+// Mouse-look tunables, ported from the xenia-canary mousehook cvars. The
+// user-facing sensitivity multiplier is ge_mouse_sens (defined below).
+REXCVAR_DEFINE_BOOL(ge_invert_x, false, "Input", "Invert mouse X (horizontal) look");
+REXCVAR_DEFINE_BOOL(ge_invert_y, false, "Input", "Invert mouse Y (vertical) look");
+REXCVAR_DEFINE_BOOL(ge_disable_autoaim, true, "Input",
+                    "Disable auto-aim and look-ahead while mouse-look is on");
+REXCVAR_DEFINE_DOUBLE(ge_menu_sensitivity, 1.0, "Input",
+                      "Mouse sensitivity in menus").range(0.05, 20.0);
+REXCVAR_DEFINE_DOUBLE(ge_aim_turn_distance, 0.4, "Input",
+                      "Crosshair travel in aim-mode before the camera turns [0-1]").range(0.0, 1.0);
+REXCVAR_DEFINE_BOOL(ge_gun_sway, true, "Input", "Gun sway as the camera turns");
 
 REXCVAR_DEFINE_DOUBLE(ge_mouse_sens, 1.0, "Input", "Mouse look sensitivity").range(0.05, 20.0);
 // Mouse-look on/off. ON: the mouse looks (added on top of the pad -- both work
@@ -998,104 +984,225 @@ void InitMouseLook() {
 void SetMouselookSuppressed(bool v) { g_listener.set_suppressed(v); }
 }  // namespace ge
 
-// YAW: this stick-yaw write site only runs in control mode 2, which normal
-// gameplay does NOT use -- so mouse YAW is applied in ge_mouselook_pitch instead
-// (that site runs every frame). Kept only to confirm firing / lazily attach.
-void ge_mouselook_yaw(PPCRegister& /*r11*/) { ge_ensure_listener(); }
+// ===========================================================================
+// Mouse-look: faithful port of the xenia-canary mousehook
+// (src/xenia/hid/winkey/hookables/goldeneye.cc, GoldeneyeGame::DoHooks) for the
+// GoldenEye_Nov2007_Release build. Runs once per frame from ge_inject_keyboard,
+// operating on the local player struct in guest RAM. Writes the game's own
+// camera / crosshair / gun fields incrementally so it coexists with the
+// controller, recoil, and the tank turret.
+// ===========================================================================
+namespace {
+// RareGameBuildAddrs for GoldenEye_Nov2007_Release (from supported_builds[]).
+constexpr uint32_t GE_MENU_XY       = 0x8272B37Cu;  // menu cursor X (Y at +4)
+constexpr uint32_t GE_PAUSE_FLAG    = 0x82F1E70Cu;  // non-zero ~= game paused
+constexpr uint32_t GE_SETTINGS_PTR  = 0x83088228u;  // -> settings struct pointer
+constexpr uint32_t GE_SETTINGS_BITS = 0x298u;       // bitflags offset in struct
+constexpr uint32_t GE_PLAYER_PTR    = 0x82F1FA98u;  // -> players[0] (host's Bond)
+constexpr uint32_t GE_BONDVIEW_CUR  = 0x82F1FAACu;  // -> currently-controlled view's player
+constexpr uint32_t GE_OFF_WATCH     = 0x2E8u;       // watch status (!=0 -> input disabled)
+constexpr uint32_t GE_OFF_DISABLED  = 0x80u;        // control-disabled flag (cutscene)
+constexpr uint32_t GE_OFF_CAM_X     = 0x254u;       // camera yaw
+constexpr uint32_t GE_OFF_CAM_Y     = 0x264u;       // camera pitch
+constexpr uint32_t GE_OFF_CH_X      = 0x10A8u;      // crosshair X
+constexpr uint32_t GE_OFF_CH_Y      = 0x10ACu;      // crosshair Y
+constexpr uint32_t GE_OFF_GUN_X     = 0x10BCu;      // gun X
+constexpr uint32_t GE_OFF_GUN_Y     = 0x10C0u;      // gun Y
+constexpr uint32_t GE_OFF_AIM_MODE  = 0x22Cu;       // aim-mode (1 = aiming)
+constexpr uint32_t GE_OFF_AIM_MULT  = 0x11ACu;      // aim-turn multiplier (slows when zoomed)
+enum GESettingFlag {
+  GE_SET_AutoAim   = 0x10,
+  GE_SET_LookAhead = 0x80,
+};
+}  // namespace
 
-// PITCH/YAW look injection. Runs every frame in ge_bondview_control AFTER the
-// guest has folded the right stick into the camera state this frame: the stick's
-// pitch is already integrated into bondview+612, and its yaw into the heading
-// (flt_82F1F900/904/910) the view matrix is built from.
-//
-// Mouse-look is ADDITIVE with the stick: we read the angle the game just computed
-// from the pad and add only the mouse's per-frame delta on top. Earlier this site
-// wrote a frozen absolute (seeded once per view, moved only by the mouse) into the
-// camera every frame, which CLOBBERED the right stick -- with no mouse to move it
-// (e.g. a handheld with no mouse at all) the view snapped back to that frozen
-// value every frame, so the right stick appeared stuck. Reading the live value and
-// adding the mouse delta lets both work at once on every platform.
-void ge_mouselook_pitch(PPCRegister& /*r11*/) {
-  ge_ensure_listener();
-  g_listener.tick_capture();  // capture lifecycle (matches upstream: independent of FP gate)
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
-  uint32_t bv = LD32(base, GE_BONDVIEW_CUR);
-  if (!bv) return;
+void ge_mouse_camera(uint8_t* base) {
+  // Persistent state (= GoldeneyeGame member vars in xenia).
+  static uint32_t prev_pause = 0, prev_disabled = 0, prev_aim_mode = 0;
+  static bool start_centering = false, disable_sway = false;
+  static float centering_speed = 0.0125f;
 
-  // Suspend mouse-look whenever the player isn't in first-person control:
-  //   * g_CameraMode != FP  -> level-start intro fly-in (modes 1/2/3), swirl,
-  //     death cam, ending pose, fade-to-title, etc. (gameplay = 4).
-  //   * gBondViewCutscene   -> a scripted camera took over mid-level in FP mode.
-  // Clear g_look_bv so ge_pitch_hold stops holding and the scripted/intro camera
-  // is left alone; control returns with no snap (we re-read the live angle below).
-  if (!ge_mouselook_on() || LD32(base, GE_CAMERA_MODE) != GE_CAM_FP ||
-      LD32(base, GE_CUTSCENE) != 0) {
-    g_look_bv = 0;
-    return;
+  const float sensitivity = static_cast<float>(REXCVAR_GET(ge_mouse_sens));
+  const float menu_sensitivity = static_cast<float>(REXCVAR_GET(ge_menu_sensitivity));
+  const bool invert_x = REXCVAR_GET(ge_invert_x);
+  const bool invert_y = REXCVAR_GET(ge_invert_y);
+  const bool disable_autoaim = REXCVAR_GET(ge_disable_autoaim);
+  const float aim_turn_distance = static_cast<float>(REXCVAR_GET(ge_aim_turn_distance));
+  const bool gun_sway = REXCVAR_GET(ge_gun_sway);
+
+  // Consume this frame's raw mouse delta once; used for both menu and camera.
+  const float mdx = static_cast<float>(ge_take_mouse_dx());
+  const float mdy = static_cast<float>(ge_take_mouse_dy());
+
+  // Move the menu selection crosshair (the game's own menus read these).
+  {
+    float menuX = LDF32(base, GE_MENU_XY);
+    float menuY = LDF32(base, GE_MENU_XY + 4);
+    menuX += (mdx / 5.f) * menu_sensitivity;
+    menuY += (mdy / 5.f) * menu_sensitivity;
+    STF32(base, GE_MENU_XY, menuX);
+    STF32(base, GE_MENU_XY + 4, menuY);
   }
-  g_look_bv = bv;  // tracking this view (gates ge_pitch_hold)
 
-  const float sens = static_cast<float>(REXCVAR_GET(ge_mouse_sens));
-  int dx = ge_take_mouse_dx();
-  int dy = ge_take_mouse_dy();
-
-  // PITCH: rebase on the game's current +612 (the stick's pitch is already in) and
-  // add the mouse delta. With no mouse this writes the stick's own value straight
-  // back (a no-op clobber); ge_pitch_hold then holds it against the walking
-  // auto-level. Remember it for that hold.
-  float pitch = LDF32(base, bv + GE_BV_PITCH);
-  pitch += static_cast<float>(-dy) * sens * kPitchPerCount;            // up = look up
-  if (pitch > kPitchMax) pitch = kPitchMax;
-  if (pitch < kPitchMin) pitch = kPitchMin;
-  g_look_pitch = pitch;
-  STF32(base, bv + GE_BV_PITCH, pitch);
-  ST32(base, bv + GE_BV_CENTER_FLAG, 0u);  // suppress vertical auto-center
-
-  // YAW: only assert the heading when the mouse actually moved, and add its delta
-  // to the LIVE heading (already carrying the right stick's turn this frame). With
-  // no mouse motion we leave the heading untouched so the stick fully owns yaw and
-  // its smoother isn't fought.
-  if (dx != 0) {
-    float offset = LDF32(base, GE_YAW_OFFSET);
-    float h = LDF32(base, GE_YAW_HEADING);                            // rad, incl. stick
-    h += (static_cast<float>(dx) * sens * kYawDegPerCount) / GE_RAD2DEG;  // right = +yaw
-    while (h >= GE_TWO_PI) h -= GE_TWO_PI;
-    while (h < 0.0f) h += GE_TWO_PI;
-    STF32(base, GE_YAW_HEADING, h);
-    STF32(base, GE_YAW_SMOOTH, h * 12.5f);
-    STF32(base, GE_YAW_TARGET, h);
-    // keep the HUD/radar degrees copy (+596) in sync with the heading we just set
-    float yaw_deg = (h + offset) * GE_RAD2DEG;
-    while (yaw_deg >= 360.0f) yaw_deg -= 360.0f;
-    while (yaw_deg < 0.0f) yaw_deg += 360.0f;
-    STF32(base, bv + GE_BV_YAW, yaw_deg);
+  // Target the LOCAL player. Online uses Xbox System Link, where each console
+  // controls its OWN Bond at a session-global index (host = players[0], clients =
+  // players[1..3]). players[0] (GE_PLAYER_PTR) is therefore only the local player
+  // on the host -- using it made mouse-look host-only. GE_BONDVIEW_CUR points at
+  // the view the local console is actually driving, so it resolves to this
+  // console's player in online play and to players[0] in single-player/the host.
+  // Target the LOCAL player = the active-viewport player. player+0x904 (viewport
+  // size/offset) is 0 only for the view the local console actually renders -- the
+  // same signal GoldenEye's own code uses ("current player is the active
+  // viewport", per the CE 3D-SFX hack). This is stable every frame and resolves
+  // to players[0] on the host, players[1] on a joiner, etc., automatically.
+  // (The old GE_BONDVIEW_CUR target flipped between local/remote each frame
+  // because the bondview CONTROL loop cycles it across all players -- that was
+  // the online jitter.)
+  uint32_t player = 0;
+  for (int i = 0; i < 4; ++i) {
+    uint32_t p = LD32(base, 0x82F1FA98u + i * 4u);
+    if (p && LD32(base, p + 0x904u) == 0u) { player = p; break; }
   }
-}
+  if (!player) player = LD32(base, GE_BONDVIEW_CUR);  // fallback (menus/boot)
+  if (!player) player = LD32(base, GE_PLAYER_PTR);
+  if (!player) return;
 
-// No-op (kept hooked, harmless). Pitch is driven via +612 in ge_mouselook_pitch.
-void ge_tick_pitch(PPCRegister& /*r11*/) {}
+  const uint32_t game_pause_flag = LD32(base, GE_PAUSE_FLAG);
 
-// THE pitch auto-level. ge_bondview_tick @0x820bcb30 eases +612 toward neutral
-// when walking. When mouse-look is on, restore our pitch right after this write
-// so it HOLDS where the mouse put it.
-void ge_pitch_hold(PPCRegister& /*r11*/) {
-  if (!ge_mouselook_on() || !g_look_bv) return;
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
-  uint32_t bv = LD32(base, GE_BONDVIEW_CUR);
-  if (bv) STF32(base, bv + GE_BV_PITCH, g_look_pitch);
-}
+  // control-disabled (cutscene); fall back to watch-status (watch up/down).
+  uint32_t game_control_disabled = LD32(base, player + GE_OFF_DISABLED);
+  if (game_control_disabled == 0)
+    game_control_disabled = LD32(base, player + GE_OFF_WATCH);
 
-// GE move-to-centre: ge_bondview_control @0x820bb460 sets +524 = 1 when you move
-// without pushing the look stick; the next block eases pitch back to neutral.
-// Clear +524 here -- before that ease reads it -- so mouse-look pitch never
-// auto-levels. Gated on FP control (intro fly-in / cutscenes keep native behavior).
-void ge_no_autolevel(PPCRegister& /*r11*/) {
-  if (!ge_mouselook_on()) return;
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
-  if (LD32(base, GE_CAMERA_MODE) != GE_CAM_FP) return;
-  if (LD32(base, GE_CUTSCENE) != 0) return;
-  uint32_t bv = LD32(base, GE_BONDVIEW_CUR);
-  if (bv) ST32(base, bv + GE_BV_CENTER_FLAG, 0u);
+  // Disable auto-aim & look-ahead, only when the pause/control state changes --
+  // xenia's exact behaviour. (Doing it every frame oscillated against the game's
+  // per-frame auto-aim in multiplayer and caused the camera jitter.)
+  if (game_pause_flag != prev_pause || game_control_disabled != prev_disabled) {
+    const uint32_t sp = LD32(base, GE_SETTINGS_PTR);
+    if (sp) {
+      const uint32_t sva = sp + GE_SETTINGS_BITS;
+      uint32_t settings = LD32(base, sva);
+      if (settings & GE_SET_LookAhead) settings &= ~(uint32_t)GE_SET_LookAhead;
+      if (disable_autoaim && (settings & GE_SET_AutoAim))
+        settings &= ~(uint32_t)GE_SET_AutoAim;
+      ST32(base, sva, settings);
+    }
+    prev_pause = game_pause_flag;
+    prev_disabled = game_control_disabled;
+  }
+
+  if (game_control_disabled) return;
+
+  const uint32_t aim_mode = LD32(base, player + GE_OFF_AIM_MODE);
+  if (aim_mode != prev_aim_mode) {
+    if (aim_mode != 0) {  // entering aim mode -> reset gun position
+      STF32(base, player + GE_OFF_GUN_X, 0.f);
+      STF32(base, player + GE_OFF_GUN_Y, 0.f);
+    }
+    // Always reset crosshair on enter/exit (else non-aim fires toward it).
+    STF32(base, player + GE_OFF_CH_X, 0.f);
+    STF32(base, player + GE_OFF_CH_Y, 0.f);
+    prev_aim_mode = aim_mode;
+  }
+
+  const float bounds = 1.f, dividor = 500.f, gun_multiplier = 1.f;
+  const float crosshair_multiplier = 1.f, centering_multiplier = 1.f;
+  const float aim_turn_dividor = 1.f;
+
+  if (aim_mode == 1) {
+    float chX = LDF32(base, player + GE_OFF_CH_X);
+    float chY = LDF32(base, player + GE_OFF_CH_Y);
+    chX += (invert_x ? -1.f : 1.f) * (mdx / dividor) * sensitivity;
+    chY += (invert_y ? -1.f : 1.f) * (mdy / dividor) * sensitivity;
+
+    chX = std::min(chX, bounds); chX = std::max(chX, -bounds);
+    chY = std::min(chY, bounds); chY = std::max(chY, -bounds);
+
+    STF32(base, player + GE_OFF_CH_X, chX);
+    STF32(base, player + GE_OFF_CH_Y, chY);
+    STF32(base, player + GE_OFF_GUN_X, chX * gun_multiplier);
+    STF32(base, player + GE_OFF_GUN_Y, chY * gun_multiplier);
+
+    // Turn the camera once the crosshair travels past a threshold.
+    float camX = LDF32(base, player + GE_OFF_CAM_X);
+    float camY = LDF32(base, player + GE_OFF_CAM_Y);
+    const float aim_multiplier = LDF32(base, player + GE_OFF_AIM_MULT);
+    const float ch_distance = sqrtf(chX * chX + chY * chY);
+    if (ch_distance > aim_turn_distance) {
+      camX += (chX / aim_turn_dividor) * aim_multiplier;
+      STF32(base, player + GE_OFF_CAM_X, camX);
+      camY -= (chY / aim_turn_dividor) * aim_multiplier;
+      STF32(base, player + GE_OFF_CAM_Y, camY);
+    }
+
+    start_centering = true;
+    disable_sway = true;       // skip weapon sway until we've centered
+    centering_speed = 0.05f;   // speed up centering when leaving aim-mode
+  } else {
+    float gX = LDF32(base, player + GE_OFF_GUN_X);
+    float gY = LDF32(base, player + GE_OFF_GUN_Y);
+
+    // Gun-centering back to the middle after aim-mode / when idle.
+    if (start_centering) {
+      if (gX != 0 || gY != 0) {
+        if (gX > 0) gX -= std::min(centering_speed * centering_multiplier, gX);
+        if (gX < 0) gX += std::min(centering_speed * centering_multiplier, -gX);
+        if (gY > 0) gY -= std::min(centering_speed * centering_multiplier, gY);
+        if (gY < 0) gY += std::min(centering_speed * centering_multiplier, -gY);
+      }
+      if (gX == 0 && gY == 0) {
+        centering_speed = 0.0125f;
+        start_centering = false;
+        disable_sway = false;
+      }
+    }
+
+    if (mdx != 0.f || mdy != 0.f) {
+      float camX = LDF32(base, player + GE_OFF_CAM_X);
+      float camY = LDF32(base, player + GE_OFF_CAM_Y);
+
+      camX += (invert_x ? -1.f : 1.f) * (mdx / 10.f) * sensitivity;
+
+      // Add 'sway' to the gun as the camera turns.
+      const float gun_sway_x = ((mdx / 16000.f) * sensitivity) * bounds;
+      const float gun_sway_y = ((mdy / 16000.f) * sensitivity) * bounds;
+      float gun_sway_x_changed = gX + gun_sway_x;
+      float gun_sway_y_changed = gY + gun_sway_y;
+
+      if (!invert_y) {
+        camY -= (mdy / 10.f) * sensitivity;
+      } else {
+        camY += (mdy / 10.f) * sensitivity;
+        gun_sway_y_changed = gY - gun_sway_y;
+      }
+
+      STF32(base, player + GE_OFF_CAM_X, camX);
+      STF32(base, player + GE_OFF_CAM_Y, camY);
+
+      if (gun_sway && !disable_sway) {
+        // Bound the sway to [0.2:-0.2] (only if it would push further OOB).
+        if (gun_sway_x_changed > (0.2f * bounds) && gun_sway_x > 0) gun_sway_x_changed = gX;
+        if (gun_sway_x_changed < -(0.2f * bounds) && gun_sway_x < 0) gun_sway_x_changed = gX;
+        if (gun_sway_y_changed > (0.2f * bounds) && gun_sway_y > 0) gun_sway_y_changed = gY;
+        if (gun_sway_y_changed < -(0.2f * bounds) && gun_sway_y < 0) gun_sway_y_changed = gY;
+        gX = gun_sway_x_changed;
+        gY = gun_sway_y_changed;
+      }
+    } else {
+      if (!start_centering) {
+        start_centering = true;
+        centering_speed = 0.0125f;
+      }
+    }
+
+    gX = std::min(gX, bounds); gX = std::max(gX, -bounds);
+    gY = std::min(gY, bounds); gY = std::max(gY, -bounds);
+
+    STF32(base, player + GE_OFF_CH_X, gX * crosshair_multiplier);
+    STF32(base, player + GE_OFF_CH_Y, gY * crosshair_multiplier);
+    STF32(base, player + GE_OFF_GUN_X, gX);
+    STF32(base, player + GE_OFF_GUN_Y, gY);
+  }
 }
 
 // ===========================================================================
@@ -1158,15 +1265,39 @@ REXCVAR_DEFINE_STRING(ge_key_back, "Tab", "Input/Keybinds", "Back button");
 // Runs once per controller poll, after XamInputGetState fills the slot-0 buffer
 // and before the guest dispatches it. OR our keyboard buttons in, and set the
 // left stick / triggers when their keys are held (pad input is preserved).
+void ge_mouse_camera(uint8_t* base);  // defined above
+void ge_apply_ce_data_patches(uint8_t* base);  // ge_ce_patches.cpp
+
 void ge_inject_keyboard(PPCRegister& /*r11*/) {
   // Attach the input listener from the controller-poll path too. InitMouseLook()
-  // runs at OnCreateDialogs when Runtime::display_window() can still be null, and
-  // the look hooks (ge_mouselook_*) only fire in-level -- so without this, the
-  // listener never attaches while in menus and keyboard/mouse stay dead until a
-  // level loads. This poll runs every frame (incl. menus), so it attaches early.
+  // runs at OnCreateDialogs when Runtime::display_window() can still be null, so
+  // without this the listener never attaches while in menus and keyboard/mouse
+  // stay dead until a level loads. This poll runs every frame (incl. menus), so
+  // it attaches early. NB: the keyboard early-return moved BELOW the CE/mouse
+  // block so data fixes + mouse-look still run when only the keyboard is off.
   ge_ensure_listener();
-  if (!REXCVAR_GET(ge_keyboard_enable) || !ge_input_active()) return;
   PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+
+  // Apply BeanTools community DATA bug-fixes once, before any level loads its
+  // setup/fog/BG data. The data segment is live in guest RAM by the first input
+  // poll (menu), which precedes any level load.
+  static bool ce_patched = false;
+  if (!ce_patched) {
+    ce_patched = true;
+    ge_apply_ce_data_patches(base);
+    REXKRNL_INFO("GECE community data bug-fixes applied");
+  }
+
+  // Mouse look runs every frame here, independent of the keyboard toggle. The
+  // cross-platform listener only accumulates deltas while the game is focused and
+  // the cursor is captured, so this is a no-op in menus / when unfocused.
+  // tick_capture() drives the per-frame capture/recenter lifecycle (it used to
+  // live in the now-removed ge_mouselook_pitch hook; ge_ensure_listener already
+  // ran at the top of this function).
+  g_listener.tick_capture();
+  if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
+
+  if (!REXCVAR_GET(ge_keyboard_enable) || !ge_input_active()) return;
 
   uint16_t add = 0;
   if (ge_key_down("ge_key_a")) add |= BTN_A;
@@ -1195,4 +1326,323 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (ge_key_down("ge_key_mv_down")) ly = -32767;
   if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
   if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
+}
+
+// ===========================================================================
+// BeanTools Community Edition CODE fixes (instruction patches replicated as
+// midasm hooks; the recomp runs generated C++ so the xex bytes can't be patched
+// directly). Addresses/values 1:1 with finalizer.c. Data-only CE fixes live in
+// ge_ce_patches.cpp.
+// ===========================================================================
+
+// fix_door_volume_clamp @0x820DD814: `li r3,0` -> `li r3,1` (min volume for
+// distant doors; 0 overflows). After-hook forces r3 = 1.
+void ge_ce_door_vol(PPCRegister& r3) { r3.u32 = 1; }
+
+// remove_beta_string_at_logo @0x820ED678: `ori r3,r3,0x9D97` -> `...0x9CE3`
+// (point the GoldenEye-logo string id at the empty string). Replace low half.
+void ge_ce_beta_str(PPCRegister& r3) {
+  r3.u32 = (r3.u32 & 0xFFFF0000u) | 0x9CE3u;
+}
+
+// extend_audio_distance, store site 0x8214438C: original `stfs f0,0x5C(r31)`
+// stored a small default scaler; CE makes X3DEmitter->CurveDistanceScaler =
+// 6500.0f. Re-store 6500.0f (0x45CB2000) to r31+0x5C after the original store.
+void ge_ce_audio_dist(PPCRegister& r31) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  ST32(base, r31.u32 + 0x5Cu, 0x45CB2000u);  // 6500.0f
+}
+
+// hardcode_near_clip_to_2, per-fog store site 0x82117B44: original
+// `stfs f0,0x14(r11)` writes the fog entry's near-clip into the global. CE NOOPs
+// it and pins the global to 2.0f. Can't NOOP a store in the recomp, so re-write
+// the just-stored slot (r11+0x14 == the near-clip global) back to 2.0f each load.
+void ge_ce_near_clip(PPCRegister& r11) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  ST32(base, r11.u32 + 0x14u, 0x40000000u);  // 2.0f
+}
+
+// remove_original_graphics_mode_blur @0x82188E70: CE NOOPs `bne cr6,+0x19C` so
+// the blur path is never taken. Branch-replace -> always fall through.
+//   jump_on_true  = 0x8218900C (original target, never taken)
+//   jump_on_false = 0x82188E74 (fall through)
+bool ge_ce_blur(PPCRegister& /*r3*/) { return false; }
+
+// remove_original_graphics_mode_from_intro @0x8209972C: CE turns
+// `bne cr6,0x82099750` into an unconditional `b 0x82099750` so the intro reads
+// the current graphics-mode flag. Branch-replace -> always take.
+//   jump_on_true  = 0x82099750 (always)
+//   jump_on_false = 0x82099730 (unused)
+bool ge_ce_intro_gfx(PPCRegister& /*r3*/) { return true; }
+
+// ===========================================================================
+// BeanTools Community Edition MP / network hack-functions, re-implemented as
+// midasm hooks (the recomp can't add the new 0x830E guest code, so each hack's
+// logic is replicated in C++ -- the same pattern as ge_hook_830E0xxx). Game
+// functions are called directly via their generated sub_ symbols. 1:1 with
+// finalizer.c.
+// ===========================================================================
+namespace { constexpr uint32_t GE_NET_FLAG = 0x830CAEA0u; }  // byte: !=0 = network MP session
+
+// disable_doors_autoclosing_on_mp @0x820E4F1C (after `lwz r11,0xE8(r30)` loads
+// the door open-tick): in a network session, force it to 0 so doors never
+// auto-close. Outside a session, keep the loaded value.
+void ge_ce_mp_door(PPCRegister& r11) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  if (base[GE_NET_FLAG] != 0) r11.u32 = 0;
+}
+
+// disable_player_collisions_for_network_mp @0x820CDFA4 (replaces `bl sub_820B3E90`,
+// the player-collision-radius calc): run it normally outside a network session;
+// in one, skip it so players pass through each other. The CE hack tail-returns
+// from the enclosing function in both cases, so return=true.
+void ge_ce_mp_collision() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  if (base[GE_NET_FLAG] == 0) sub_820B3E90(*ctx, base);
+}
+
+// fix_golden_gun_respawn_visiblity_flag @0x820CF940 (replaces cmpwi/bne): keep
+// the respawning weapon's invisible flag only for the golden gun in the MWTGG
+// scenario (so it stays hidden until grabbed); otherwise clear it so weapons
+// reappear. MP scenario id @0x82F61084; weapon id in r11 (golden gun = 0x13).
+//   jump_on_true  = 0x820CF948 (keep invisible: GG path)
+//   jump_on_false = 0x820CF94C (clear flag: normal path)
+bool ge_ce_golden_gun(PPCRegister& r11) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  return LD32(base, 0x82F61084u) == 3u && r11.u32 == 0x13u;
+}
+
+// make_mp_always_use_p2_fog @0x82117CB0 (after `cmpwi cr6,r3,1` @0x82117CAC; r3 =
+// active player count): with 2+ players, force the fog index to 2 (P2 fog) for a
+// consistent look; 1 player keeps the original path.
+//   jump_on_true  = 0x82117CB8 (2+ players: continue with r3=2)
+//   jump_on_false = 0x82117CB4 (1 player: original `li r3,0`)
+bool ge_ce_p2_fog(PPCRegister& r3) {
+  if (r3.s32 != 1) { r3.u32 = 2; return true; }
+  return false;
+}
+
+// fix_network_armor_bug @0x8216BC1C (after `stw r12,0x64(r30)`): re-implements
+// the CE `cal_dam` armor hack (the patch ships its C source). When an armor prop
+// is processed, award it to the NEAREST player within 10m -- fixes armor not
+// being granted to remote players in network MP. r30 = armor prop pointer.
+// Offsets from armor_fix_code.h: prop.type@+3, prop.pos@+0x58, prop.armorval@+0x84;
+// player coords ptr@+0x1AC, coord.pos@+0xC, player.armor@+0x1E8. Float consts:
+// 50.0@0x82000B90, 1000.0@0x8200371C (=10m), 1e6@0x82003F0C.
+void ge_ce_armor_fix(PPCRegister& r30) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  const uint32_t prop = r30.u32;
+  if (base[prop + 3] != 0x15) return;  // not an armor prop
+  const float f50 = LDF32(base, 0x82000B90u);
+  const float f1000 = LDF32(base, 0x8200371Cu);
+  float nearest = LDF32(base, 0x82003F0Cu);  // 1,000,000
+  const float px = LDF32(base, prop + 0x58u);
+  const float py = LDF32(base, prop + 0x5Cu);
+  const float pz = LDF32(base, prop + 0x60u);
+  int pick = -1;
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t pl = LD32(base, 0x82F1FA98u + i * 4u);
+    if (!pl) continue;
+    const uint32_t coords = LD32(base, pl + 0x1ACu);
+    const float dx = LDF32(base, coords + 0x0Cu) - px;
+    const float dy = (LDF32(base, coords + 0x10u) - f50) - py;
+    const float dz = LDF32(base, coords + 0x14u) - pz;
+    const float test = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (test < nearest) { nearest = test; pick = i; }
+  }
+  if (pick < 0 || nearest > f1000) return;  // nearest player >10m away (or none)
+  const uint32_t winner = LD32(base, 0x82F1FA98u + pick * 4u);
+  STF32(base, winner + 0x1E8u, LDF32(base, prop + 0x84u));  // grant armorval
+}
+
+// increase_mp_characters: bump the unlocked MP character count from 0x21 to 0x32
+// (`li r11,0x21` -> `li r11,0x32`) at the two unlock sites (0x820EF350 SP-clear,
+// 0x82106C54 system-link). The new character struct data is written in
+// ge_ce_patches.cpp (mpchars_altsandbonus -> 0x8272BA80).
+void ge_ce_mp_charcount(PPCRegister& r11) { r11.u32 = 0x32u; }
+
+// add_sfx_to_remote_player_weapons @0x8216E25C (runs BEFORE the original
+// `add r11,r10,r11`): play the firing SFX for a REMOTE player's weapon so you
+// hear other players shoot online. The CE hack saved/restored every register
+// around the SFX calls; we snapshot/restore the whole PPC context so the
+// remote-fire (tracer-spawn) function continues undisturbed -- the SFX is a pure
+// side effect. r11 = remote player struct pointer.
+//   paused flag @0x830633EC; remote-fire gate player+0x2044; old sound-buffer
+//   slots player+0xAFC / +0xB00; current weapon player+0x928; weapon-stats array
+//   @0x82421968 stride 0x38 (model flag +0x08, stats ptr +0x0C, sound id +0x26);
+//   play=sub_82144920, free=sub_82144970/sub_82144A08, set-loc=sub_821448F8;
+//   solo-fullscreen screen flag @0x8272B424; player coords player+0x1AC (+0xC).
+void ge_ce_remote_weapon_sfx(PPCRegister& r11) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  const uint32_t player = r11.u32;
+  if (!player) return;
+  if (LD32(base, 0x830633ECu) != 0) return;        // game paused
+  if (LD32(base, player + 0x2044u) != 0) return;   // remote-fire gate
+
+  PPCContext saved = *ctx;  // the SFX calls clobber volatile regs; restore after
+
+  auto deactivate = [&](uint32_t slot) {
+    uint32_t buf = LD32(base, slot);
+    if (!buf) return;
+    ctx->r3.u32 = buf; sub_82144970(*ctx, base);
+    if (ctx->r3.u32 == 0) return;
+    ctx->r3.u32 = LD32(base, slot); sub_82144A08(*ctx, base);
+  };
+  deactivate(player + 0x0AFCu);   // free old sound buffer 1
+  deactivate(player + 0x0B00u);   // free old sound buffer 2
+
+  const uint32_t snd_slot = player + 0x0B00u;  // play into buffer-2 slot
+  const uint32_t channel  = 0x1461u;
+
+  const uint32_t weapon = LD32(base, player + 0x928u);
+  const uint32_t entry  = 0x82421968u + weapon * 0x38u;  // weapon stats entry
+  if (LD32(base, entry + 0x08u) != 0) { *ctx = saved; return; }  // no model -> no sfx
+  const uint32_t stats = LD32(base, entry + 0x0Cu);
+  if (stats == 0) { *ctx = saved; return; }                     // null stats
+  const uint32_t sound_id = LD16(base, stats + 0x26u);          // weapon sound id
+  if ((int32_t)sound_id > 0x105) { *ctx = saved; return; }      // illegal range
+
+  ctx->r3.u32 = LD32(base, 0x83064DE0u);
+  ctx->r4.u32 = sound_id;
+  ctx->r5.u32 = snd_slot;
+  ctx->r6.u32 = LD32(base, 0x83064DE8u);
+  ctx->r7.u32 = 0x820036A8u;
+  ctx->r8.u32 = channel;
+  sub_82144920(*ctx, base);          // play sfx -> r3 = sound buffer
+  const uint32_t buf = ctx->r3.u32;
+  if (buf != 0 && LD32(base, 0x8272B424u) == 3u) {  // solo full-screen -> 3D pos
+    const uint32_t coord = LD32(base, player + 0x01ACu);
+    ctx->r3.u32 = buf;
+    ctx->r4.u32 = coord + 0x0Cu;
+    sub_821448F8(*ctx, base);        // set 3D location
+  }
+
+  *ctx = saved;  // restore -> remote-fire function continues unaffected
+}
+
+// set_mp_sfx_to_use_player_location: the 4 SFX call sites (gasp 0x820BF264,
+// slapper 0x820CDC5C, knife 0x820ACF54, item-equip 0x820AC4D0) all originally
+// `bl sub_82144920` (play sfx). CE redirects each through a helper that plays the
+// sound AND positions it at the emitting player's 3D location, so in
+// split-screen-solo/online you hear other players' actions directionally. This
+// hook IS that helper: it plays the sfx (args already in ctx from the caller),
+// then sets the 3D location -- but only when another player is the source (not
+// the local/active-viewport player, whose own sounds stay centered). Registered
+// at all 4 sites with jump_address = site+4 to replace the original bl. No reg
+// save needed: the original was itself a bl, so volatiles are already clobbered.
+// Shared helper: play the sfx (args already in ctx) and 3D-position it at the
+// emitting player -- but only when the source is a NON-local player (the local/
+// active-viewport player's own sounds stay centered).
+static void ge_ce_play_at_location(PPCContext* ctx, uint8_t* base) {
+  sub_82144920(*ctx, base);                    // play sfx (caller's args in ctx)
+  const uint32_t buf = ctx->r3.u32;            // sound buffer handle
+  if (buf == 0) return;                        // null buffer -> done
+  if (LD32(base, 0x8272B424u) != 3u) return;   // not solo full-screen view
+  if (LD32(base, 0x82F1FA9Cu) == 0 && LD64(base, 0x82F1FAA0u) == 0)
+    return;                                    // single-player -> no positioning
+  const uint32_t cur = LD32(base, 0x82F1FAACu);  // current player
+  if (LD32(base, cur + 0x904u) == 0) return;   // local active viewport -> centered
+  const uint32_t coord = LD32(base, cur + 0x1ACu);
+  ctx->r3.u32 = buf;
+  ctx->r4.u32 = coord + 0x0Cu;                 // -> player world location
+  sub_821448F8(*ctx, base);                    // set 3D location
+  ctx->r3.u32 = buf;                           // leave buffer in r3 for downstream
+}
+
+void ge_ce_sfx_3d() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  ST32(base, 0x824203ACu, 0);  // your own sound -> your death -> death tune plays
+  ge_ce_play_at_location(ctx, base);
+}
+
+// Trigger Gasps If Local Player Damaged, Else Argh (set_mp_sfx, gasp half) @
+// 0x820BF408 (replaces `bl sub_82144920`). When the damaged player is a REMOTE
+// player (solo-fullscreen + MP + not the local viewport + has a model), play a
+// gender-appropriate "argh" at their 3D location and flag this death as NOT
+// yours (0x824203AC=1) so the death tune is suppressed for it; otherwise it's
+// your own gasp (flag=0 -> death tune plays). jump_address skips the original bl.
+//   chr = player+0x1AC, model = chr+0x08, bodynum = model+0x0F; body-info array
+//   0x82729020 stride 0x24, gender +0x18; argh index female 0x83062BF4 (0..2,
+//   +0x0D) / male 0x83062BF8 (0..0x18, +0x86).
+void ge_ce_gasp() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  uint32_t model = 0;
+  if (LD32(base, 0x8272B424u) == 3u) {                       // solo full-screen
+    const bool mp = (LD32(base, 0x82F1FA9Cu) != 0) || (LD64(base, 0x82F1FAA0u) != 0);
+    if (mp) {
+      const uint32_t cur = LD32(base, 0x82F1FAACu);
+      if (LD32(base, cur + 0x904u) != 0) {                   // not the local viewport
+        const uint32_t chr = LD32(base, cur + 0x1ACu);
+        if (chr) model = LD32(base, chr + 0x08u);
+      }
+    }
+  }
+  if (model != 0) {                                          // remote player damaged
+    ST32(base, 0x824203ACu, 1u);                             // not your death
+    const uint32_t bodynum = base[model + 0x0Fu];
+    const uint32_t gender = base[0x82729020u + bodynum * 0x24u + 0x18u];
+    ctx->r5.u32 = 0;
+    uint32_t arghid;
+    if (gender == 0u) {                                      // female
+      int32_t i = (int32_t)LD32(base, 0x83062BF4u) + 1;
+      if (i > 2) i = 0;
+      ST32(base, 0x83062BF4u, (uint32_t)i);
+      arghid = (uint32_t)i + 0x0Du;
+    } else {                                                 // male
+      int32_t i = (int32_t)LD32(base, 0x83062BF8u) + 1;
+      if (i > 0x18) i = 0;
+      ST32(base, 0x83062BF8u, (uint32_t)i);
+      arghid = (uint32_t)i + 0x86u;
+    }
+    ctx->r4.u32 = arghid;
+    ge_ce_play_at_location(ctx, base);                       // argh at their location
+  } else {                                                   // your own gasp
+    ST32(base, 0x824203ACu, 0u);                             // your death -> death tune plays
+    sub_82144920(*ctx, base);                                // play gasp (caller's args)
+  }
+}
+
+// only_trigger_mp_death_tune_for_your_kills_and_yourself @0x820BFB04 (the
+// `bl <play death tune>`; r3 already = 6 from the vanilla `li r3,6` at 0x820BFB00).
+// Skip the death tune when 0x824203AC is set (the gasp hook flagged this death as
+// another player's). jump_on_true skips the bl; no jump_on_false -> falls through
+// and plays it for your own deaths.
+bool ge_ce_death_tune() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  return LD32(base, 0x824203ACu) != 0u;
+}
+
+// reset_internal_cheat_state float relocation @0x8209D88C: the death-tune logic
+// reads a 5.0f that originally lived at the address CE now repurposes as the
+// bypass flag (0x824203AC). After the original `lfs f1,0x3AC(r11)`, reload f1
+// from +0x3A8 instead (where ge_ce_patches stashes the 5.0f). r11 = 0x82420000.
+void ge_ce_killtune_float(PPCRegister& r11, PPCRegister& f1) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  f1.f64 = (double)LDF32(base, r11.u32 + 0x3A8u);
+}
+
+// fix_watch_volume_sliders_range: the watch volume sliders only spanned half the
+// real 0-100 range. CE reads the stored byte and halves it for display, and
+// doubles the slider value before storing (entering the save routine past its
+// clamp). READ hooks replace `bl <vol read>` (r3 = settings ptr -> vol byte >> 1);
+// SAVE hooks replace `bl <vol save>` (double r4, then run the save routine from
+// its mid-point continuation so the doubled value isn't clamped back). Music vol
+// byte = settings+0x295, fx vol = settings+0x294. All use jump_address = site+4.
+void ge_ce_watch_music_read(PPCRegister& r3) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  r3.u32 = (uint32_t)(base[r3.u32 + 0x295u] >> 1);
+}
+void ge_ce_watch_sfx_read(PPCRegister& r3) {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx;
+  r3.u32 = (uint32_t)(base[r3.u32 + 0x294u] >> 1);
+}
+void ge_ce_watch_music_save() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  ctx->r4.u32 = ctx->r4.u32 + ctx->r4.u32;   // double the slider value
+  ge_cont_82184E18(*ctx, base);              // save routine past its clamp
+}
+void ge_ce_watch_sfx_save() {
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
+  ctx->r4.u32 = ctx->r4.u32 + ctx->r4.u32;
+  ge_cont_82184E48(*ctx, base);
 }

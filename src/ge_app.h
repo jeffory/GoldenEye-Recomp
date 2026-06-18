@@ -48,7 +48,11 @@ class GeApp : public rex::ReXApp {
   // are just defaults -- ge.toml (written by the in-game menu) overrides them.
   void OnConfigurePaths(rex::PathConfig& paths) override {
     (void)paths;
-    rex::cvar::SetFlagByName("vsync", "false");
+    // NOTE: vsync is NOT forced here. Its SDK default is false (off), so the
+    // in-menu toggle persists: turning it ON differs from default -> written to
+    // ge.toml; OFF == default -> not written but still boots off. Forcing it here
+    // would re-assert off every boot and the "on" choice would never survive a
+    // restart (SaveConfig only writes cvars that differ from their default).
     rex::cvar::SetFlagByName("max_fps", "60");  // default 60 (clamped to native refresh)
     rex::cvar::SetFlagByName("window_width", "2560");
     rex::cvar::SetFlagByName("window_height", "1440");
@@ -77,6 +81,10 @@ class GeApp : public rex::ReXApp {
   // Register the ESC pause-menu keybind and create the always-on Post-FX
   // filter overlay once the ImGui drawer exists.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    // Window/taskbar title shown while running. Overrides the SDK default
+    // ("ge <build stamp>"); the internal app name stays "ge" so ge.toml and the
+    // user data dir are unchanged.
+    if (window()) window()->SetTitle("GoldenEye");
     rex::ui::RegisterBind("bind_pause_menu", "Escape", "Pause menu",
                           [this] { TogglePauseMenu(); });
     ge::InitMouseLook();  // attach the cross-platform mouse/keyboard look listener

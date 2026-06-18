@@ -1,0 +1,5 @@
+// Application icon. The rexglue window class loads it by the name "MAINICON"
+// (LoadIconW(hinstance, L"MAINICON") in window_win.cpp) and applies it via
+// WM_SETICON, so this is the icon for the .exe, the window title bar, and the
+// taskbar. Windows Explorer shows it for the file too.
+MAINICON ICON "Icon.ico"
