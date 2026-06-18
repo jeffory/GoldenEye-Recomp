@@ -832,8 +832,7 @@ constexpr float GE_RAD2DEG = 57.29578f;
 }  // namespace
 
 namespace {
-float g_look_yaw_deg = 0.0f;  // our absolute yaw (deg, [0,360))
-float g_look_pitch = 0.0f;    // our absolute pitch (+612 units)
+float g_look_pitch = 0.0f;    // last pitch we wrote (+612 units); held vs auto-level
 uint32_t g_look_bv = 0;       // bondview struct we're tracking
 }  // namespace
 
@@ -1004,11 +1003,18 @@ void SetMouselookSuppressed(bool v) { g_listener.set_suppressed(v); }
 // (that site runs every frame). Kept only to confirm firing / lazily attach.
 void ge_mouselook_yaw(PPCRegister& /*r11*/) { ge_ensure_listener(); }
 
-// PITCH: runs every frame in ge_bondview_control (unconditional pitch site).
-// Keep our own absolute yaw/pitch from raw mouse deltas and write them straight
-// into the camera state: +596 (HUD yaw), +612 (pitch), and the heading
-// (flt_82F1F900/904/910) the view matrix is built from. Re-sync to the game's
-// values when the active view changes.
+// PITCH/YAW look injection. Runs every frame in ge_bondview_control AFTER the
+// guest has folded the right stick into the camera state this frame: the stick's
+// pitch is already integrated into bondview+612, and its yaw into the heading
+// (flt_82F1F900/904/910) the view matrix is built from.
+//
+// Mouse-look is ADDITIVE with the stick: we read the angle the game just computed
+// from the pad and add only the mouse's per-frame delta on top. Earlier this site
+// wrote a frozen absolute (seeded once per view, moved only by the mouse) into the
+// camera every frame, which CLOBBERED the right stick -- with no mouse to move it
+// (e.g. a handheld with no mouse at all) the view snapped back to that frozen
+// value every frame, so the right stick appeared stuck. Reading the live value and
+// adding the mouse delta lets both work at once on every platform.
 void ge_mouselook_pitch(PPCRegister& /*r11*/) {
   ge_ensure_listener();
   g_listener.tick_capture();  // capture lifecycle (matches upstream: independent of FP gate)
@@ -1020,46 +1026,50 @@ void ge_mouselook_pitch(PPCRegister& /*r11*/) {
   //   * g_CameraMode != FP  -> level-start intro fly-in (modes 1/2/3), swirl,
   //     death cam, ending pose, fade-to-title, etc. (gameplay = 4).
   //   * gBondViewCutscene   -> a scripted camera took over mid-level in FP mode.
-  // Clear g_look_bv so the view re-syncs to the game's angle when control returns
-  // (no snap) instead of fighting the scripted/intro camera.
+  // Clear g_look_bv so ge_pitch_hold stops holding and the scripted/intro camera
+  // is left alone; control returns with no snap (we re-read the live angle below).
   if (!ge_mouselook_on() || LD32(base, GE_CAMERA_MODE) != GE_CAM_FP ||
       LD32(base, GE_CUTSCENE) != 0) {
     g_look_bv = 0;
     return;
   }
-
-  float game_yaw = LDF32(base, bv + GE_BV_YAW);
-  float game_pitch = LDF32(base, bv + GE_BV_PITCH);
-  if (bv != g_look_bv) {  // new view -> adopt the game's current angles
-    g_look_bv = bv;
-    g_look_yaw_deg = game_yaw;
-    g_look_pitch = game_pitch;
-  }
+  g_look_bv = bv;  // tracking this view (gates ge_pitch_hold)
 
   const float sens = static_cast<float>(REXCVAR_GET(ge_mouse_sens));
   int dx = ge_take_mouse_dx();
   int dy = ge_take_mouse_dy();
 
-  g_look_yaw_deg += static_cast<float>(dx) * sens * kYawDegPerCount;   // right = +yaw
-  while (g_look_yaw_deg >= 360.0f) g_look_yaw_deg -= 360.0f;
-  while (g_look_yaw_deg < 0.0f) g_look_yaw_deg += 360.0f;
-
-  g_look_pitch += static_cast<float>(-dy) * sens * kPitchPerCount;     // up = look up
-  if (g_look_pitch > kPitchMax) g_look_pitch = kPitchMax;
-  if (g_look_pitch < kPitchMin) g_look_pitch = kPitchMin;
-
-  STF32(base, bv + GE_BV_YAW, g_look_yaw_deg);   // HUD/radar copy
-  STF32(base, bv + GE_BV_PITCH, g_look_pitch);
+  // PITCH: rebase on the game's current +612 (the stick's pitch is already in) and
+  // add the mouse delta. With no mouse this writes the stick's own value straight
+  // back (a no-op clobber); ge_pitch_hold then holds it against the walking
+  // auto-level. Remember it for that hold.
+  float pitch = LDF32(base, bv + GE_BV_PITCH);
+  pitch += static_cast<float>(-dy) * sens * kPitchPerCount;            // up = look up
+  if (pitch > kPitchMax) pitch = kPitchMax;
+  if (pitch < kPitchMin) pitch = kPitchMin;
+  g_look_pitch = pitch;
+  STF32(base, bv + GE_BV_PITCH, pitch);
   ST32(base, bv + GE_BV_CENTER_FLAG, 0u);  // suppress vertical auto-center
 
-  // YAW: drive the heading the camera is built from (+ its smoother steady-state).
-  float offset = LDF32(base, GE_YAW_OFFSET);
-  float h = g_look_yaw_deg / GE_RAD2DEG - offset;
-  while (h >= GE_TWO_PI) h -= GE_TWO_PI;
-  while (h < 0.0f) h += GE_TWO_PI;
-  STF32(base, GE_YAW_HEADING, h);
-  STF32(base, GE_YAW_SMOOTH, h * 12.5f);
-  STF32(base, GE_YAW_TARGET, h);
+  // YAW: only assert the heading when the mouse actually moved, and add its delta
+  // to the LIVE heading (already carrying the right stick's turn this frame). With
+  // no mouse motion we leave the heading untouched so the stick fully owns yaw and
+  // its smoother isn't fought.
+  if (dx != 0) {
+    float offset = LDF32(base, GE_YAW_OFFSET);
+    float h = LDF32(base, GE_YAW_HEADING);                            // rad, incl. stick
+    h += (static_cast<float>(dx) * sens * kYawDegPerCount) / GE_RAD2DEG;  // right = +yaw
+    while (h >= GE_TWO_PI) h -= GE_TWO_PI;
+    while (h < 0.0f) h += GE_TWO_PI;
+    STF32(base, GE_YAW_HEADING, h);
+    STF32(base, GE_YAW_SMOOTH, h * 12.5f);
+    STF32(base, GE_YAW_TARGET, h);
+    // keep the HUD/radar degrees copy (+596) in sync with the heading we just set
+    float yaw_deg = (h + offset) * GE_RAD2DEG;
+    while (yaw_deg >= 360.0f) yaw_deg -= 360.0f;
+    while (yaw_deg < 0.0f) yaw_deg += 360.0f;
+    STF32(base, bv + GE_BV_YAW, yaw_deg);
+  }
 }
 
 // No-op (kept hooked, harmless). Pitch is driven via +612 in ge_mouselook_pitch.
