@@ -141,6 +141,10 @@ struct CPProbe : rex::graphics::CommandProcessor {
 std::atomic<uint32_t> g_present_cpcnt{0};
 // Guest tick at the last present, for a bounded completion wait.
 std::atomic<uint32_t> g_present_tb{0};
+// Count of 80ms GPU-wait skip-bit fallback EPISODES in ge_dbg_now (one per stall
+// stretch, not per poll). Logged in the GEWATCHDOG STALL dump so a captured
+// lock-up shows whether the render-side skip-bit fallback fired.
+std::atomic<uint32_t> g_skipbit_fallback_fires{0};
 inline rex::graphics::CommandProcessor* ge_cp() {
   auto* ks = rex::system::kernel_state();
   if (!ks) return nullptr;
@@ -191,6 +195,10 @@ inline void ST16(uint8_t* b, uint32_t ga, uint16_t val) {
 }
 }  // namespace
 
+// rexglue CP WAIT_REG_MEM >60ms deadlock-breaker fire count (command_processor.cpp).
+// Lets the watchdog report whether the CPU<->GPU fence breaker fired in a lock-up.
+extern "C" uint32_t rex_ge_cp_wait_reg_mem_timeouts();
+
 // ===========================================================================
 // Freeze watchdog. Auto-detects the visual freeze (the guest keeps presenting
 // -- present# advancing -- but the GPU command ring stops advancing) and logs
@@ -236,7 +244,9 @@ void ge_watchdog_thread() {
       // release the CP). The render is parked waiting on GPU completion ->
       // deadlock. Write 0 to release the CP: it drains the buffer, delivers the
       // completion, the render resumes. Memory-only, no interrupt (safe).
-      if (stall >= 2 && dev && idblk && idblk < 0xFFFFFFFEu) {
+      // Active recovery WRITES guest memory, so it is opt-in via ge_freeze_diag;
+      // the default-on watchdog only observes + logs.
+      if (stall >= 2 && dev && idblk && idblk < 0xFFFFFFFEu && REXCVAR_GET(ge_freeze_diag)) {
         ST32(base, idblk, 0u);  // release the CP's WAIT_REG_MEM semaphore
         if (!recover_fired) {
           recover_fired = true;
@@ -260,6 +270,13 @@ void ge_watchdog_thread() {
             "skipbit={} | dev={:#x} idblk={:#x}",
             rpi, wpi, (rpi == wpi ? "DRAINED" : "PENDING"), present, present - present_at_stall_start,
             dbg, dbg - dbg_at_stall_start, submit, presented, target, semaphore, skip, dev, idblk);
+        // Residual render-path stall mechanisms (cumulative fire counts): which one
+        // tripped tells us whether this lock-up is the CPU<->GPU fence deadlock
+        // (WAIT_REG_MEM breaker) or the guest GPU-wait giving up (skip-bit fallback).
+        REXKRNL_INFO(
+            "GEWATCHDOG -> residual fires: skipbit-fallback(80ms)={} | WAIT_REG_MEM-breaker(60ms)={}",
+            g_skipbit_fallback_fires.load(std::memory_order_relaxed),
+            rex_ge_cp_wait_reg_mem_timeouts());
         REXKRNL_INFO(
             "GEWATCHDOG -> render={} | presenting={} | producer={} | polling={}",
             // The real freeze mechanism: the guest latched the skip bit and is
@@ -456,7 +473,11 @@ void ge_watchdog_thread() {
 }
 
 inline void ge_start_watchdog_once() {
-  if (!REXCVAR_GET(ge_freeze_diag)) return;  // diagnostics off in shipping builds
+  // Detection + logging run by DEFAULT (a 250ms-poll detached thread, negligible
+  // cost) so a rare in-the-wild lock-up is captured in ge.log without needing
+  // ge_freeze_diag set ahead of time. The active memory-write auto-recovery
+  // inside the loop stays gated behind ge_freeze_diag, so the default behaviour is
+  // purely observational.
   static std::atomic<bool> started{false};
   bool expected = false;
   if (started.compare_exchange_strong(expected, true)) {
@@ -545,11 +566,18 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
   // this stays a one-shot "proceed past this stall", not a permanent skip.
   static thread_local uint32_t s_wait_start = 0;
   static thread_local bool s_waiting = false;
+  static thread_local bool s_fallback_counted = false;
   if (!drawn) {
-    if (!s_waiting) { s_waiting = true; s_wait_start = t; }
+    if (!s_waiting) { s_waiting = true; s_wait_start = t; s_fallback_counted = false; }
     else if ((uint32_t)(t - s_wait_start) > 4000000u) {  // ~80ms @49.875MHz
       drawn = true;
       if (dev) base[dev + 10941u] |= 0x02u;   // stalled: skip this GPU wait
+      // Count once per stall episode (this branch re-runs every poll while the
+      // stall persists); the watchdog reports it as a residual-mechanism signal.
+      if (!s_fallback_counted) {
+        s_fallback_counted = true;
+        g_skipbit_fallback_fires.fetch_add(1, std::memory_order_relaxed);
+      }
     }
     // The six GPU-completion waits poll this routine. Yield the core back so the
     // rexglue CP worker (the thread that advances the ring read pointer / swap
