@@ -20,8 +20,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments "-DREXSDK_DIR=${file(rootProject.findProperty('rexSdkDir') ?: '../../GoldenEye-Recomp-rexglue').absolutePath}",
-                          '-DCMAKE_BUILD_TYPE=RelWithDebInfo'
+                arguments "-DREXSDK_DIR=${file(rootProject.findProperty('rexSdkDir') ?: '../../GoldenEye-Recomp-rexglue').absolutePath}"
                 // C++23; libc++ jthread/stop_token need the experimental library.
                 cppFlags '-std=c++23', '-fexperimental-library'
             }
@@ -42,8 +41,29 @@ android {
     // AGP picks up the target `ge` and its shared-lib dependencies automatically.
 
     buildTypes {
+        debug {
+            debuggable true
+            jniDebuggable true
+            // Keep extractNativeLibs=true so simpleperf / run-as can access .so files on-disk.
+            manifestPlaceholders = [extractNativeLibs: 'true']
+            externalNativeBuild {
+                cmake {
+                    arguments '-DCMAKE_BUILD_TYPE=Debug'
+                }
+            }
+        }
         release {
+            debuggable false
             minifyEnabled false
+            // Uncompressed libs in APK: loaded directly via mmap, no disk extraction.
+            manifestPlaceholders = [extractNativeLibs: 'false']
+            externalNativeBuild {
+                cmake {
+                    // RelWithDebInfo now compiles at -O3 -DNDEBUG -g (see rexglue CMakeLists.txt).
+                    // Keeps DWARF symbols in the .so for symbolication; strip is done at APK packaging.
+                    arguments '-DCMAKE_BUILD_TYPE=RelWithDebInfo'
+                }
+            }
         }
     }
 
