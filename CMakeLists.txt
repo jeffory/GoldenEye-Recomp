@@ -19,6 +19,7 @@ include(generated/rexglue.cmake)
 set(GE_SOURCES
     src/main.cpp
     src/ge_hooks.cpp
+    src/ge_gamestate.cpp
     src/ge_menu.cpp
     src/ge_postfx.cpp
     src/ge_username.cpp
