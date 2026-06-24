@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -13,7 +14,9 @@ import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.Log;
 import android.util.TypedValue;
+import android.view.Display;
 import android.view.Gravity;
+import android.view.Surface;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -80,6 +83,14 @@ public class GoldenEyeActivity extends NativeActivity {
     private TextView overlayText;
     private int dotPhase;
 
+    // Dual-screen weapon menu (AYN Thor secondary display). The Presentation hosts
+    // a SurfaceView whose Surface is handed to native code; native renders the
+    // ImGui weapon menu into it. Null whenever there is no secondary display
+    // (single-screen fallback).
+    private DisplayManager displayManager;
+    private DisplayManager.DisplayListener displayListener;
+    private WeaponMenuPresentation weaponPresentation;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         attempt = getIntent() != null ? getIntent().getIntExtra(ATTEMPT_EXTRA, 0) : 0;
@@ -118,6 +129,18 @@ public class GoldenEyeActivity extends NativeActivity {
         watchdogThread = new Thread(this::bootWatchdogRun, "ge-boot-watchdog");
         watchdogThread.setDaemon(true);
         watchdogThread.start();
+
+        // Watch for a secondary display appearing/disappearing (dock, hotplug).
+        // The actual binding is (re)established in onResume / onDisplay* below.
+        displayManager = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+        if (displayManager != null) {
+            displayListener = new DisplayManager.DisplayListener() {
+                @Override public void onDisplayAdded(int displayId) { updateSecondaryDisplay(); }
+                @Override public void onDisplayRemoved(int displayId) { updateSecondaryDisplay(); }
+                @Override public void onDisplayChanged(int displayId) { updateSecondaryDisplay(); }
+            };
+            displayManager.registerDisplayListener(displayListener, null);
+        }
     }
 
     @Override
@@ -323,12 +346,105 @@ public class GoldenEyeActivity extends NativeActivity {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
+    // --- Dual-screen weapon menu --------------------------------------------
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        updateSecondaryDisplay();
+    }
+
+    @Override
+    protected void onPause() {
+        // Drop the secondary surface while backgrounded; native tears its surface
+        // down cleanly and re-creates it on the next resume.
+        teardownSecondaryDisplay();
+        super.onPause();
+    }
+
+    /** Bring the weapon menu up if a secondary display exists, else tear it down. */
+    private void updateSecondaryDisplay() {
+        Display secondary = pickSecondaryDisplay();
+        if (secondary == null) {
+            teardownSecondaryDisplay();   // single-screen fallback
+            return;
+        }
+        if (weaponPresentation != null) {
+            if (weaponPresentation.getDisplay() != null
+                    && weaponPresentation.getDisplay().getDisplayId() == secondary.getDisplayId()
+                    && weaponPresentation.isShowing()) {
+                return;  // already showing on this display
+            }
+            teardownSecondaryDisplay();
+        }
+        try {
+            weaponPresentation = new WeaponMenuPresentation(this, secondary, this);
+            weaponPresentation.show();
+            Log.i(TAG, "weapon menu presentation shown on display " + secondary.getDisplayId());
+        } catch (Throwable t) {
+            Log.e(TAG, "failed to show weapon menu presentation", t);
+            weaponPresentation = null;
+        }
+    }
+
+    /** The first non-default (presentation) display, or null on a single-screen device. */
+    private Display pickSecondaryDisplay() {
+        if (displayManager == null) {
+            return null;
+        }
+        Display[] presentation =
+            displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION);
+        if (presentation != null && presentation.length > 0) {
+            return presentation[0];
+        }
+        for (Display d : displayManager.getDisplays()) {
+            if (d.getDisplayId() != Display.DEFAULT_DISPLAY) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    private void teardownSecondaryDisplay() {
+        if (weaponPresentation != null) {
+            try {
+                weaponPresentation.dismiss();
+            } catch (Throwable t) {
+                // ignore
+            }
+            weaponPresentation = null;
+        }
+        releaseSecondarySurface();
+    }
+
+    // Called by WeaponMenuPresentation on the main thread.
+    void provideSecondarySurface(Surface surface, int width, int height) {
+        nativeProvideSecondaryDisplaySurface(surface, width, height);
+    }
+
+    void releaseSecondarySurface() {
+        nativeReleaseSecondaryDisplaySurface();
+    }
+
+    void forwardSecondaryTouch(int pointerId, int action, float x, float y) {
+        nativeSecondaryTouch(pointerId, action, x, y);
+    }
+
+    // Implemented in src/ge_android_ds.cpp (libge.so).
+    private native void nativeProvideSecondaryDisplaySurface(Surface surface, int width, int height);
+    private native void nativeReleaseSecondaryDisplaySurface();
+    private native void nativeSecondaryTouch(int pointerId, int action, float x, float y);
+
     @Override
     protected void onDestroy() {
         stopWatchdog = true;
         if (watchdogThread != null) {
             watchdogThread.interrupt();
         }
+        if (displayManager != null && displayListener != null) {
+            displayManager.unregisterDisplayListener(displayListener);
+        }
+        teardownSecondaryDisplay();
         hideOverlay();
         if (overlayThread != null) {
             overlayThread.quitSafely();

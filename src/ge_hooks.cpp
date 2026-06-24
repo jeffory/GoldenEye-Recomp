@@ -15,6 +15,7 @@
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
 #include "ge_gamestate.h"  // ge::gamestate::OnFrame (game-state bridge pump)
+#include "ge_dualscreen.h"  // ge::DualScreen (second-screen weapon menu pacing)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
 #include <rex/runtime.h>
 #include <rex/system/xmemory.h>
@@ -567,6 +568,13 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   // menu, and apply any pending equip request. Inert until the guest inventory
   // layout is confirmed on-device (see ge_gamestate.cpp); safe to call here.
   ge::gamestate::OnFrame(ctx, base);
+
+  // Pace the second-screen weapon menu: request one UI-thread paint of the
+  // secondary surface for this frame. Runs on the game thread, so it only posts
+  // a deferred UI-thread tick (the secondary surface must be touched only there)
+  // -- and it is a cheap no-op when there is no second screen / the feature is
+  // off, which is the single-screen fallback. See ge_dualscreen.cpp.
+  ge::DualScreen::Get().OnGuestPresent();
 }
 
 // F3  0x830E0670 (site 0x8209F5F0 sub_8209F5D8 -> ge_cont_8209F5F4)

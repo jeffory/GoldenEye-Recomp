@@ -1,0 +1,153 @@
+// ge - second-screen weapon-selection menu. See ge_weaponmenu.h.
+//
+// Drawn as a single full-panel ImGui window (no title bar / not movable): this
+// dialog owns the entire secondary display, so it fills io.DisplaySize. Layout
+// is a responsive grid of large, touch-friendly buttons -- one per carried
+// weapon -- with ammo counts; the equipped weapon is highlighted. Tapping a
+// button posts an equip request to the game thread via the bridge.
+
+#include "ge_weaponmenu.h"
+
+#include "ge_gamestate.h"
+
+#include <imgui.h>
+
+#include <algorithm>
+#include <cstdio>
+
+namespace ge {
+
+namespace {
+
+// Briefing-style palette, kept close to the pause menu (ge_menu.cpp) so the two
+// screens read as one product.
+constexpr ImU32 kBg = IM_COL32(18, 16, 12, 255);          // near-black backing
+constexpr ImU32 kPanel = IM_COL32(214, 201, 162, 255);    // manila paper
+constexpr ImU32 kBtn = IM_COL32(52, 46, 34, 255);         // unselected slate
+constexpr ImU32 kBtnHover = IM_COL32(74, 66, 48, 255);
+constexpr ImU32 kBtnActive = IM_COL32(96, 86, 62, 255);
+constexpr ImU32 kEquipped = IM_COL32(196, 36, 28, 255);   // red = currently equipped
+constexpr ImU32 kEquippedHover = IM_COL32(220, 60, 50, 255);
+
+// Provisional weapon names. GoldenEye's carried-weapon slot order is confirmed
+// on-device alongside the bridge offsets (ge_gamestate.cpp); until then this is
+// a best-effort guess and WeaponLabel() falls back to "Slot N" for anything not
+// listed, so the UI never shows a name it cannot stand behind.
+constexpr const char* kProvisionalNames[] = {
+    "Unarmed",   "Knife",      "Hunting Knife", "Throwing Knife", "PP7",
+    "PP7 (Sil.)", "DD44",      "Klobb",         "KF7 Soviet",     "ZMG (9mm)",
+    "D5K",        "D5K (Sil.)", "Phantom",       "AR33",           "RC-P90",
+    "Shotgun",   "Auto Shotgun", "Sniper Rifle", "Cougar Magnum",  "Golden Gun",
+    "Silver PP7", "Gold PP7",  "Moonraker",     "Grenade Launcher", "Rocket Launcher",
+    "Grenades",  "Timed Mine", "Proximity Mine", "Remote Mine",    "Taser",
+    "Tank",      "Watch Laser",
+};
+
+}  // namespace
+
+const char* WeaponMenuDialog::WeaponLabel(int id) {
+  if (id >= 0 && id < static_cast<int>(std::size(kProvisionalNames))) {
+    return kProvisionalNames[id];
+  }
+  static char buf[16];
+  std::snprintf(buf, sizeof(buf), "Slot %d", id);
+  return buf;
+}
+
+WeaponMenuDialog::WeaponMenuDialog(rex::ui::ImGuiDrawer* drawer)
+    : rex::ui::ImGuiDialog(drawer) {}
+
+void WeaponMenuDialog::OnDraw(ImGuiIO& io) {
+  const ImVec2 screen = io.DisplaySize;
+
+  ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+  ImGui::SetNextWindowSize(screen);
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                           ImGuiWindowFlags_NoBringToFrontOnFocus |
+                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, kBg);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 16.0f));
+  if (!ImGui::Begin("##ge_weapon_menu", nullptr, flags)) {
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    return;
+  }
+
+  const gamestate::WeaponSnapshot snap = gamestate::GetWeaponSnapshot();
+
+  // Header.
+  ImGui::PushStyleColor(ImGuiCol_Text, kPanel);
+  ImGui::TextUnformatted("WEAPONS");
+  ImGui::PopStyleColor();
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  if (!snap.valid || snap.held_count == 0) {
+    // Single-screen fallback / pre-RE state: render an explicit "unavailable"
+    // message instead of trusting stale or zeroed data.
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 190, 160, 255));
+    const char* msg = snap.valid ? "No weapons carried." : "Weapon data unavailable.";
+    const ImVec2 sz = ImGui::CalcTextSize(msg);
+    ImGui::SetCursorPos(ImVec2((screen.x - sz.x) * 0.5f, screen.y * 0.5f));
+    ImGui::TextUnformatted(msg);
+    ImGui::PopStyleColor();
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    return;
+  }
+
+  // Responsive grid sizing. Target ~2 columns on the narrow AYN panel, more if
+  // the surface is wider; each button is sized for a fingertip.
+  const float avail_w = ImGui::GetContentRegionAvail().x;
+  const float min_btn_w = 200.0f;
+  int cols = std::max(1, static_cast<int>(avail_w / min_btn_w));
+  cols = std::min(cols, 4);
+  const float spacing = 10.0f;
+  const float btn_w = (avail_w - spacing * (cols - 1)) / static_cast<float>(cols);
+  const float btn_h = std::max(64.0f, screen.y * 0.16f);
+
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(spacing, spacing));
+
+  int drawn = 0;
+  for (int i = 0; i < snap.held_count; ++i) {
+    const int id = snap.held_ids[i];
+    const bool equipped = (id == snap.equipped_id);
+    const unsigned ammo = (id >= 0 && id < gamestate::kMaxWeaponSlots) ? snap.ammo[id] : 0;
+
+    if (drawn % cols != 0) {
+      ImGui::SameLine();
+    }
+    ++drawn;
+
+    ImGui::PushID(id);
+    ImGui::PushStyleColor(ImGuiCol_Button, equipped ? kEquipped : kBtn);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, equipped ? kEquippedHover : kBtnHover);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, equipped ? kEquippedHover : kBtnActive);
+
+    char label[64];
+    std::snprintf(label, sizeof(label), "%s\nx%u%s", WeaponLabel(id), ammo,
+                  equipped ? "  (equipped)" : "");
+    if (ImGui::Button(label, ImVec2(btn_w, btn_h)) && !equipped) {
+      // Post the switch; the game thread applies it on its next frame at a safe
+      // point (see ge_gamestate.cpp). No-op on the equipped weapon.
+      gamestate::RequestEquipWeapon(id);
+    }
+
+    ImGui::PopStyleColor(3);
+    ImGui::PopID();
+  }
+
+  ImGui::PopStyleVar(2);
+
+  ImGui::End();
+  ImGui::PopStyleVar();
+  ImGui::PopStyleColor();
+}
+
+}  // namespace ge

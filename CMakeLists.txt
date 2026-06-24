@@ -23,7 +23,17 @@ set(GE_SOURCES
     src/ge_menu.cpp
     src/ge_postfx.cpp
     src/ge_username.cpp
+    src/ge_dualscreen.cpp   # dual-screen weapon-menu controller (all platforms)
+    src/ge_weaponmenu.cpp   # second-screen weapon-menu UI (all platforms)
 )
+
+# Android-only JNI binding: turns the secondary-display Surface (created by the
+# Java Presentation) into an ANativeWindow for the controller. It is also
+# #ifdef __ANDROID__-guarded, but it includes android/native_window_jni.h which
+# only exists in the NDK, so it is compiled on Android alone.
+if(ANDROID)
+    list(APPEND GE_SOURCES src/ge_android_ds.cpp)
+endif()
 
 if(WIN32)
     add_executable(ge WIN32 ${GE_SOURCES})
