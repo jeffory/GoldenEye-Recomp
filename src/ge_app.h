@@ -16,6 +16,7 @@
 
 #include <string>
 
+#include "ge_fps.h"
 #include "ge_menu.h"
 #include "ge_postfx.h"
 
@@ -61,6 +62,7 @@ class GeApp : public rex::ReXApp {
     rex::ui::RegisterBind("bind_pause_menu", "Escape", "Pause menu",
                           [this] { TogglePauseMenu(); });
     postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
+    fps_overlay_ = std::make_unique<ge::FpsOverlay>(drawer);
     // Username/server are set in the ONLINE pause-menu tab now -- no first-boot
     // prompt. They apply on the Save & Restart the ONLINE tab triggers.
   }
@@ -75,6 +77,7 @@ class GeApp : public rex::ReXApp {
       menu_ = nullptr;
     }
     postfx_.reset();
+    fps_overlay_.reset();
   }
 
  private:
@@ -125,4 +128,5 @@ class GeApp : public rex::ReXApp {
 
   GeMenuDialog* menu_ = nullptr;  // non-owning; self-deletes via the drawer
   std::unique_ptr<ge::PostFxOverlay> postfx_;       // always-on filter layer
+  std::unique_ptr<ge::FpsOverlay>    fps_overlay_;  // FPS/frametime corner HUD
 };

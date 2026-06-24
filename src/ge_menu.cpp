@@ -330,6 +330,25 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
                          "(fixes picture freeze; higher = fewer freezes, more lag)");
 
       ImGui::Spacing();
+
+      // --- FPS/Frametime overlay ---
+      bool show_fps = GetCvarB("ge_show_fps");
+      if (ImGui::Checkbox("Show FPS Overlay", &show_fps)) {
+        SetCvarB("ge_show_fps", show_fps);
+        if (callbacks_.persist_config) callbacks_.persist_config();
+      }
+      ImGui::TextColored(ImColor(kInkDim), "(FPS + frametime HUD in top-left corner)");
+
+      ImGui::Spacing();
+
+      bool perf_log = GetCvarB("ge_perf_log");
+      if (ImGui::Checkbox("Perf Log (1/sec to ge.log)", &perf_log)) {
+        SetCvarB("ge_perf_log", perf_log);
+        if (callbacks_.persist_config) callbacks_.persist_config();
+      }
+      ImGui::TextColored(ImColor(kInkDim), "(frametime percentiles; use for before/after comparison)");
+
+      ImGui::Spacing();
       ImGui::Separator();
       ImGui::Spacing();
 

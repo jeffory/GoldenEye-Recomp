@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "ge_fps.h"    // FpsRecordPresent (per-present frametime sampling)
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
 #include <rex/cvar.h>  // REXCVAR_DEFINE_BOOL / REXCVAR_GET (ge_freeze_diag)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
@@ -594,8 +595,10 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   uint32_t a1 = r31.u32;
   auto* cpp = ge_cp();
   uint32_t cpc = cpp ? cpp->counter() : 0;
+  const uint32_t tb_now = (uint32_t)REX_QUERY_TIMEBASE();
   g_present_cpcnt.store(cpc, std::memory_order_relaxed);
-  g_present_tb.store((uint32_t)REX_QUERY_TIMEBASE(), std::memory_order_relaxed);
+  g_present_tb.store(tb_now, std::memory_order_relaxed);
+  ge::FpsRecordPresent(tb_now);  // feed the frametime ring buffer
 
   static uint32_t n = 0;                       // throttled fps heartbeat (diag only)
   if ((n++ & 0x3F) == 0 && REXCVAR_GET(ge_freeze_diag))
