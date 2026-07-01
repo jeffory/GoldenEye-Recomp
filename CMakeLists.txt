@@ -44,6 +44,10 @@ endif()
 
 # Output a GoldenEye.exe (the in-Explorer/process name), independent of the
 # internal target/app name "ge" (which still drives ge.toml / the user data dir).
-set_target_properties(ge PROPERTIES OUTPUT_NAME "GoldenEye")
+# NOT on Android: NativeActivity dlopens the lib named by android.app.lib_name
+# ("ge" -> libge.so); renaming it to libGoldenEye.so makes the app unlaunchable.
+if(NOT ANDROID)
+    set_target_properties(ge PROPERTIES OUTPUT_NAME "GoldenEye")
+endif()
 
 rexglue_setup_target(ge)
