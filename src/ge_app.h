@@ -71,6 +71,12 @@ class GeApp : public rex::ReXApp {
     // Spike attribution lines (GESPIKE) on by default on the handheld -- rate-
     // limited to ~4/s and only emitted when a frame exceeds 2x the median.
     rex::cvar::SetFlagByName("ge_spike_log", "true");
+    // GPU execution time via Vulkan timestamp queries (kGpuFrameUs -> the
+    // GESPIKE gpu= column + the overlay's gpu bar). Cost: one TOP/BOTTOM
+    // timestamp pair per submission + a no-wait readback. Validated on the
+    // Thor's Adreno (and on desktop, period 10ns); the code self-disables on
+    // devices whose queue family lacks timestamp support.
+    rex::cvar::SetFlagByName("ge_gpu_timestamps", "true");
     // Pad-first handheld: keep the xenia-canary mouse-look port OFF. It defaults
     // on, and with it ge_disable_autoaim strips auto-aim/look-ahead on every
     // pause/cutscene transition and the crosshair/gun-centering writes run every
