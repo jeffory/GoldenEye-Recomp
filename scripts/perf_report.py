@@ -21,14 +21,26 @@ import statistics
 import sys
 
 # Stage columns (CSV names / GESPIKE keys) that partition frame time.
+# NOTE: raw cp_execute_us CONTAINS cp_wait_reg_mem_us (WAIT_REG_MEM executes as
+# a packet inside ExecutePrimaryBuffer), so the report derives a net value --
+# otherwise "CP execute" reads as a full frame when the CP is really parked in
+# the CPU<->GPU fence for most of it (pacing, not work).
 STAGES = {
-    "cp_execute_us": "CP execute (PM4 translation + submit)",
+    "cp_execute_net_us": "CP work (PM4 translation, net of fence wait)",
     "cp_idle_us": "CP idle (waiting for guest work)",
-    "cp_wait_reg_mem_us": "CP fence wait (WAIT_REG_MEM)",
+    "cp_wait_reg_mem_us": "CP fence wait (WAIT_REG_MEM pacing/sync)",
     "present_block_us": "Present (UI-thread paint+present block)",
     "guest_gpu_wait_us": "Guest GPU-wait (thread-time, can exceed wall)",
     "gpu_frame_us": "GPU execution (Vulkan timestamps)",
 }
+
+
+def derive_stages(fr):
+    """Add derived stage fields to a frame/spike dict (mutates + returns it)."""
+    # max(0, ...) keeps the operand type: int for CSV rows, float for log lines.
+    fr["cp_execute_net_us"] = max(
+        0, fr.get("cp_execute_us", 0) - fr.get("cp_wait_reg_mem_us", 0))
+    return fr
 
 GESPIKE_RE = re.compile(
     r"GESPIKE dt=(?P<dt>[\d.]+)ms med=(?P<med>[\d.]+)ms "
@@ -71,7 +83,8 @@ def analyze_log(path):
                 continue
             m = GESPIKE_RE.search(line)
             if m:
-                gespikes.append({k: float(v) for k, v in m.groupdict().items()})
+                gespikes.append(
+                    derive_stages({k: float(v) for k, v in m.groupdict().items()}))
 
     print(f"\n=== {path} (ge.log telemetry) ===")
     if gefps:
@@ -125,7 +138,8 @@ def analyze_csv(path):
     frames = []
     for r in rows:
         try:
-            frames.append({k: int(v) for k, v in r.items() if v not in ("", None)})
+            frames.append(
+                derive_stages({k: int(v) for k, v in r.items() if v not in ("", None)}))
         except ValueError:
             continue
     fts = sorted(fr.get("frame_time_us", 0) / 1000.0 for fr in frames)
