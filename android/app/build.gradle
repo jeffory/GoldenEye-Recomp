@@ -38,6 +38,9 @@ android {
 
         externalNativeBuild {
             cmake {
+                // RelWithDebInfo for ALL variants (incl. debug): the recomp is
+                // unplayable at Debug/-O0, and every on-device timing behavior
+                // (freeze fix, watchdog, boot heartbeat) was verified at RWDI.
                 arguments "-DREXSDK_DIR=${file(rootProject.findProperty('rexSdkDir') ?: '../../GoldenEye-Recomp-rexglue').absolutePath}",
                           '-DCMAKE_BUILD_TYPE=RelWithDebInfo'
                 // C++23; libc++ jthread/stop_token need the experimental library.
@@ -60,8 +63,17 @@ android {
     // AGP picks up the target `ge` and its shared-lib dependencies automatically.
 
     buildTypes {
+        debug {
+            debuggable true
+            jniDebuggable true
+            // Keep extractNativeLibs=true so simpleperf / run-as can access .so files on-disk.
+            manifestPlaceholders = [extractNativeLibs: 'true']
+        }
         release {
+            debuggable false
             minifyEnabled false
+            // Uncompressed libs in APK: loaded directly via mmap, no disk extraction.
+            manifestPlaceholders = [extractNativeLibs: 'false']
             if (ksPropsFile.exists()) { signingConfig signingConfigs.release }
         }
     }

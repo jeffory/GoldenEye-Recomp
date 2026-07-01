@@ -67,6 +67,15 @@ class GeApp : public rex::ReXApp {
     // and toggles them with --ge_fps_overlay / --ge_fps_log.)
     rex::cvar::SetFlagByName("ge_fps_overlay", "true");
     rex::cvar::SetFlagByName("ge_fps_log", "true");
+    // Pad-first handheld: keep the xenia-canary mouse-look port OFF. It defaults
+    // on, and with it ge_disable_autoaim strips auto-aim/look-ahead on every
+    // pause/cutscene transition and the crosshair/gun-centering writes run every
+    // frame with no mouse attached (ge_mouse_camera in ge_hooks.cpp) -- all
+    // unverified on arm64. Gating ge_mouselook_enable skips that whole path
+    // (ge_disable_autoaim is only read inside it); the CE data patches are
+    // applied before the gate and are unaffected. Re-enable here once the port
+    // has had a Thor pass (or gate it on real mouse motion instead).
+    rex::cvar::SetFlagByName("ge_mouselook_enable", "false");
 #endif
     // NOTE: fullscreen is NOT forced here. Its default is set to true at the
     // framework level (window.cpp) instead. That makes "windowed" the
