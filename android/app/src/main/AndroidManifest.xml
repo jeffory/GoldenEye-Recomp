@@ -20,7 +20,7 @@
     <application
         android:allowBackup="false"
         android:label="GoldenEye 007"
-        android:extractNativeLibs="true"
+        android:extractNativeLibs="${extractNativeLibs}"
         android:resizeableActivity="false"
         android:hasCode="true">
 
