@@ -32,6 +32,11 @@ void FpsOnFrame(uint32_t frames_advanced);
 // Bound to a desktop keybind and called once when the recorder is first enabled.
 void FpsReset();
 
+// Cumulative CP-starvation episodes from the freeze watchdog (implemented in
+// ge_hooks.cpp; ring non-empty but no CP progress across a 250ms tick). Read
+// by the GESPIKE log line.
+uint64_t GetCpStarvedEpisodes();
+
 // Small always-on-top text readout (live FPS + avg / 1%-low / worst / best /
 // frame count). Created once at startup like PostFxOverlay; gated each frame by
 // the ge_fps_overlay cvar.

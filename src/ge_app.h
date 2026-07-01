@@ -68,6 +68,9 @@ class GeApp : public rex::ReXApp {
     // and toggles them with --ge_fps_overlay / --ge_fps_log.)
     rex::cvar::SetFlagByName("ge_fps_overlay", "true");
     rex::cvar::SetFlagByName("ge_fps_log", "true");
+    // Spike attribution lines (GESPIKE) on by default on the handheld -- rate-
+    // limited to ~4/s and only emitted when a frame exceeds 2x the median.
+    rex::cvar::SetFlagByName("ge_spike_log", "true");
     // Pad-first handheld: keep the xenia-canary mouse-look port OFF. It defaults
     // on, and with it ge_disable_autoaim strips auto-aim/look-ahead on every
     // pause/cutscene transition and the crosshair/gun-centering writes run every

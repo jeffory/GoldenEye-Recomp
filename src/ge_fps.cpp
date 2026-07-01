@@ -29,6 +29,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging/macros.h>
+#include <rex/perf/counter.h>
 
 #include <imgui.h>
 
@@ -64,6 +65,16 @@ REXCVAR_DEFINE_INT32(ge_fps_gap_ms, 250, "Debug",
                      "GoldenEye: frame times above this many ms count as load/"
                      "transition gaps instead of gameplay frames")
     .range(50, 2000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Rate-limited GESPIKE ge.log line when a frame takes >2x the rolling median:
+// the frame time plus the per-stage breakdown (CP execute/idle/fence, present
+// block, guest GPU-wait, draws, stalls, CP-starvation episodes) so a spike can
+// be attributed to a pipeline stage from the log alone. Default OFF on desktop;
+// forced on for Android in GeApp::OnConfigurePaths.
+REXCVAR_DEFINE_BOOL(ge_spike_log, false, "Debug",
+                    "GoldenEye: log a GESPIKE stage-breakdown line when a frame "
+                    "takes >2x the rolling median")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Present-cadence counters exported by the SDK presenter (presenter.cpp, same
@@ -106,6 +117,7 @@ struct Accumulator {
   std::atomic<uint64_t> hitches{0};         // frames slower than 2x target period
   std::atomic<uint64_t> gaps{0};            // load/transition stalls (> ge_fps_gap_ms)
   std::atomic<uint64_t> max_gap_us{0};      // longest excluded gap
+  std::atomic<uint32_t> median_us{0};       // rolling p50, refreshed at the 1s tick
   std::atomic<double> ema_fps{0.0};         // smoothed instantaneous FPS
   std::atomic<uint32_t> hist[kBins]{};
 
@@ -119,6 +131,7 @@ struct Accumulator {
     hitches.store(0, std::memory_order_relaxed);
     gaps.store(0, std::memory_order_relaxed);
     max_gap_us.store(0, std::memory_order_relaxed);
+    median_us.store(0, std::memory_order_relaxed);
     ema_fps.store(0.0, std::memory_order_relaxed);
     for (auto& b : hist) b.store(0, std::memory_order_relaxed);
   }
@@ -252,10 +265,60 @@ void FpsOnFrame(uint32_t frames_advanced) {
   const double ema = a.ema_fps.load(std::memory_order_relaxed);
   a.ema_fps.store(ema <= 0.0 ? inst : ema * 0.9 + inst * 0.1, std::memory_order_relaxed);
 
-  if (logit) {
+  // GESPIKE: a frame >2x the rolling median (and below the gap cutoff -- gaps
+  // returned above) gets a rate-limited stage-breakdown line. The rex::perf
+  // snapshot is the just-completed frame: the CP already executed this frame's
+  // swap (Profiler::Flip ran) before the guest observed completion here.
+  if (REXCVAR_GET(ge_spike_log)) {
+    const uint32_t med = a.median_us.load(std::memory_order_relaxed);
+    if (med > 0 && per > 2ull * med) {
+      static std::atomic<uint64_t> s_last_spike_us{0};
+      uint64_t last_spike = s_last_spike_us.load(std::memory_order_relaxed);
+      if (now - last_spike >= 250'000ull &&
+          s_last_spike_us.compare_exchange_strong(last_spike, now,
+                                                  std::memory_order_relaxed)) {
+        using rex::perf::CounterId;
+        using rex::perf::GetSnapshotCounter;
+        REXKRNL_INFO(
+            "GESPIKE dt={:.1f}ms med={:.1f}ms cpexec={}us cpidle={}us "
+            "wrm={}us present={}us gwait={}us gpu={}us draws={} stalls={} "
+            "starved={}",
+            per / 1000.0, med / 1000.0,
+            GetSnapshotCounter(CounterId::kCpExecuteUs),
+            GetSnapshotCounter(CounterId::kCpIdleUs),
+            GetSnapshotCounter(CounterId::kCpWaitRegMemUs),
+            GetSnapshotCounter(CounterId::kPresentBlockUs),
+            GetSnapshotCounter(CounterId::kGuestGpuWaitUs),
+            GetSnapshotCounter(CounterId::kGpuFrameUs),
+            GetSnapshotCounter(CounterId::kDrawCalls),
+            GetSnapshotCounter(CounterId::kCommandBufferStalls),
+            GetCpStarvedEpisodes());
+      }
+    }
+  }
+
+  if (logit || REXCVAR_GET(ge_spike_log)) {
     const uint64_t last = a.last_log_us.load(std::memory_order_relaxed);
     if (now - last >= 1'000'000ull) {
       a.last_log_us.store(now, std::memory_order_relaxed);
+
+      // Refresh the window median (p50 frametime since the last reset) from
+      // the histogram for the spike detector. Same walk as 1%-low, different
+      // target.
+      const uint64_t n_med = a.count.load(std::memory_order_relaxed);
+      if (n_med > 0) {
+        const uint64_t target = (n_med + 1) / 2;
+        uint64_t acc_n = 0;
+        int bin = kBins - 1;
+        for (int i = 0; i < kBins; ++i) {
+          acc_n += a.hist[i].load(std::memory_order_relaxed);
+          if (acc_n >= target) { bin = i; break; }
+        }
+        a.median_us.store(static_cast<uint32_t>((bin + 1) * kBinMs * 1000.0),
+                          std::memory_order_relaxed);
+      }
+
+      if (!logit) return;
       Snapshot s = Read();
       REXKRNL_INFO(
           "GEFPS avg={:.1f} low1={:.1f} worst={:.1f} hitch={} gaps={} "

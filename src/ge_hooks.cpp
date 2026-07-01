@@ -18,6 +18,7 @@
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
 #include "ge_fps.h"    // ge::FpsOnFrame (guest-FPS benchmark recorder)
 #include <rex/cvar.h>  // REXCVAR_DEFINE_BOOL / REXCVAR_GET (ge_freeze_diag)
+#include <rex/perf/counter.h>  // rex::perf frame-stage counters (GESPIKE)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
 #include <rex/runtime.h>
 #include <rex/system/xmemory.h>
@@ -201,6 +202,20 @@ inline void ST16(uint8_t* b, uint32_t ga, uint16_t val) {
 // rexglue CP WAIT_REG_MEM >60ms deadlock-breaker fire count (command_processor.cpp).
 // Lets the watchdog report whether the CPU<->GPU fence breaker fired in a lock-up.
 extern "C" uint32_t rex_ge_cp_wait_reg_mem_timeouts();
+// rexglue CP drain-progress sequence (command_processor.cpp). Stagnant while the
+// ring is non-empty = the CP worker isn't getting scheduled (starvation).
+extern "C" uint64_t rex_ge_cp_progress_seq();
+
+// CP-starvation episodes observed by the watchdog (ring non-empty but the CP
+// progress seq did not advance across a 250ms watchdog tick). Coarse by design
+// -- fine-grained starvation shows up as missing time in the per-frame CP
+// counters instead. Read by the GESPIKE log line (ge_fps.cpp).
+std::atomic<uint64_t> g_cp_starved_episodes{0};
+namespace ge {
+uint64_t GetCpStarvedEpisodes() {
+  return g_cp_starved_episodes.load(std::memory_order_relaxed);
+}
+}  // namespace ge
 
 // ===========================================================================
 // Freeze watchdog. Auto-detects the visual freeze (the guest keeps presenting
@@ -218,6 +233,7 @@ void ge_watchdog_thread() {
   uint32_t last_wpi = 0xFFFFFFFFu, last_rpi = 0, last_present = 0, last_submit = 0;
   uint32_t present_at_stall_start = 0, dbg_at_stall_start = 0, submit_at_stall_start = 0;
   uint32_t stall = 0;
+  uint64_t last_cp_seq = 0;
   bool logged = false;
   bool recover_fired = false;
   for (;;) {
@@ -226,6 +242,15 @@ void ge_watchdog_thread() {
     if (!cp) continue;
     uint32_t wpi = static_cast<CPProbe*>(cp)->wpi();
     uint32_t rpi = static_cast<CPProbe*>(cp)->rpi();
+
+    // CP starvation: work queued (ring non-empty) but the CP's drain-progress
+    // seq didn't move across a whole 250ms tick -> the worker isn't being
+    // scheduled. One episode per stagnant tick; surfaced in GESPIKE.
+    uint64_t cp_seq = rex_ge_cp_progress_seq();
+    if (rpi != wpi && cp_seq == last_cp_seq) {
+      g_cp_starved_episodes.fetch_add(1, std::memory_order_relaxed);
+    }
+    last_cp_seq = cp_seq;
     uint32_t present = g_present_cpcnt.load(std::memory_order_relaxed);
     uint32_t dbg = g_dbgnow_calls.load(std::memory_order_relaxed);
     uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
@@ -602,6 +627,14 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
       std::this_thread::yield();
     }
   } else {
+    if (s_waiting) {
+      // Wait episode over: bill the yield-spin to the per-frame stage
+      // counters (guest timebase ticks -> us; /50 approximates the 49.875MHz
+      // timebase within 0.25%). Summed across ALL waiting guest threads, so
+      // it reads as total thread-time blocked on the GPU, not wall time.
+      rex::perf::IncrementCounter(rex::perf::CounterId::kGuestGpuWaitUs,
+                                  static_cast<int64_t>((uint32_t)(t - s_wait_start) / 50u));
+    }
     s_waiting = false;
   }
 
