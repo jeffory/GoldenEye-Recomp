@@ -74,6 +74,11 @@ uint64_t rex_ge_present_new_frame_count();
 uint64_t rex_ge_guest_refresh_count();
 uint64_t rex_ge_guest_drop_count();
 uint64_t rex_ge_present_block_us();
+#ifdef __ANDROID__
+// Android-only (defined in the SDK's Android window/app-context backends).
+uint64_t rex_ge_paint_request_count();
+uint64_t rex_ge_ui_loop_iteration_count();
+#endif
 }
 
 namespace ge {
@@ -286,6 +291,19 @@ void FpsOnFrame(uint32_t frames_advanced) {
             d_paint / secs, (c_new - pv_new) / secs,
             (c_refresh - pv_refresh) / secs, (c_drop - pv_drop) / secs,
             (c_n - pv_n) / secs, paint_ms);
+#ifdef __ANDROID__
+        // req/s = paints requested (UI-loop wakes); loop/s = UI-loop
+        // iterations. req/s < refresh/s means requests are being swallowed
+        // upstream (presenter gate); loop/s < req/s means the loop can't keep
+        // up with its wakes.
+        static uint64_t pv_req = 0, pv_loop = 0;
+        const uint64_t c_req = rex_ge_paint_request_count();
+        const uint64_t c_loop = rex_ge_ui_loop_iteration_count();
+        REXKRNL_INFO("GESHOWN2 req/s={:.1f} loop/s={:.1f}",
+                     (c_req - pv_req) / secs, (c_loop - pv_loop) / secs);
+        pv_req = c_req;
+        pv_loop = c_loop;
+#endif
       }
       pv_t = now;
       pv_paint = c_paint;
