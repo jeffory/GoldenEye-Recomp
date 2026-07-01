@@ -608,6 +608,15 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       if (ImGui::Button("Reset Benchmark")) ge::FpsReset();
       ImGui::TextColored(ImColor(kInkDim),
                          "(reset starts a fresh avg/1%%low/worst window)");
+      if (callbacks_.get_perf_csv && callbacks_.set_perf_csv) {
+        bool csv_on = callbacks_.get_perf_csv();
+        if (ImGui::Checkbox("Record Perf CSV (ge_perf.csv)", &csv_on)) {
+          callbacks_.set_perf_csv(csv_on);
+        }
+        ImGui::TextColored(ImColor(kInkDim),
+                           "(per-frame stage timings; session-only, saved "
+                           "next to ge.log)");
+      }
       break;
     }
     case 2: {  // CONTROLS

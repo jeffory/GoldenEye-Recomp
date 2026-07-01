@@ -7,6 +7,7 @@
 #pragma once
 
 #include <rex/cvar.h>
+#include <rex/perf/counter.h>
 #include <rex/rex_app.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
@@ -153,6 +154,16 @@ class GeApp : public rex::ReXApp {
       });
     };
     cb.persist_config = [this] { PersistConfig(); };
+    // Perf CSV capture (VIDEO tab checkbox). Opt-in per session -- the writer
+    // + its periodic fflush run on the CP worker, so it is never left on by
+    // default. Lands next to ge.log in the user data dir; pull with adb and
+    // feed to scripts/perf_report.py.
+    cb.get_perf_csv = [] { return ge_perf_csv_on_; };
+    cb.set_perf_csv = [this](bool on) {
+      ge_perf_csv_on_ = on;
+      rex::perf::SetCsvLogPath(
+          on ? (user_data_root() / "ge_perf.csv").string() : std::string());
+    };
     cb.request_restart = [this] {
       // ONLINE tab "Save & Restart": the menu has already persisted the cvars;
       // launch a fresh process (which reads the new ge.toml at boot) then tear
@@ -173,4 +184,5 @@ class GeApp : public rex::ReXApp {
   GeMenuDialog* menu_ = nullptr;  // non-owning; self-deletes via the drawer
   std::unique_ptr<ge::PostFxOverlay> postfx_;       // always-on filter layer
   std::unique_ptr<ge::FpsOverlay> fps_overlay_;     // guest-FPS benchmark readout
+  static inline bool ge_perf_csv_on_ = false;       // perf-CSV capture running?
 };

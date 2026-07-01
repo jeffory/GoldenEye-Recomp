@@ -37,6 +37,11 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
     // server / online-enable cvars so they take effect on a clean reboot (they
     // are read at startup, not live).
     std::function<void()> request_restart;
+    // Per-frame perf-counter CSV recording (rex::perf). get reports whether a
+    // capture is running; set(true) starts one (path chosen by the app, under
+    // the user data dir), set(false) stops and flushes it.
+    std::function<bool()> get_perf_csv;
+    std::function<void(bool)> set_perf_csv;
   };
 
   GeMenuDialog(rex::ui::ImGuiDrawer* drawer, Callbacks callbacks);
