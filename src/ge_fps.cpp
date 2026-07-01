@@ -2,12 +2,25 @@
 //
 // Guest-FPS benchmark recorder + overlay implementation. See ge_fps.h.
 //
-// The accumulator is fed once per real rendered frame (ge_dbg_now's submit-
-// advance branch). It times frames with std::chrono::steady_clock -- real
-// wall-clock seconds, so "FPS" means frames per real second and we avoid any
-// guest-timebase frequency ambiguity. All state is lock-free, fixed-size:
+// SEMANTICS: every stat describes the guest's frame-production cadence between
+// real submit-counter advances, measured with std::chrono::steady_clock (real
+// wall-clock seconds; no guest-timebase ambiguity). The timestamp is taken
+// BEFORE the frame limiter / present path, so this is "frames the game
+// produced", not "frames the display showed" -- the two diverge when the
+// present path drops frames. Corrections applied so the numbers match what a
+// player would recognize:
+//   - Coalesced advances (submit jumps by >1 between polls) are divided back
+//     into per-frame times instead of recording one doubled "slow" frame.
+//   - Load-screen / transition stalls (per-frame dt > ge_fps_gap_ms) are
+//     counted separately as "gaps" and do NOT pollute avg/worst/1%-low.
+//   - "hitch" counts accepted frames that took more than two of the title's
+//     60Hz vblank slots (>41.7ms; a guest-engine constant, independent of the
+//     panel rate; steady half-rate sections contribute zero).
+//   - The old "best" (max fps) stat is gone: the shortest pre-throttle spacing
+//     only measured catch-up bursts, which mean nothing to the player.
+// All state is lock-free, fixed-size:
 //   - count + sum_us           -> average FPS
-//   - min_us / max_us (CAS)    -> best / worst single frame
+//   - max_us (CAS)             -> worst single frame
 //   - a frame-time histogram   -> 1%-low (FPS at the 99th-percentile frametime),
 //                                 O(1) per frame, no allocation, no mutex
 //   - an EMA of instantaneous FPS for a smooth live readout
@@ -27,13 +40,14 @@
 // --ge_fps_overlay=true); forced on for Android in GeApp::OnConfigurePaths.
 REXCVAR_DEFINE_BOOL(ge_fps_overlay, false, "Debug",
                     "GoldenEye: draw an on-screen guest-FPS readout "
-                    "(live / avg / 1%-low / worst / best)")
+                    "(live / avg / 1%-low / worst / hitch+gap counts)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Periodic grep-able GEFPS summary line to ge.log (~1/s). Default OFF on desktop
 // (enable with --ge_fps_log=true); forced on for Android in OnConfigurePaths.
 REXCVAR_DEFINE_BOOL(ge_fps_log, false, "Debug",
-                    "GoldenEye: log a periodic GEFPS avg/low1/min/max summary line to ge.log")
+                    "GoldenEye: log a periodic GEFPS avg/low1/worst/hitch/gap "
+                    "summary line to ge.log")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // On-screen overlay text scale (1.0 = ImGui default). Default 2x for readability
@@ -41,6 +55,15 @@ REXCVAR_DEFINE_BOOL(ge_fps_log, false, "Debug",
 REXCVAR_DEFINE_DOUBLE(ge_fps_scale, 2.0, "Debug",
                       "GoldenEye: on-screen FPS overlay text scale (1.0 = default)")
     .range(0.5, 6.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Per-frame times above this are load screens / level transitions / FMV stalls,
+// not gameplay frames: they are counted (and max-tracked) as "gaps" but excluded
+// from avg / worst / 1%-low so one level load can't own the worst-frame stat.
+REXCVAR_DEFINE_INT32(ge_fps_gap_ms, 250, "Debug",
+                     "GoldenEye: frame times above this many ms count as load/"
+                     "transition gaps instead of gameplay frames")
+    .range(50, 2000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace ge {
@@ -62,10 +85,12 @@ struct Accumulator {
   std::atomic<uint64_t> last_frame_us{0};   // timestamp of previous frame (0 = none)
   std::atomic<uint64_t> window_start_us{0}; // first frame of the current window
   std::atomic<uint64_t> last_log_us{0};     // last periodic-log emit
-  std::atomic<uint64_t> count{0};           // frames this window (dt samples)
+  std::atomic<uint64_t> count{0};           // frames this window (per-frame samples)
   std::atomic<uint64_t> sum_us{0};          // total frame time this window
-  std::atomic<uint32_t> min_us{UINT32_MAX}; // best (shortest) frame
-  std::atomic<uint32_t> max_us{0};          // worst (longest) frame
+  std::atomic<uint32_t> max_us{0};          // worst (longest) gameplay frame
+  std::atomic<uint64_t> hitches{0};         // frames slower than 2x target period
+  std::atomic<uint64_t> gaps{0};            // load/transition stalls (> ge_fps_gap_ms)
+  std::atomic<uint64_t> max_gap_us{0};      // longest excluded gap
   std::atomic<double> ema_fps{0.0};         // smoothed instantaneous FPS
   std::atomic<uint32_t> hist[kBins]{};
 
@@ -75,8 +100,10 @@ struct Accumulator {
     last_log_us.store(0, std::memory_order_relaxed);
     count.store(0, std::memory_order_relaxed);
     sum_us.store(0, std::memory_order_relaxed);
-    min_us.store(UINT32_MAX, std::memory_order_relaxed);
     max_us.store(0, std::memory_order_relaxed);
+    hitches.store(0, std::memory_order_relaxed);
+    gaps.store(0, std::memory_order_relaxed);
+    max_gap_us.store(0, std::memory_order_relaxed);
     ema_fps.store(0.0, std::memory_order_relaxed);
     for (auto& b : hist) b.store(0, std::memory_order_relaxed);
   }
@@ -87,18 +114,30 @@ Accumulator& Acc() {
   return a;
 }
 
-void CasMin(std::atomic<uint32_t>& a, uint32_t v) {
-  uint32_t cur = a.load(std::memory_order_relaxed);
-  while (v < cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
-}
-void CasMax(std::atomic<uint32_t>& a, uint32_t v) {
-  uint32_t cur = a.load(std::memory_order_relaxed);
+template <typename T>
+void CasMax(std::atomic<T>& a, T v) {
+  T cur = a.load(std::memory_order_relaxed);
   while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
 }
 
+// Hitch = a frame that took MORE than two of the title's 60Hz vblank slots
+// (2.5 x 16.67ms). The threshold is a guest-title constant, deliberately NOT
+// derived from max_fps or the panel: GoldenEye's engine targets 60 regardless
+// of the display (the Thor's 120Hz panel doesn't make it produce 120), max_fps
+// is a *cap* the user can raise past the real rate (a desktop config with
+// max_fps=120 shrank a derived threshold to 25ms and flagged every legitimate
+// half-rate frame), and with vsync on max_fps is ignored anyway. Why 2.5x and
+// not 2x/3x: the title runs whole sections at a steady half rate (2 slots --
+// attract, menus), so 2x counts all of those; and vsync quantizes frame times
+// to exact slot multiples, so a threshold AT the 3-slot time flips on
+// microsecond jitter. 2.5x sits cleanly between the 2- and 3-slot buckets:
+// steady 30-on-60 contributes zero, a third vblank always counts.
+constexpr uint32_t kHitchThreshUs = 41'667;
+
 struct Snapshot {
-  double live, avg, low1, worst, best;  // FPS values
-  uint64_t count;
+  double live, avg, low1, worst;  // FPS values
+  uint64_t count, hitches, gaps;
+  double max_gap_ms;
   double dur_s;
 };
 
@@ -110,10 +149,11 @@ Snapshot Read() {
   s.count = n;
   s.live = a.ema_fps.load(std::memory_order_relaxed);
   s.avg = (sum > 0) ? (static_cast<double>(n) * 1e6 / static_cast<double>(sum)) : 0.0;
-  const uint32_t mn = a.min_us.load(std::memory_order_relaxed);
   const uint32_t mx = a.max_us.load(std::memory_order_relaxed);
-  s.best = (mn > 0 && mn != UINT32_MAX) ? (1e6 / mn) : 0.0;
   s.worst = (mx > 0) ? (1e6 / mx) : 0.0;
+  s.hitches = a.hitches.load(std::memory_order_relaxed);
+  s.gaps = a.gaps.load(std::memory_order_relaxed);
+  s.max_gap_ms = a.max_gap_us.load(std::memory_order_relaxed) / 1000.0;
 
   // 1%-low: the FPS at the 99th-percentile frame time. Walk the histogram from
   // the fast end until cumulative count reaches 99% of samples; that bin's time
@@ -139,7 +179,7 @@ Snapshot Read() {
 
 void FpsReset() { Acc().Reset(); }
 
-void FpsOnFrame() {
+void FpsOnFrame(uint32_t frames_advanced) {
   const bool overlay = REXCVAR_GET(ge_fps_overlay);
   const bool logit = REXCVAR_GET(ge_fps_log);
   if (!overlay && !logit) {
@@ -156,26 +196,44 @@ void FpsOnFrame() {
   a.window_start_us.compare_exchange_strong(exp0, now, std::memory_order_relaxed);
   if (prev == 0 || now <= prev) return;  // first frame of window / clock noise
 
-  uint64_t dt = now - prev;
-  // Reject non-displayed frames. The guest submit counter we tick on can advance
-  // more than once per visible frame (a clear + a present, menu transitions), so
-  // some "frames" land 1-3ms apart -- not distinct frames the player sees, and
-  // they'd corrupt the best-frame metric / inflate the count. This title never
-  // displays faster than ~63 fps, so treat anything > 200 fps (dt < 5ms) as a
-  // sub-frame swap and drop it. dt > 2s is a load screen / pause gap.
-  if (dt < 5'000ull || dt > 2'000'000ull) return;
+  // A poll can observe the submit counter jumping by >1 (the intermediate value
+  // was never seen); the elapsed time then covers several produced frames. Split
+  // it evenly instead of booking one doubled "slow" frame. Clamp defensively:
+  // a huge jump means we lost track (fresh window, counter glitch), not that
+  // dozens of frames really fit in this dt.
+  if (frames_advanced < 1) frames_advanced = 1;
+  if (frames_advanced > 4) frames_advanced = 4;
+  const uint64_t per = (now - prev) / frames_advanced;
 
-  a.count.fetch_add(1, std::memory_order_relaxed);
-  a.sum_us.fetch_add(dt, std::memory_order_relaxed);
-  CasMin(a.min_us, static_cast<uint32_t>(dt));
-  CasMax(a.max_us, static_cast<uint32_t>(dt));
+  // Sub-frame floor: the guest can emit non-display swaps (a clear + a present
+  // on menu transitions) that land 1-3ms apart. This title never produces real
+  // frames faster than ~63fps, so anything > 200fps is not a player frame.
+  if (per < 5'000ull) return;
 
-  int bin = static_cast<int>((dt / 1000.0) / kBinMs);
+  // Load screens / level transitions / FMV stalls: track separately, keep them
+  // out of the gameplay stats.
+  const uint64_t gap_us =
+      static_cast<uint64_t>(REXCVAR_GET(ge_fps_gap_ms)) * 1000ull;
+  if (per > gap_us) {
+    a.gaps.fetch_add(1, std::memory_order_relaxed);
+    CasMax(a.max_gap_us, per);
+    return;
+  }
+
+  if (per > kHitchThreshUs) {
+    a.hitches.fetch_add(frames_advanced, std::memory_order_relaxed);
+  }
+
+  a.count.fetch_add(frames_advanced, std::memory_order_relaxed);
+  a.sum_us.fetch_add(per * frames_advanced, std::memory_order_relaxed);
+  CasMax(a.max_us, static_cast<uint32_t>(per));
+
+  int bin = static_cast<int>((per / 1000.0) / kBinMs);
   if (bin < 0) bin = 0;
   if (bin >= kBins) bin = kBins - 1;
-  a.hist[bin].fetch_add(1, std::memory_order_relaxed);
+  a.hist[bin].fetch_add(frames_advanced, std::memory_order_relaxed);
 
-  const double inst = 1e6 / static_cast<double>(dt);
+  const double inst = 1e6 / static_cast<double>(per);
   const double ema = a.ema_fps.load(std::memory_order_relaxed);
   a.ema_fps.store(ema <= 0.0 ? inst : ema * 0.9 + inst * 0.1, std::memory_order_relaxed);
 
@@ -184,8 +242,11 @@ void FpsOnFrame() {
     if (now - last >= 1'000'000ull) {
       a.last_log_us.store(now, std::memory_order_relaxed);
       Snapshot s = Read();
-      REXKRNL_INFO("GEFPS avg={:.1f} low1={:.1f} min={:.1f} max={:.1f} n={} dur={:.1f}s",
-                   s.avg, s.low1, s.worst, s.best, s.count, s.dur_s);
+      REXKRNL_INFO(
+          "GEFPS avg={:.1f} low1={:.1f} worst={:.1f} hitch={} gaps={} "
+          "maxgap={:.0f}ms n={} dur={:.1f}s",
+          s.avg, s.low1, s.worst, s.hitches, s.gaps, s.max_gap_ms, s.count,
+          s.dur_s);
     }
   }
 }
@@ -213,7 +274,9 @@ void FpsOverlay::OnDraw(ImGuiIO& io) {
     ImGui::Text("avg   %5.1f", s.avg);
     ImGui::Text("1%%low %5.1f", s.low1);
     ImGui::Text("worst %5.1f", s.worst);
-    ImGui::Text("best  %5.1f", s.best);
+    ImGui::Text("hitch %llu  gap %llu",
+                static_cast<unsigned long long>(s.hitches),
+                static_cast<unsigned long long>(s.gaps));
     ImGui::Text("n %llu  %.0fs", static_cast<unsigned long long>(s.count), s.dur_s);
   }
   ImGui::End();

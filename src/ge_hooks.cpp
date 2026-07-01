@@ -640,7 +640,14 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
     if (submit != prev_submit &&
         s_last_submit.compare_exchange_strong(prev_submit, submit,
                                               std::memory_order_relaxed)) {
-      ge::FpsOnFrame();  // one real rendered frame -> feed the FPS benchmark recorder
+      // How many frames the counter really advanced by: a poll can miss an
+      // intermediate submit value (clear+present pairs, catch-up after a
+      // hitch), and telling the recorder lets it split the elapsed time into
+      // per-frame samples instead of booking one doubled "slow" frame. Wrap-
+      // safe u32 subtract; the recorder clamps to [1,4]. prev_submit==0 means
+      // first observation -> treat as a single frame.
+      uint32_t adv = (prev_submit != 0) ? (submit - prev_submit) : 1u;
+      ge::FpsOnFrame(adv);  // feed the FPS benchmark recorder
       uint32_t old = rendered.fetch_add(1, std::memory_order_relaxed);
       if ((old & 0x3F) == 0)  // log #1, #65, #129... (boot loader greps >= 65)
         REXKRNL_INFO("GEGPU rendered#{} dev={:#x} submit={}", old + 1, dev, submit);

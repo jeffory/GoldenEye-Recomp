@@ -8,6 +8,7 @@
 // the layout geometry stays the same.
 
 #include "ge_menu.h"
+#include "ge_fps.h"
 #include "ge_postfx.h"
 
 #include <rex/cvar.h>
@@ -590,6 +591,23 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
         ge::ResetPostFx();
         if (callbacks_.persist_config) callbacks_.persist_config();
       }
+
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::Spacing();
+
+      // --- FPS benchmark (ge_fps) --- gamepad-reachable reset; desktop also
+      // has the F2 bind. Starts a fresh measurement window for A/B runs.
+      ImGui::TextColored(ImColor(kTitle), "FPS BENCHMARK");
+      bool fps_overlay = GetCvarB("ge_fps_overlay");
+      if (ImGui::Checkbox("FPS Overlay", &fps_overlay)) {
+        SetCvarB("ge_fps_overlay", fps_overlay);
+        if (callbacks_.persist_config) callbacks_.persist_config();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Reset Benchmark")) ge::FpsReset();
+      ImGui::TextColored(ImColor(kInkDim),
+                         "(reset starts a fresh avg/1%%low/worst window)");
       break;
     }
     case 2: {  // CONTROLS
