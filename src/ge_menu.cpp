@@ -439,6 +439,33 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
 
       ImGui::Spacing();
 
+      // --- Render scale (integer guest upscale; 1x is native/cheapest). Its
+      //     diagnostic use: A/B 1x vs 2x with the FPS stage breakdown -- if
+      //     present/GPU times barely move at 2x, the GPU isn't the bottleneck.
+      static const struct { const char* label; const char* value; } kScale[] = {
+          {"1x (native)", "1"}, {"2x", "2"}, {"3x", "3"}};
+      const std::string cur_scale = rex::cvar::GetFlagByName("resolution_scale");
+      int scale_idx = 0;
+      for (int i = 0; i < IM_ARRAYSIZE(kScale); ++i)
+        if (cur_scale == kScale[i].value) scale_idx = i;
+      ImGui::SetNextWindowSizeConstraints(
+          ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 4.0f));
+      if (ImGui::BeginCombo("Render Scale", kScale[scale_idx].label)) {
+        for (int i = 0; i < IM_ARRAYSIZE(kScale); ++i) {
+          bool sel = (i == scale_idx);
+          if (ImGui::Selectable(kScale[i].label, sel)) {
+            rex::cvar::SetFlagByName("resolution_scale", kScale[i].value);
+            if (callbacks_.persist_config) callbacks_.persist_config();
+          }
+          if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::TextColored(ImColor(kInkDim),
+                         "(integer 3D upscale; applied via the restart button above)");
+
+      ImGui::Spacing();
+
       // --- Graphics API. "Auto" detects the GPU at boot: AMD -> Vulkan (the
       //     D3D12 path times out / black-screens on AMD for this title), all
       //     others -> Direct3D 12. Override here if needed; applied on restart. ---
@@ -608,6 +635,11 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       if (ImGui::Button("Reset Benchmark")) ge::FpsReset();
       ImGui::TextColored(ImColor(kInkDim),
                          "(reset starts a fresh avg/1%%low/worst window)");
+      bool fps_detail = GetCvarB("ge_fps_detail");
+      if (ImGui::Checkbox("Stage Breakdown (shown fps + time bars)", &fps_detail)) {
+        SetCvarB("ge_fps_detail", fps_detail);
+        if (callbacks_.persist_config) callbacks_.persist_config();
+      }
       if (callbacks_.get_perf_csv && callbacks_.set_perf_csv) {
         bool csv_on = callbacks_.get_perf_csv();
         if (ImGui::Checkbox("Record Perf CSV (ge_perf.csv)", &csv_on)) {

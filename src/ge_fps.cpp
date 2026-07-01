@@ -33,9 +33,11 @@
 
 #include <imgui.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 
 // On-screen live readout (top-left). Default OFF on desktop (enable with
 // --ge_fps_overlay=true); forced on for Android in GeApp::OnConfigurePaths.
@@ -75,6 +77,14 @@ REXCVAR_DEFINE_INT32(ge_fps_gap_ms, 250, "Debug",
 REXCVAR_DEFINE_BOOL(ge_spike_log, false, "Debug",
                     "GoldenEye: log a GESPIKE stage-breakdown line when a frame "
                     "takes >2x the rolling median")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Extra overlay section: displayed fps + per-stage time bars from the
+// rex::perf snapshot (where does the frame go: CP work / fence / present /
+// guest wait / GPU). Toggled from the pause menu; default off.
+REXCVAR_DEFINE_BOOL(ge_fps_detail, false, "Debug",
+                    "GoldenEye: show per-stage frame-time bars + displayed fps "
+                    "in the FPS overlay")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Present-cadence counters exported by the SDK presenter (presenter.cpp, same
@@ -406,6 +416,49 @@ void FpsOverlay::OnDraw(ImGuiIO& io) {
                 static_cast<unsigned long long>(s.hitches),
                 static_cast<unsigned long long>(s.gaps));
     ImGui::Text("n %llu  %.0fs", static_cast<unsigned long long>(s.count), s.dur_s);
+
+    if (REXCVAR_GET(ge_fps_detail)) {
+      ImGui::Separator();
+      // Displayed fps: rate of successful presents, refreshed every ~500ms
+      // from the monotonic SDK counter (single-threaded: OnDraw runs on the
+      // UI thread only).
+      static uint64_t sp_t = 0, sp_paints = 0;
+      static double shown_fps = 0.0;
+      const uint64_t now2 = NowUs();
+      const uint64_t paints = rex_ge_present_paint_count();
+      if (sp_t == 0) {
+        sp_t = now2;
+        sp_paints = paints;
+      } else if (now2 - sp_t >= 500'000ull) {
+        shown_fps = (paints - sp_paints) * 1e6 / (now2 - sp_t);
+        sp_t = now2;
+        sp_paints = paints;
+      }
+      ImGui::Text("shown %5.1f", shown_fps);
+
+      // Per-stage time of the last completed frame, as bars against the 60fps
+      // budget (16.7ms). "cp work" is execute net of the nested fence wait.
+      using rex::perf::CounterId;
+      using rex::perf::GetSnapshotCounter;
+      const int64_t wrm = GetSnapshotCounter(CounterId::kCpWaitRegMemUs);
+      const int64_t cpwork =
+          std::max<int64_t>(0, GetSnapshotCounter(CounterId::kCpExecuteUs) - wrm);
+      struct Row { const char* name; int64_t us; };
+      const Row rows[] = {
+          {"cp work", cpwork},
+          {"fence  ", wrm},
+          {"present", GetSnapshotCounter(CounterId::kPresentBlockUs)},
+          {"gwait  ", GetSnapshotCounter(CounterId::kGuestGpuWaitUs)},
+          {"gpu    ", GetSnapshotCounter(CounterId::kGpuFrameUs)},
+      };
+      for (const Row& r : rows) {
+        const float frac =
+            std::min(1.0f, static_cast<float>(r.us) / 16'667.0f);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%s %5.1fms", r.name, r.us / 1000.0);
+        ImGui::ProgressBar(frac, ImVec2(140.0f, 0.0f), buf);
+      }
+    }
   }
   ImGui::End();
 }
