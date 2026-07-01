@@ -20,7 +20,6 @@
     <application
         android:allowBackup="false"
         android:label="GoldenEye 007"
-        android:debuggable="true"
         android:extractNativeLibs="true"
         android:resizeableActivity="false"
         android:hasCode="true">

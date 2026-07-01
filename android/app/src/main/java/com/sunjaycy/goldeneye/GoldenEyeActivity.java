@@ -56,17 +56,22 @@ import java.io.FileReader;
 public class GoldenEyeActivity extends NativeActivity {
     private static final String TAG = "GEBOOT";
     // A healthy boot creates its swapchain ~2s after launch and reaches a live
-    // render (present#65) within ~5s; this window leaves a wide margin (incl. a
+    // render (rendered#65) within ~5s; this window leaves a wide margin (incl. a
     // cold shader cache on first run) while keeping failed-boot retries quick.
     private static final int BOOT_WATCHDOG_MS = 16000;
     private static final int POLL_MS = 2000;
     private static final int MAX_BOOT_ATTEMPTS = 10;
     private static final String ATTEMPT_EXTRA = "ge_boot_attempt";
 
-    // Present counter is logged as "GEGPU present#N" every 64 frames; N>=65 means
-    // >=64 frames presented = a real render loop (a wedged boot can emit a lone
-    // "present#1" then freeze, so any "present#" is not enough).
-    private static final int PRESENT_THRESHOLD = 65;
+    // Real-render counter, logged as "GEGPU rendered#N" every 64 frames; N>=65
+    // means >=64 frames actually reached the screen = a live render loop. We gate
+    // on this, NOT on "GEGPU present#", because present# (and the CP swap counter)
+    // keep advancing on a WEDGED boot -- VdSwap still fires while render is skipped
+    // every frame -- so a frozen boot would be mistaken for "live". "rendered#" is
+    // emitted only from the drawn branch of ge_dbg_now (presented:=submit), so it
+    // stops the instant the game freezes, letting the loader relaunch and re-roll
+    // the residual ~50% boot race.
+    private static final int RENDER_THRESHOLD = 65;
 
     private volatile boolean relaunching;
     private volatile boolean stopWatchdog;
@@ -85,7 +90,7 @@ public class GoldenEyeActivity extends NativeActivity {
         attempt = getIntent() != null ? getIntent().getIntExtra(ATTEMPT_EXTRA, 0) : 0;
 
         // Start each launch with a fresh log so the watchdog only sees THIS
-        // process's "present#" markers (the runtime appends across launches).
+        // process's "rendered#" markers (the runtime appends across launches).
         try {
             File log = new File(getExternalFilesDir(null), "ge.log");
             if (log.exists()) {
@@ -166,7 +171,7 @@ public class GoldenEyeActivity extends NativeActivity {
         relaunchSelf(attempt + 1);
     }
 
-    /** True once the native runtime has a LIVE render loop (>= PRESENT_THRESHOLD frames). */
+    /** True once the native runtime has a LIVE render loop (>= RENDER_THRESHOLD real frames). */
     private boolean hasStartedPresenting() {
         File log = new File(getExternalFilesDir(null), "ge.log");
         if (!log.exists()) {
@@ -175,17 +180,17 @@ public class GoldenEyeActivity extends NativeActivity {
         try (BufferedReader r = new BufferedReader(new FileReader(log))) {
             String line;
             while ((line = r.readLine()) != null) {
-                int idx = line.indexOf("present#");
+                int idx = line.indexOf("rendered#");
                 if (idx < 0) {
                     continue;
                 }
-                int j = idx + "present#".length();
+                int j = idx + "rendered#".length();
                 int n = 0;
                 while (j < line.length() && Character.isDigit(line.charAt(j))) {
                     n = n * 10 + (line.charAt(j) - '0');
                     j++;
                 }
-                if (n >= PRESENT_THRESHOLD) {
+                if (n >= RENDER_THRESHOLD) {
                     return true;
                 }
             }

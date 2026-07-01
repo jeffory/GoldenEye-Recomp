@@ -11,6 +11,8 @@
 #include "ge_postfx.h"
 
 #include <rex/cvar.h>
+#include <rex/ui/keybinds.h>     // VirtualKeyToString (key rebinding)
+#include <rex/ui/virtual_key.h>
 
 #include <imgui.h>
 
@@ -80,6 +82,73 @@ void AddVerticalLabel(ImDrawList* dl, ImFont* font, float size, ImVec2 center, I
     char ch[2] = {*p, 0};
     ImVec2 sz = font->CalcTextSizeA(size, FLT_MAX, 0.0f, ch);
     dl->AddText(font, size, ImVec2(center.x - sz.x * 0.5f, y), col, ch);
+  }
+}
+
+// Keyboard rebinding ---------------------------------------------------------
+struct KeyBind {
+  const char* label;
+  const char* cvar;
+};
+// Order = display order. Right-stick (look) is the mouse, so it is not here.
+constexpr KeyBind kBinds[] = {
+    {"Move Forward", "ge_key_mv_up"},   {"Move Back", "ge_key_mv_down"},
+    {"Move Left", "ge_key_mv_left"},    {"Move Right", "ge_key_mv_right"},
+    {"A", "ge_key_a"},                  {"B", "ge_key_b"},
+    {"X", "ge_key_x"},                  {"Y", "ge_key_y"},
+    {"Left Trigger", "ge_key_lt"},      {"Right Trigger", "ge_key_rt"},
+    {"Left Bumper", "ge_key_lb"},       {"Right Bumper", "ge_key_rb"},
+    {"Left Stick (L3)", "ge_key_l3"},   {"Right Stick (R3)", "ge_key_r3"},
+    {"D-Pad Up", "ge_key_dup"},         {"D-Pad Down", "ge_key_ddown"},
+    {"D-Pad Left", "ge_key_dleft"},     {"D-Pad Right", "ge_key_dright"},
+    {"Start", "ge_key_start"},          {"Back", "ge_key_back"},
+};
+
+// Map an ImGui key to a Windows virtual-key code (== rex VirtualKey value).
+int ImGuiKeyToVk(ImGuiKey k) {
+  if (k >= ImGuiKey_A && k <= ImGuiKey_Z) return 'A' + (k - ImGuiKey_A);
+  if (k >= ImGuiKey_0 && k <= ImGuiKey_9) return '0' + (k - ImGuiKey_0);
+  if (k >= ImGuiKey_Keypad0 && k <= ImGuiKey_Keypad9) return 0x60 + (k - ImGuiKey_Keypad0);
+  if (k >= ImGuiKey_F1 && k <= ImGuiKey_F12) return 0x70 + (k - ImGuiKey_F1);
+  switch (k) {
+    case ImGuiKey_Space: return 0x20;
+    case ImGuiKey_Enter: return 0x0D;
+    case ImGuiKey_Tab: return 0x09;
+    case ImGuiKey_Backspace: return 0x08;
+    case ImGuiKey_Delete: return 0x2E;
+    case ImGuiKey_Insert: return 0x2D;
+    case ImGuiKey_Home: return 0x24;
+    case ImGuiKey_End: return 0x23;
+    case ImGuiKey_PageUp: return 0x21;
+    case ImGuiKey_PageDown: return 0x22;
+    case ImGuiKey_LeftArrow: return 0x25;
+    case ImGuiKey_RightArrow: return 0x27;
+    case ImGuiKey_UpArrow: return 0x26;
+    case ImGuiKey_DownArrow: return 0x28;
+    case ImGuiKey_LeftShift:
+    case ImGuiKey_RightShift: return 0x10;
+    case ImGuiKey_LeftCtrl:
+    case ImGuiKey_RightCtrl: return 0x11;
+    case ImGuiKey_LeftAlt:
+    case ImGuiKey_RightAlt: return 0x12;
+    case ImGuiKey_GraveAccent: return 0xC0;
+    case ImGuiKey_Minus: return 0xBD;
+    case ImGuiKey_Equal: return 0xBB;
+    case ImGuiKey_Comma: return 0xBC;
+    case ImGuiKey_Period: return 0xBE;
+    case ImGuiKey_Semicolon: return 0xBA;
+    case ImGuiKey_Slash: return 0xBF;
+    case ImGuiKey_Backslash: return 0xDC;
+    case ImGuiKey_LeftBracket: return 0xDB;
+    case ImGuiKey_RightBracket: return 0xDD;
+    case ImGuiKey_Apostrophe: return 0xDE;
+    case ImGuiKey_CapsLock: return 0x14;
+    case ImGuiKey_KeypadEnter: return 0x0D;
+    case ImGuiKey_KeypadAdd: return 0x6B;
+    case ImGuiKey_KeypadSubtract: return 0x6D;
+    case ImGuiKey_KeypadMultiply: return 0x6A;
+    case ImGuiKey_KeypadDivide: return 0x6F;
+    default: return 0;
   }
 }
 
@@ -356,7 +425,94 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
         }
         ImGui::EndCombo();
       }
-      ImGui::TextColored(ImColor(kInkDim), "(resolution applies after restart)");
+      ImGui::TextColored(ImColor(kInkDim),
+                         "(renders the 3D scene at this resolution; needs a restart)");
+      // Internal resolution can't change live without a full GPU device reset
+      // (the EDRAM buffer + render-target/texture caches are sized at init --
+      // changing them mid-run corrupts in-flight GPU state). So instead of a
+      // manual save+restart, apply it in one click: persist + relaunch now.
+      if (ImGui::Button("Apply Resolution (quick restart)")) {
+        if (callbacks_.persist_config) callbacks_.persist_config();
+        if (callbacks_.request_restart) callbacks_.request_restart();
+      }
+
+      ImGui::Spacing();
+
+      // --- Graphics API. "Auto" detects the GPU at boot: AMD -> Vulkan (the
+      //     D3D12 path times out / black-screens on AMD for this title), all
+      //     others -> Direct3D 12. Override here if needed; applied on restart. ---
+      static const struct { const char* label; const char* value; } kApi[] = {
+          {"Auto (recommended)", "auto"}, {"Direct3D 12", "d3d12"}, {"Vulkan", "vulkan"}};
+      const std::string cur_api = rex::cvar::GetFlagByName("gpu");
+      int api_idx = 0;
+      for (int i = 0; i < IM_ARRAYSIZE(kApi); ++i)
+        if (cur_api == kApi[i].value) api_idx = i;
+      ImGui::SetNextWindowSizeConstraints(
+          ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 6.0f));
+      if (ImGui::BeginCombo("Graphics API", kApi[api_idx].label)) {
+        for (int i = 0; i < IM_ARRAYSIZE(kApi); ++i) {
+          bool sel = (i == api_idx);
+          if (ImGui::Selectable(kApi[i].label, sel)) {
+            rex::cvar::SetFlagByName("gpu", kApi[i].value);
+            if (callbacks_.persist_config) callbacks_.persist_config();
+          }
+          if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::TextColored(ImColor(kInkDim), "(AMD uses Vulkan automatically; applies after restart)");
+
+      ImGui::Spacing();
+
+      // --- Texture filtering. Drives the engine's anisotropic_override cvar,
+      //     which is hot-reload: the sampler cache re-reads it per draw, so this
+      //     applies instantly. Values: 0 = off (bilinear), 3 = 4x .. 5 = 16x. ---
+      static const struct { const char* label; const char* value; } kAniso[] = {
+          {"Off (bilinear)", "0"}, {"4x", "3"}, {"8x", "4"}, {"16x", "5"}};
+      const std::string cur_aniso = rex::cvar::GetFlagByName("anisotropic_override");
+      int aniso_idx = 1;  // default 4x (engine default = 3)
+      for (int i = 0; i < IM_ARRAYSIZE(kAniso); ++i)
+        if (cur_aniso == kAniso[i].value) aniso_idx = i;
+      ImGui::SetNextWindowSizeConstraints(
+          ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 6.0f));
+      if (ImGui::BeginCombo("Texture Filtering", kAniso[aniso_idx].label)) {
+        for (int i = 0; i < IM_ARRAYSIZE(kAniso); ++i) {
+          bool sel = (i == aniso_idx);
+          if (ImGui::Selectable(kAniso[i].label, sel)) {
+            rex::cvar::SetFlagByName("anisotropic_override", kAniso[i].value);
+            if (callbacks_.persist_config) callbacks_.persist_config();
+          }
+          if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::TextColored(ImColor(kInkDim), "(anisotropic filtering; applies instantly)");
+
+      ImGui::Spacing();
+
+      // --- Anti-aliasing. Drives swap_post_effect (FXAA post-process). Now
+      //     hot-reload: the GPU vsync worker re-applies it each tick, so it
+      //     switches live. MSAA isn't user-selectable (it's guest-driven). ---
+      static const struct { const char* label; const char* value; } kAA[] = {
+          {"Off", "none"}, {"FXAA", "fxaa"}, {"FXAA (Extreme)", "fxaa_extreme"}};
+      const std::string cur_aa = rex::cvar::GetFlagByName("swap_post_effect");
+      int aa_idx = 0;
+      for (int i = 0; i < IM_ARRAYSIZE(kAA); ++i)
+        if (cur_aa == kAA[i].value) aa_idx = i;
+      ImGui::SetNextWindowSizeConstraints(
+          ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 6.0f));
+      if (ImGui::BeginCombo("Anti-Aliasing", kAA[aa_idx].label)) {
+        for (int i = 0; i < IM_ARRAYSIZE(kAA); ++i) {
+          bool sel = (i == aa_idx);
+          if (ImGui::Selectable(kAA[i].label, sel)) {
+            rex::cvar::SetFlagByName("swap_post_effect", kAA[i].value);
+            if (callbacks_.persist_config) callbacks_.persist_config();
+          }
+          if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::TextColored(ImColor(kInkDim), "(FXAA post-process AA; applies instantly)");
 
       ImGui::Spacing();
       ImGui::Separator();
@@ -436,13 +592,91 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       }
       break;
     }
-    case 2:  // CONTROLS
-      ImGui::TextWrapped("Movement, aim and fire use the gamepad or the bound keyboard keys.");
+    case 2: {  // CONTROLS
+      ImGui::TextColored(ImColor(kTitle), "MOUSE LOOK");
       ImGui::Spacing();
-      ImGui::BulletText("Pause / this menu: ESC");
-      ImGui::BulletText("Freeze-frame: F1");
-      ImGui::BulletText("Rebind keys: F4");
+
+      // Mouse sensitivity -- live (the look hooks read ge_mouse_sens each frame);
+      // persisted to ge.toml on release so it survives a restart.
+      float sens = GetCvarF("ge_mouse_sens");
+      if (ImGui::SliderFloat("Mouse Sensitivity", &sens, 0.05f, 20.0f, "%.2f")) {
+        if (sens < 0.05f) sens = 0.05f;
+        if (sens > 20.0f) sens = 20.0f;
+        SetCvarF("ge_mouse_sens", sens);
+      }
+      if (ImGui::IsItemDeactivatedAfterEdit() && callbacks_.persist_config)
+        callbacks_.persist_config();
+
+      ImGui::Spacing();
+
+      // Mouse-look toggle. ON: the mouse looks (on top of the controller -- both
+      // work at once) and the cursor is captured in-game. OFF: controller only,
+      // cursor free.
+      bool ml = GetCvarB("ge_mouselook_enable");
+      if (ImGui::Checkbox("Mouse look", &ml)) {
+        SetCvarB("ge_mouselook_enable", ml);
+        if (callbacks_.persist_config) callbacks_.persist_config();
+      }
+      ImGui::TextColored(ImColor(kInkDim),
+                         "(controller still works; cursor is captured in-game, freed in this menu)");
+
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::Spacing();
+
+      ImGui::TextColored(ImColor(kTitle), "REBIND KEYS");
+      ImGui::TextColored(ImColor(kInkDim), "(click a binding, then press the new key; Esc cancels)");
+      ImGui::Spacing();
+
+      const float btn_w = content_w * 0.34f;
+      const float label_x = content_w * 0.44f;
+      for (const auto& b : kBinds) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(b.label);
+        ImGui::SameLine(label_x);
+        const bool capturing = (rebinding_cvar_ == b.cvar);
+        std::string cur = capturing ? "press a key..." : rex::cvar::GetFlagByName(b.cvar);
+        if (cur.empty()) cur = "(unbound)";
+        ImGui::PushID(b.cvar);
+        if (ImGui::Button(cur.c_str(), ImVec2(btn_w, 0))) {
+          rebinding_cvar_ = b.cvar;
+          rebind_skip_ = 1;  // ignore the click that started this rebind
+        }
+        ImGui::PopID();
+      }
+
+      // Capture the next key / mouse button for the pending rebind.
+      if (rebinding_cvar_) {
+        if (rebind_skip_ > 0) {
+          --rebind_skip_;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+          rebinding_cvar_ = nullptr;  // cancel
+        } else {
+          int vk = 0;
+          if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) vk = 0x01;          // LMB
+          else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) vk = 0x02;     // RMB
+          else if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) vk = 0x04;    // MMB
+          else {
+            for (ImGuiKey k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END;
+                 k = static_cast<ImGuiKey>(k + 1)) {
+              if (ImGui::IsKeyPressed(k, false)) {
+                vk = ImGuiKeyToVk(k);
+                if (vk) break;
+              }
+            }
+          }
+          if (vk) {
+            std::string name = rex::ui::VirtualKeyToString(static_cast<rex::ui::VirtualKey>(vk));
+            if (!name.empty()) {
+              rex::cvar::SetFlagByName(rebinding_cvar_, name);
+              if (callbacks_.persist_config) callbacks_.persist_config();
+            }
+            rebinding_cvar_ = nullptr;
+          }
+        }
+      }
       break;
+    }
     case 3: {  // ONLINE
       // Load the cvars into the edit buffers once, the first time the tab opens
       // (so typing doesn't fight a per-frame reload).

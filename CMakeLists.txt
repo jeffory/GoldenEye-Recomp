@@ -18,14 +18,22 @@ include(generated/rexglue.cmake)
 # Sources
 set(GE_SOURCES
     src/main.cpp
+    src/ge_fps.cpp
     src/ge_hooks.cpp
     src/ge_menu.cpp
     src/ge_postfx.cpp
     src/ge_username.cpp
+    src/ge_ce_patches.cpp
 )
 
 if(WIN32)
-    add_executable(ge WIN32 ${GE_SOURCES})
+    # Embed the application icon (GoldenEye.rc -> "MAINICON"). Use LLVM's resource
+    # compiler since the toolchain is clang/lld (MSVC rc.exe may not be on PATH).
+    if(NOT CMAKE_RC_COMPILER)
+        set(CMAKE_RC_COMPILER "llvm-rc")
+    endif()
+    enable_language(RC)
+    add_executable(ge WIN32 ${GE_SOURCES} GoldenEye.rc)
 elseif(ANDROID)
     # NativeActivity loads this as a shared library (android.app.lib_name=ge).
     # The android_main entry + app-glue come from the SDK via rexglue_setup_target.
@@ -33,5 +41,9 @@ elseif(ANDROID)
 else()
     add_executable(ge ${GE_SOURCES})
 endif()
+
+# Output a GoldenEye.exe (the in-Explorer/process name), independent of the
+# internal target/app name "ge" (which still drives ge.toml / the user data dir).
+set_target_properties(ge PROPERTIES OUTPUT_NAME "GoldenEye")
 
 rexglue_setup_target(ge)

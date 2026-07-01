@@ -16,6 +16,7 @@
 
 #include <string>
 
+#include "ge_fps.h"
 #include "ge_menu.h"
 #include "ge_postfx.h"
 
@@ -25,6 +26,12 @@
 // boot -- they are read at startup (UserProfile ctor, online client start).
 namespace ge {
 void LaunchSelfDetached();
+// Attach the cross-platform mouse/keyboard look listener at startup (implemented
+// in ge_hooks.cpp).
+void InitMouseLook();
+// Suppress mouse-look while the pause menu is open (cursor is needed for the
+// menu, and motion shouldn't turn into look). Implemented in ge_hooks.cpp.
+void SetMouselookSuppressed(bool suppressed);
 }
 
 class GeApp : public rex::ReXApp {
@@ -41,10 +48,26 @@ class GeApp : public rex::ReXApp {
   // are just defaults -- ge.toml (written by the in-game menu) overrides them.
   void OnConfigurePaths(rex::PathConfig& paths) override {
     (void)paths;
-    rex::cvar::SetFlagByName("vsync", "false");
+    // NOTE: vsync is NOT forced here. Its SDK default is false (off), so the
+    // in-menu toggle persists: turning it ON differs from default -> written to
+    // ge.toml; OFF == default -> not written but still boots off. Forcing it here
+    // would re-assert off every boot and the "on" choice would never survive a
+    // restart (SaveConfig only writes cvars that differ from their default).
     rex::cvar::SetFlagByName("max_fps", "60");  // default 60 (clamped to native refresh)
     rex::cvar::SetFlagByName("window_width", "2560");
     rex::cvar::SetFlagByName("window_height", "1440");
+    // Our 1:1 mouse-look + keyboard injection (ge_hooks.cpp) is the sole MnK
+    // path. Force the SDK's mouse-as-stick driver off so a stale ge.toml can't
+    // re-enable it alongside ours (double-input / cursor fight).
+    rex::cvar::SetFlagByName("mnk_mode", "false");
+#if defined(__ANDROID__)
+    // No config file / CLI on Android: turn the guest-FPS benchmark recorder on
+    // here so the on-screen readout + periodic GEFPS ge.log lines are available
+    // for measuring framerate on the handheld. (Desktop leaves these default-off
+    // and toggles them with --ge_fps_overlay / --ge_fps_log.)
+    rex::cvar::SetFlagByName("ge_fps_overlay", "true");
+    rex::cvar::SetFlagByName("ge_fps_log", "true");
+#endif
     // NOTE: fullscreen is NOT forced here. Its default is set to true at the
     // framework level (window.cpp) instead. That makes "windowed" the
     // non-default value, so toggling to windowed actually saves to ge.toml --
@@ -58,9 +81,18 @@ class GeApp : public rex::ReXApp {
   // Register the ESC pause-menu keybind and create the always-on Post-FX
   // filter overlay once the ImGui drawer exists.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    // Window/taskbar title shown while running. Overrides the SDK default
+    // ("ge <build stamp>"); the internal app name stays "ge" so ge.toml and the
+    // user data dir are unchanged.
+    if (window()) window()->SetTitle("GoldenEye");
     rex::ui::RegisterBind("bind_pause_menu", "Escape", "Pause menu",
                           [this] { TogglePauseMenu(); });
+    ge::InitMouseLook();  // attach the cross-platform mouse/keyboard look listener
     postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
+    fps_overlay_ = std::make_unique<ge::FpsOverlay>(drawer);  // guest-FPS readout
+    // F2 starts a fresh benchmark window (clears avg / 1%-low / min / max).
+    rex::ui::RegisterBind("bind_fps_reset", "F2", "Reset FPS benchmark",
+                          [] { ge::FpsReset(); });
     // Username/server are set in the ONLINE pause-menu tab now -- no first-boot
     // prompt. They apply on the Save & Restart the ONLINE tab triggers.
   }
@@ -68,6 +100,8 @@ class GeApp : public rex::ReXApp {
   // Tear down the menu, overlay and keybind before the drawer is destroyed.
   void OnShutdown() override {
     rex::ui::UnregisterBind("bind_pause_menu");
+    rex::ui::UnregisterBind("bind_fps_reset");
+    fps_overlay_.reset();
     if (menu_) {
       // Direct delete (not Close()) so we don't re-enter pause bookkeeping
       // during shutdown; removes itself from the drawer in its destructor.
@@ -85,7 +119,10 @@ class GeApp : public rex::ReXApp {
       return;
     }
     GeMenuDialog::Callbacks cb;
-    cb.on_closed = [this] { menu_ = nullptr; };
+    cb.on_closed = [this] {
+      menu_ = nullptr;
+      ge::SetMouselookSuppressed(false);  // re-enable mouse-look on menu close
+    };
     cb.on_quit = [this] {
       if (runtime() && runtime()->kernel_state()) {
         runtime()->kernel_state()->TerminateTitle();
@@ -120,9 +157,11 @@ class GeApp : public rex::ReXApp {
         app_context().QuitFromUIThread();
       });
     };
+    ge::SetMouselookSuppressed(true);  // freeze mouse-look + free the cursor while the menu is up
     menu_ = new GeMenuDialog(imgui_drawer(), std::move(cb));
   }
 
   GeMenuDialog* menu_ = nullptr;  // non-owning; self-deletes via the drawer
   std::unique_ptr<ge::PostFxOverlay> postfx_;       // always-on filter layer
+  std::unique_ptr<ge::FpsOverlay> fps_overlay_;     // guest-FPS benchmark readout
 };
