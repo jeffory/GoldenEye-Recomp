@@ -66,6 +66,16 @@ REXCVAR_DEFINE_INT32(ge_fps_gap_ms, 250, "Debug",
     .range(50, 2000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Present-cadence counters exported by the SDK presenter (presenter.cpp, same
+// extern "C" pattern as rex_ge_cp_progress_seq). Monotonic; we take deltas.
+extern "C" {
+uint64_t rex_ge_present_paint_count();
+uint64_t rex_ge_present_new_frame_count();
+uint64_t rex_ge_guest_refresh_count();
+uint64_t rex_ge_guest_drop_count();
+uint64_t rex_ge_present_block_us();
+}
+
 namespace ge {
 namespace {
 
@@ -247,6 +257,43 @@ void FpsOnFrame(uint32_t frames_advanced) {
           "maxgap={:.0f}ms n={} dur={:.1f}s",
           s.avg, s.low1, s.worst, s.hitches, s.gaps, s.max_gap_ms, s.count,
           s.dur_s);
+
+      // GESHOWN: where do produced frames go? Per-second deltas across the
+      // present pipeline -- submit (this recorder) -> refresh (frames the CP
+      // delivered to the present mailbox) -> new (paints that showed a new
+      // frame) -> shown (successful presents); drop = mailbox frames replaced
+      // before any paint consumed them (produced but never displayed). paint=
+      // average PaintAndPresent wall time (the UI-thread block incl. FIFO
+      // vsync wait). shown/new well below refresh + high drop = the paint
+      // loop, not the game, is limiting displayed fps.
+      // Benign single-writer statics: only the log-tick winner runs this.
+      static uint64_t pv_t = 0, pv_paint = 0, pv_new = 0, pv_refresh = 0,
+                      pv_drop = 0, pv_block = 0, pv_n = 0;
+      const uint64_t c_paint = rex_ge_present_paint_count();
+      const uint64_t c_new = rex_ge_present_new_frame_count();
+      const uint64_t c_refresh = rex_ge_guest_refresh_count();
+      const uint64_t c_drop = rex_ge_guest_drop_count();
+      const uint64_t c_block = rex_ge_present_block_us();
+      const uint64_t c_n = a.count.load(std::memory_order_relaxed);
+      if (pv_t != 0 && now > pv_t) {
+        const double secs = (now - pv_t) / 1e6;
+        const uint64_t d_paint = c_paint - pv_paint;
+        const double paint_ms =
+            d_paint ? ((c_block - pv_block) / 1000.0 / d_paint) : 0.0;
+        REXKRNL_INFO(
+            "GESHOWN shown/s={:.1f} new/s={:.1f} refresh/s={:.1f} "
+            "drop/s={:.1f} submit/s={:.1f} paint={:.2f}ms",
+            d_paint / secs, (c_new - pv_new) / secs,
+            (c_refresh - pv_refresh) / secs, (c_drop - pv_drop) / secs,
+            (c_n - pv_n) / secs, paint_ms);
+      }
+      pv_t = now;
+      pv_paint = c_paint;
+      pv_new = c_new;
+      pv_refresh = c_refresh;
+      pv_drop = c_drop;
+      pv_block = c_block;
+      pv_n = c_n;
     }
   }
 }
