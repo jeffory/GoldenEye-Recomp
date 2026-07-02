@@ -991,6 +991,9 @@ REXCVAR_DEFINE_DOUBLE(ge_aim_turn_distance, 0.4, "Input",
 REXCVAR_DEFINE_BOOL(ge_gun_sway, true, "Input", "Gun sway as the camera turns");
 
 REXCVAR_DEFINE_DOUBLE(ge_mouse_sens, 1.0, "Input", "Mouse look sensitivity").range(0.05, 20.0);
+REXCVAR_DEFINE_DOUBLE(ge_mouse_smooth, 0.0, "Input",
+                      "Mouse look smoothing, EMA over per-frame deltas (0 = off/raw .. 0.9 = heavy)")
+    .range(0.0, 0.9);
 // Mouse-look on/off. ON: the mouse looks (added on top of the pad -- both work
 // at once, so you can put the controller down) and the cursor is captured during
 // play. OFF: no mouse-look, cursor free, controller only.
@@ -1214,6 +1217,23 @@ void ge_mouse_camera(uint8_t* base) {
   const float mdx = ge_take_mouse_dx();
   const float mdy = ge_take_mouse_dy();
 
+  // Optional look smoothing: EMA over the per-frame delta so frame-pacing
+  // jitter doesn't turn 1:1 into uneven yaw steps. Camera/crosshair only --
+  // the menu cursor below stays raw (a laggy cursor feels broken). The tail
+  // snaps to zero once imperceptible so the camera fully stops.
+  static float smooth_dx = 0.f, smooth_dy = 0.f;
+  const float smooth = static_cast<float>(REXCVAR_GET(ge_mouse_smooth));
+  float cdx = mdx, cdy = mdy;
+  if (smooth > 0.f) {
+    smooth_dx = smooth_dx * smooth + mdx * (1.f - smooth);
+    smooth_dy = smooth_dy * smooth + mdy * (1.f - smooth);
+    if (mdx == 0.f && std::fabs(smooth_dx) < 0.01f) smooth_dx = 0.f;
+    if (mdy == 0.f && std::fabs(smooth_dy) < 0.01f) smooth_dy = 0.f;
+    cdx = smooth_dx; cdy = smooth_dy;
+  } else {
+    smooth_dx = smooth_dy = 0.f;  // don't carry a stale tail into a re-enable
+  }
+
   // Move the menu selection crosshair (the game's own menus read these).
   {
     float menuX = LDF32(base, GE_MENU_XY);
@@ -1292,8 +1312,8 @@ void ge_mouse_camera(uint8_t* base) {
   if (aim_mode == 1) {
     float chX = LDF32(base, player + GE_OFF_CH_X);
     float chY = LDF32(base, player + GE_OFF_CH_Y);
-    chX += (invert_x ? -1.f : 1.f) * (mdx / dividor) * sensitivity;
-    chY += (invert_y ? -1.f : 1.f) * (mdy / dividor) * sensitivity;
+    chX += (invert_x ? -1.f : 1.f) * (cdx / dividor) * sensitivity;
+    chY += (invert_y ? -1.f : 1.f) * (cdy / dividor) * sensitivity;
 
     chX = std::min(chX, bounds); chX = std::max(chX, -bounds);
     chY = std::min(chY, bounds); chY = std::max(chY, -bounds);
@@ -1337,22 +1357,22 @@ void ge_mouse_camera(uint8_t* base) {
       }
     }
 
-    if (mdx != 0.f || mdy != 0.f) {
+    if (cdx != 0.f || cdy != 0.f) {
       float camX = LDF32(base, player + GE_OFF_CAM_X);
       float camY = LDF32(base, player + GE_OFF_CAM_Y);
 
-      camX += (invert_x ? -1.f : 1.f) * (mdx / 10.f) * sensitivity;
+      camX += (invert_x ? -1.f : 1.f) * (cdx / 10.f) * sensitivity;
 
       // Add 'sway' to the gun as the camera turns.
-      const float gun_sway_x = ((mdx / 16000.f) * sensitivity) * bounds;
-      const float gun_sway_y = ((mdy / 16000.f) * sensitivity) * bounds;
+      const float gun_sway_x = ((cdx / 16000.f) * sensitivity) * bounds;
+      const float gun_sway_y = ((cdy / 16000.f) * sensitivity) * bounds;
       float gun_sway_x_changed = gX + gun_sway_x;
       float gun_sway_y_changed = gY + gun_sway_y;
 
       if (!invert_y) {
-        camY -= (mdy / 10.f) * sensitivity;
+        camY -= (cdy / 10.f) * sensitivity;
       } else {
-        camY += (mdy / 10.f) * sensitivity;
+        camY += (cdy / 10.f) * sensitivity;
         gun_sway_y_changed = gY - gun_sway_y;
       }
 

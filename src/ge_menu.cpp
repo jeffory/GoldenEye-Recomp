@@ -684,6 +684,17 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       if (ImGui::IsItemDeactivatedAfterEdit() && callbacks_.persist_config)
         callbacks_.persist_config();
 
+      // Look smoothing -- EMA over per-frame deltas; 0 = raw/off. Live-read by
+      // the look hook each frame; persisted on release like sensitivity.
+      float smooth = GetCvarF("ge_mouse_smooth");
+      if (ImGui::SliderFloat("Mouse Smoothing", &smooth, 0.0f, 0.9f, "%.2f")) {
+        if (smooth < 0.0f) smooth = 0.0f;
+        if (smooth > 0.9f) smooth = 0.9f;
+        SetCvarF("ge_mouse_smooth", smooth);
+      }
+      if (ImGui::IsItemDeactivatedAfterEdit() && callbacks_.persist_config)
+        callbacks_.persist_config();
+
       ImGui::Spacing();
 
       // Mouse-look toggle. ON: the mouse looks (on top of the controller -- both
