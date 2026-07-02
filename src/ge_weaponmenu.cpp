@@ -143,9 +143,17 @@ void WeaponMenuDialog::OnDraw(ImGuiIO& io) {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, equipped ? kEquippedHover : kBtnHover);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, equipped ? kEquippedHover : kBtnActive);
 
+    // Ammo is currently known only for the equipped weapon (the per-weapon
+    // reserve pool isn't mapped yet), so only show a count when we actually have
+    // one -- otherwise just the name, plus an "(equipped)" marker.
     char label[64];
-    std::snprintf(label, sizeof(label), "%s\nx%u%s", WeaponLabel(id), ammo,
-                  equipped ? "  (equipped)" : "");
+    if (ammo > 0) {
+      std::snprintf(label, sizeof(label), "%s\nx%u%s", WeaponLabel(id), ammo,
+                    equipped ? "  (equipped)" : "");
+    } else {
+      std::snprintf(label, sizeof(label), "%s%s", WeaponLabel(id),
+                    equipped ? "\n(equipped)" : "");
+    }
     if (ImGui::Button(label, ImVec2(btn_w, btn_h)) && !equipped) {
       // Post the switch; the game thread applies it on its next frame at a safe
       // point (see ge_gamestate.cpp). No-op on the equipped weapon.
