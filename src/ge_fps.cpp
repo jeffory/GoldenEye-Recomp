@@ -30,6 +30,7 @@
 #include <rex/cvar.h>
 #include <rex/logging/macros.h>
 #include <rex/perf/counter.h>
+#include <rex/system/fault_diag.h>  // wwf= write-watch fault counters
 
 #include <imgui.h>
 
@@ -275,6 +276,17 @@ void FpsOnFrame(uint32_t frames_advanced) {
   const double ema = a.ema_fps.load(std::memory_order_relaxed);
   a.ema_fps.store(ema <= 0.0 ? inst : ema * 0.9 + inst * 0.1, std::memory_order_relaxed);
 
+  // Write-watch faults taken since the previous recorded frame. High values
+  // here correlate fault storms (e.g. shooting-enemy effect spawns hitting
+  // GPU-watched pool pages) with GESPIKE frames; a runaway value is the
+  // infinite fault loop the SDK failsafe guards against. Single-writer (frame
+  // loop thread), like the rest of this recorder.
+  static uint64_t s_prev_wwf = 0;
+  const uint64_t wwf_total =
+      rex::system::fault_diag().ww_faults_total.load(std::memory_order_relaxed);
+  const uint64_t wwf_frame = wwf_total - s_prev_wwf;
+  s_prev_wwf = wwf_total;
+
   // GESPIKE: a frame >2x the rolling median (and below the gap cutoff -- gaps
   // returned above) gets a rate-limited stage-breakdown line. The rex::perf
   // snapshot is the just-completed frame: the CP already executed this frame's
@@ -292,7 +304,7 @@ void FpsOnFrame(uint32_t frames_advanced) {
         REXKRNL_INFO(
             "GESPIKE dt={:.1f}ms med={:.1f}ms cpexec={}us cpidle={}us "
             "wrm={}us present={}us gwait={}us gpu={}us draws={} stalls={} "
-            "starved={}",
+            "starved={} wwf={}",
             per / 1000.0, med / 1000.0,
             GetSnapshotCounter(CounterId::kCpExecuteUs),
             GetSnapshotCounter(CounterId::kCpIdleUs),
@@ -302,7 +314,7 @@ void FpsOnFrame(uint32_t frames_advanced) {
             GetSnapshotCounter(CounterId::kGpuFrameUs),
             GetSnapshotCounter(CounterId::kDrawCalls),
             GetSnapshotCounter(CounterId::kCommandBufferStalls),
-            GetCpStarvedEpisodes());
+            GetCpStarvedEpisodes(), wwf_frame);
       }
     }
   }
@@ -346,7 +358,7 @@ void FpsOnFrame(uint32_t frames_advanced) {
       // loop, not the game, is limiting displayed fps.
       // Benign single-writer statics: only the log-tick winner runs this.
       static uint64_t pv_t = 0, pv_paint = 0, pv_new = 0, pv_refresh = 0,
-                      pv_drop = 0, pv_block = 0, pv_n = 0;
+                      pv_drop = 0, pv_block = 0, pv_n = 0, pv_wwf = 0;
       const uint64_t c_paint = rex_ge_present_paint_count();
       const uint64_t c_new = rex_ge_present_new_frame_count();
       const uint64_t c_refresh = rex_ge_guest_refresh_count();
@@ -360,10 +372,11 @@ void FpsOnFrame(uint32_t frames_advanced) {
             d_paint ? ((c_block - pv_block) / 1000.0 / d_paint) : 0.0;
         REXKRNL_INFO(
             "GESHOWN shown/s={:.1f} new/s={:.1f} refresh/s={:.1f} "
-            "drop/s={:.1f} submit/s={:.1f} paint={:.2f}ms",
+            "drop/s={:.1f} submit/s={:.1f} paint={:.2f}ms wwf/s={:.0f}",
             d_paint / secs, (c_new - pv_new) / secs,
             (c_refresh - pv_refresh) / secs, (c_drop - pv_drop) / secs,
-            (c_n - pv_n) / secs, paint_ms);
+            (c_n - pv_n) / secs, paint_ms, (wwf_total - pv_wwf) / secs);
+        pv_wwf = wwf_total;
 #ifdef __ANDROID__
         // req/s = paints requested (UI-loop wakes); loop/s = UI-loop
         // iterations. req/s < refresh/s means requests are being swallowed

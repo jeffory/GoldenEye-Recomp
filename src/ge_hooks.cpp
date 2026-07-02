@@ -21,6 +21,7 @@
 #include <rex/perf/counter.h>  // rex::perf frame-stage counters (GESPIKE)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
 #include <rex/runtime.h>
+#include <rex/system/fault_diag.h>  // write-watch fault diagnostics (GEWATCHDOG dump)
 #include <rex/system/xmemory.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/command_processor.h>
@@ -228,6 +229,41 @@ std::atomic<uint32_t> g_ge_device{0};   // device struct (dev) seen by ge_dbg_no
 std::atomic<uint32_t> g_ge_idblk{0};    // id-block (idblk) seen by ge_dbg_now
 std::atomic<uint32_t> g_dbgnow_calls{0};  // increments each ge_dbg_now (guest polling sub_82198C28)
 
+// Decode the SDK's write-watch fault diagnostics into ge.log. Called from the
+// watchdog thread (normal context - logging is fine here). `full` also dumps
+// the event ring; the summary line alone is cheap enough for periodic use.
+void ge_dump_fault_diag(bool full) {
+  auto& d = rex::system::fault_diag();
+  REXKRNL_INFO(
+      "GEWWDIAG wwf={} early_abort={} cb_handled={} cb_unhandled={} recovered={} "
+      "recovery_fatal={} vetoes={} any_watched_false={} rearm={} protect_ro_watched={} "
+      "shadow_disagree={} failsafe={} consec_max={}",
+      d.ww_faults_total.load(), d.early_abort_hits.load(), d.cb_handled.load(),
+      d.cb_unhandled.load(), d.recovered.load(), d.recovery_fatal.load(),
+      d.unprotect_vetoes.load(), d.any_watched_false.load(), d.rearm_races.load(),
+      d.protect_ro_watched.load(), d.shadow_disagreements.load(), d.failsafe_fires.load(),
+      d.consecutive_max.load());
+  if (!full) return;
+  static const char* kPathNames[] = {
+      "none",      "early_abort", "cb_handled",   "cb_unhandled", "recovered",
+      "rec_fatal", "rec_lied",    "veto",         "no_watch",     "rearm",
+      "protect_ro", "failsafe",   "shadow_lied"};
+  // Oldest-first up to the ring size; skip never-written slots.
+  uint32_t next = d.ring_next.load(std::memory_order_relaxed);
+  for (uint32_t k = 0; k < rex::system::FaultDiag::kRingSize; ++k) {
+    const auto& r = d.ring[(next + k) & (rex::system::FaultDiag::kRingSize - 1)];
+    if (r.path == 0) continue;
+    const char* name =
+        r.path < sizeof(kPathNames) / sizeof(kPathNames[0]) ? kPathNames[r.path] : "?";
+    REXKRNL_INFO(
+        "GEWWRING seq={} t={}.{:06}s path={} host={:#x} guest={:#010x} pc={:#x} heap={:#010x} "
+        "gpage={} cur={} state={} detail={}",
+        r.fault_seq, r.timestamp_ns / 1000000000ull, (r.timestamp_ns % 1000000000ull) / 1000,
+        name, r.host_addr, r.guest_vaddr, r.pc, r.heap_base, r.guest_page, r.current_protect,
+        r.page_state, r.detail);
+  }
+}
+
 void ge_watchdog_thread() {
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   uint32_t last_wpi = 0xFFFFFFFFu, last_rpi = 0, last_present = 0, last_submit = 0;
@@ -291,6 +327,9 @@ void ge_watchdog_thread() {
               rex::perf::GetSnapshotCounter(rex::perf::CounterId::kPresentBlockUs),
               rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGuestGpuWaitUs),
               rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGpuFrameUs));
+          // Full write-watch fault anatomy: if a guest thread is wedged in a
+          // fault loop, the ring holds the decisions of its last iterations.
+          ge_dump_fault_diag(/*full=*/true);
         }
       } else {
         tf_ticks = 0;
@@ -298,6 +337,37 @@ void ge_watchdog_thread() {
       }
       tf_last_submit = submit;
       tf_last_present = present;
+    }
+
+    // Write-watch anomaly watcher: the failsafe, unprotect vetoes, shadow
+    // disagreements and recovery events should all be zero in a healthy
+    // session. Log (rate-limited) the moment any of them move so the event is
+    // timestamped against GESPIKE/GESHOWN context even when no freeze follows.
+    {
+      auto& wwd = rex::system::fault_diag();
+      static uint64_t ww_last_failsafe = 0, ww_last_anom = 0, ww_last_recovered = 0;
+      static uint32_t ww_cooldown = 0;
+      if (ww_cooldown) --ww_cooldown;
+      uint64_t failsafe = wwd.failsafe_fires.load(std::memory_order_relaxed);
+      uint64_t anom = wwd.unprotect_vetoes.load(std::memory_order_relaxed) +
+                      wwd.shadow_disagreements.load(std::memory_order_relaxed) +
+                      wwd.rearm_races.load(std::memory_order_relaxed) +
+                      wwd.protect_ro_watched.load(std::memory_order_relaxed);
+      uint64_t recov = wwd.recovered.load(std::memory_order_relaxed) +
+                       wwd.recovery_fatal.load(std::memory_order_relaxed);
+      if (failsafe != ww_last_failsafe) {
+        REXKRNL_INFO("GEWWFAILSAFE fired (total={}) - a fault-looping page was force-unprotected",
+                     failsafe);
+        ge_dump_fault_diag(/*full=*/true);
+        ww_last_failsafe = failsafe;
+        ww_last_anom = anom;
+        ww_last_recovered = recov;
+      } else if ((anom != ww_last_anom || recov != ww_last_recovered) && ww_cooldown == 0) {
+        ge_dump_fault_diag(/*full=*/false);
+        ww_cooldown = 20;  // at most one summary per ~5s
+        ww_last_anom = anom;
+        ww_last_recovered = recov;
+      }
     }
 
     bool present_alive = (present != last_present);

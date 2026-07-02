@@ -1,5 +1,46 @@
 # HANDOFF: Thor gameplay lockup — infinite write-watch fault loop (OPEN)
 
+**Status 2026-07-02 (evening session): instrumented + failsafed + one loop class root-fixed;
+awaiting a long device session for the verdict.** What landed (SDK uncommitted work tree +
+game repo, deployed to the Thor):
+
+- **A reproducible infinite-loop class found and fixed (S2, stale shadow).** New SDK test
+  `tests/unit/memory/write_watch_fault_test.cpp` scenario 5 makes the protection shadow claim
+  RW while the kernel has the page RO: the old `ExceptionCallback` early-abort then returns
+  handled forever without touching anything — a genuine wedge, verified by stashing the fix
+  (test times out) and restoring it (passes). This signature matches lockup #2's profile
+  (all handler time in QueryProtect, TriggerCallbacks absent from stacks), and the shadow
+  memoization (3496bf3) landed *between* lockups #1 and #2. Fix: at 16+ consecutive
+  same-page faults the handler re-queries kernel truth via the new async-signal-safe
+  `rex::memory::QueryProtectUncached` and overrides a lying shadow (mmio_handler.cpp).
+- **Failsafe:** ≥64 back-to-back same-page faults (<2ms gaps — frame-paced re-arms don't
+  count) → hard mprotect-RW + `REXWWFAILSAFE` raw stderr line + `GEWWFAILSAFE` in ge.log
+  with a full diag dump. Any residual loop variant becomes a one-frame artifact.
+- **Instrumentation (`rex/system/fault_diag.h`):** counters + 128-record ring across all
+  seven decision points (early-abort, callback verdicts, unprotect-veto @ xmemory
+  TriggerCallbacks, any_watched, recovery incl. kernel-truth verify, arm-side re-arm race,
+  PhysicalHeap::Protect RO-on-watched). Game side: `GEWWDIAG` summary every ~5s when
+  counters move + full ring dump on TOTAL-FREEZE, `wwf=` on GESPIKE, `wwf/s=` on GESHOWN.
+- **Baselines (healthy):** desktop menus ~65 wwf/s; Thor menus ~70 wwf/s, consec_max 3,
+  vetoes 0, shadow_disagree 0. NOTE: `rearm` ticks constantly in normal play (GPU re-arms a
+  just-faulted page within 5ms routinely) — re-arm alone is NOT pathology; look for it
+  co-occurring with vetoes/streaks.
+- Desktop synthesis of the veto (S1/#1 hypothesis) shows it self-recovers in ≤3 faults via
+  the AccessViolationCallback recovery path — the veto alone cannot wedge; it needs the
+  re-arm race or the stale shadow to sustain. The Thor evidence will name the variant.
+- Thor host page size confirmed 4KB (16KB mixed-page theory ruled out).
+
+**Next:** rapid-shooting session (minutes) → read `wwf=` on GESPIKE lines to confirm the
+shooting↔fault-storm link; then a 20-30min combat session → either it survives (S2 fix was
+the root cause), or GEWWFAILSAFE fires with the ring naming the loop variant → apply the
+matching Phase C fix (see plan file / table below). Test infra gotcha: the write-watch tests
+are a separate binary (`write_watch_fault_tests`) because Catch2's per-test signal-handler
+save/restore strands rex's once-installed SIGSEGV handler; both test binaries also segfault
+in static destructors AT EXIT (pre-existing rexcore double-link) — results print fine,
+discovery uses PRE_TEST mode.
+
+--- Original handoff below (still-valid mechanism reference) ---
+
 **Status 2026-07-02:** two live-diagnosed lockups, one contributing bug fixed (maps parsing),
 **root cause still open**: a guest write that faults on a watched page is never resolved by the
 write-watch machinery and re-faults forever. Everything below is reproducible-from-evidence; the
