@@ -90,6 +90,13 @@ WeaponSnapshot GetWeaponSnapshot();
 // before the next frame replaces the pending request (last-writer-wins).
 void RequestEquipWeapon(int32_t weapon_id);
 
+// Non-clearing read of the pending equip target (kNoWeapon if none). The
+// actuation driver (ge_hooks) polls this across frames while it cycles the
+// game's native weapon-switch input, then calls ClearEquipRequest() once the
+// equipped weapon matches (or it gives up). Callable from any thread.
+int32_t PeekEquipRequest();
+void ClearEquipRequest();
+
 // Game-thread per-frame pump. Reads guest memory, publishes a fresh snapshot,
 // and applies any pending equip request. MUST be called only from a guest-thread
 // hook with the live PPC context. `ppc_ctx` is a PPCContext* (passed as void* so

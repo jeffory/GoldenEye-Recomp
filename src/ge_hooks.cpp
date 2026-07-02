@@ -1465,6 +1465,40 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   g_listener.tick_capture();
   if (REXCVAR_GET(ge_mouselook_enable)) ge_mouse_camera(base);
 
+  // Weapon actuation: step the game's native Y (weapon-switch) input toward the
+  // pending target posted via RequestEquipWeapon. Each Y press starts a switch
+  // that takes several frames; the equipped id only updates once it completes. So
+  // we must pulse Y once, then WAIT for the switch to land (equipped id changes)
+  // before pressing again -- otherwise the presses queue and cycle straight past
+  // the target (symptom: it lowers the gun and comes back to the same weapon).
+  // Caps bound it if a switch never lands or the target is unreachable.
+  {
+    constexpr int kMaxSteps = 16;     // total Y presses before giving up
+    constexpr int kStepTimeout = 90;  // frames to wait for one switch to land
+    static int steps = 0, wait = 0;
+    static bool pressed = false;
+    static int32_t equipped_at_press = 0;
+    const int32_t target = ge::gamestate::PeekEquipRequest();
+    if (target == ge::gamestate::kNoWeapon) {
+      steps = 0; wait = 0; pressed = false;
+    } else {
+      const auto snap = ge::gamestate::GetWeaponSnapshot();
+      const bool done = !snap.valid || snap.equipped_id == target;
+      const bool switching = pressed && snap.equipped_id == equipped_at_press;
+      if (done || steps >= kMaxSteps) {
+        ge::gamestate::ClearEquipRequest();
+        steps = 0; wait = 0; pressed = false;
+      } else if (switching && wait < kStepTimeout) {
+        ++wait;  // previous switch still in flight; keep Y released
+      } else {
+        // First step, or the previous switch landed / timed out: press Y once.
+        ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | BTN_Y);
+        equipped_at_press = snap.equipped_id;
+        pressed = true; ++steps; wait = 0;
+      }
+    }
+  }
+
   if (!REXCVAR_GET(ge_keyboard_enable) || !ge_input_active()) return;
 
   uint16_t add = 0;
@@ -1494,6 +1528,23 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (ge_key_down("ge_key_mv_down")) ly = -32767;
   if (lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(lx));
   if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
+
+  // TEMP (Task 1 verification, removed in Task 2): press N to request the next
+  // carried weapon; the driver above cycles Y to reach it.
+  {
+    static bool prev_n = false;
+    const bool n = g_listener.key_down(rex::ui::VirtualKey::kN);
+    if (n && !prev_n) {
+      const auto snap = ge::gamestate::GetWeaponSnapshot();
+      if (snap.valid && snap.held_count > 0) {
+        int idx = 0;
+        for (int i = 0; i < snap.held_count; ++i)
+          if (snap.held_ids[i] == snap.equipped_id) { idx = i; break; }
+        ge::gamestate::RequestEquipWeapon(snap.held_ids[(idx + 1) % snap.held_count]);
+      }
+    }
+    prev_n = n;
+  }
 }
 
 // ===========================================================================

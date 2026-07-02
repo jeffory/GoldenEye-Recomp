@@ -12,10 +12,14 @@
 // The values are assembled into a WeaponSnapshot and published through a seqlock
 // so any thread can read a torn-free copy lock-free.
 //
-// The write path records a UI-thread equip request in an atomic and, on the next
-// game frame, writes the game's per-frame weapon-select field (ST32) -- the same
-// field a weapon-cycle input sets -- so the game runs its normal switch logic
-// (animation, ammo check). Writes are gated to safe moments.
+// The equip path records a UI-thread request in an atomic (RequestEquipWeapon);
+// the actuator lives in ge_hooks.cpp, which peeks the pending target
+// (PeekEquipRequest) and pulses the game's native Y weapon-switch input until the
+// equipped weapon reaches it, then clears it (ClearEquipRequest). A direct
+// guest-memory write was tried and abandoned -- writing the equipped-id block
+// corrupts it and the game does not poll a "desired weapon" field (see
+// docs/HANDOFF-weapon-switch-direct-call.md). This TU no longer writes guest
+// weapon state; it only reads/publishes the snapshot.
 //
 // ---------------------------------------------------------------------------
 // GUEST LAYOUT CONSTANTS  ***NEEDS ON-DEVICE CONFIRMATION***
@@ -658,34 +662,6 @@ WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
   return s;
 }
 
-// --- write path: apply a pending equip request at a safe moment -------------
-void apply_equip(void* ppc_ctx, uint8_t* base, const WeaponSnapshot& s) {
-  (void)ppc_ctx;  // reserved: a guest weapon-select call could use this ctx
-  uint32_t req = g_pending_equip.exchange(0, std::memory_order_acq_rel);
-  if (!(req & kReqFlag)) return;                 // nothing pending
-  int32_t id = static_cast<int32_t>(req & ~kReqFlag);
-
-  // Write path not yet wired (offset unconfirmed) or unsafe context -> drop the
-  // request silently (it was already cleared above; a stale equip must not fire
-  // a frame later in a menu/cutscene).
-  if (kEquipRequestOff == 0u || kPlayerPtrAddr == 0u) return;
-  if (!s.valid) return;                          // no live player
-  if (id < 0 || id >= (int32_t)kMaxWeaponSlots) return;
-  if (!(s.held_mask & (1u << id))) return;       // can't switch to a weapon not held
-
-  uint32_t player = LD32(base, kPlayerPtrAddr);
-  if (!plausible_guest_ptr(player)) return;
-
-  // Safety gate: only switch during normal play (alive, not in a menu/cutscene).
-  if (kStateOff != 0u && kStateInPlayMask != 0u) {
-    if ((LD32(base, player + kStateOff) & kStateInPlayMask) != kStateInPlayMask) return;
-  }
-
-  // Write the game's per-frame weapon-select field; the game's own switch logic
-  // (draw animation, ammo check) runs next frame, matching a weapon-cycle input.
-  ST32(base, player + kEquipRequestOff, static_cast<uint32_t>(id));
-}
-
 }  // namespace
 
 // ============================== public API =================================
@@ -707,6 +683,15 @@ void RequestEquipWeapon(int32_t weapon_id) {
   g_pending_equip.store(kReqFlag | (uint32_t)weapon_id, std::memory_order_release);
 }
 
+int32_t PeekEquipRequest() {
+  uint32_t req = g_pending_equip.load(std::memory_order_acquire);
+  return (req & kReqFlag) ? static_cast<int32_t>(req & ~kReqFlag) : kNoWeapon;
+}
+
+void ClearEquipRequest() {
+  g_pending_equip.store(0, std::memory_order_release);
+}
+
 void OnFrame(void* ppc_ctx, uint8_t* guest_base) {
   if (!guest_base) return;
   uint32_t frame = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -719,7 +704,8 @@ void OnFrame(void* ppc_ctx, uint8_t* guest_base) {
 
   WeaponSnapshot s = read_snapshot(guest_base, frame);
   publish(s);
-  apply_equip(ppc_ctx, guest_base, s);
+  (void)ppc_ctx;  // reserved: equip actuation now happens via native-Y injection
+                  // in ge_hooks.cpp, not a guest-memory write from this frame hook.
 }
 
 }  // namespace ge::gamestate
