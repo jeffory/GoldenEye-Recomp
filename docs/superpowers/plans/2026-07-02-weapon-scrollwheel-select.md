@@ -4,7 +4,7 @@
 
 **Goal:** Let a desktop player switch GoldenEye weapons with the mouse scrollwheel (next/prev) and number keys 1–9 (jump to the Nth carried weapon), with a numbered on-screen overlay, by wiring the currently-inert guest-memory equip-write path.
 
-**Architecture:** Reuse the dual-screen bridge (`gamestate::WeaponSnapshot` / `RequestEquipWeapon` / `apply_equip`). Task 1 confirms and wires the guest-memory field that actually switches the weapon (the one gating unknown). Task 2 adds an edge-triggered desktop input driver in the existing controller-poll hook. Task 3 adds a passive numbered overlay modeled on `FpsOverlay`. Task 4 exposes an in-game menu toggle.
+**Architecture:** Reuse the dual-screen bridge (`gamestate::WeaponSnapshot` / `RequestEquipWeapon`). Task 1 actuates switches by injecting the game's native Y button and cycling until the equipped weapon matches the requested target (the original memory-write plan was disproven — see Task 1). Task 2 adds an edge-triggered desktop input driver in the existing controller-poll hook that posts targets. Task 3 adds a passive numbered overlay modeled on `FpsOverlay`. Task 4 exposes an in-game menu toggle.
 
 **Tech Stack:** C++17, ImGui, ReXGlue SDK (`rex::cvar`, `rex::ui` input listener), CMake presets.
 
@@ -23,57 +23,107 @@
 
 ---
 
-## Task 1: Confirm & wire the guest weapon-switch write path
+## Task 1: Actuation via native-Y injection (cycle-to-target)
 
-This is the gating unknown. The write path in `apply_equip()` is inert because
-`kEquipRequestOff`/`kPlayerPtrAddr` are `0`. We first try the cheap hypothesis
-(write the equipped-id mirror `0x447f10b0` directly); if the game ignores it, we
-fall back to diffing memory to find the real "requested weapon" field. A
-temporary debug keybind drives equips so this task verifies independently of the
-later input driver.
+**REVISED** (2026-07-03). The original "guest memory write" plan was disproven on
+desktop: writing the equipped-id mirror `0x447f10b0` corrupts the id-agreement
+gate (snapshot → invalid) and no polled "desired weapon" field exists (the game
+sets weapon state *from* its switch routine). The direct guest-function call was
+also investigated and deferred (see
+`docs/HANDOFF-weapon-switch-direct-call.md`). We now actuate switches by
+**injecting the game's native Y button** (confirmed: `E`=`BTN_Y` cycles weapons),
+pulsing it until the snapshot's `equipped_id` reaches the requested target. This
+reuses the proven `GE_PAD0` injection path and the game's own switch logic.
 
 **Files:**
-- Modify: `src/ge_gamestate.cpp` (add a direct-write branch in `apply_equip`; set discovered constants; toggle the probe)
-- Modify: `src/ge_hooks.cpp` (temporary debug keybind — removed in Task 2)
+- Modify: `src/ge_gamestate.h` (declare `PeekEquipRequest` / `ClearEquipRequest`)
+- Modify: `src/ge_gamestate.cpp` (add peek/clear; remove the now-dead `apply_equip` and its `OnFrame` call)
+- Modify: `src/ge_hooks.cpp` (cycle-to-target Y-injection driver + a TEMP debug keybind, removed in Task 2)
 
 **Interfaces:**
-- Consumes: `gamestate::GetWeaponSnapshot()`, `gamestate::RequestEquipWeapon(int32_t)`, `apply_equip(void*, uint8_t*, const WeaponSnapshot&)`, `ST32(base,addr,val)`, `LD32(base,addr)`.
-- Produces: a **live** equip path — after this task `RequestEquipWeapon(id)` for a held weapon visibly switches the in-game weapon. Introduces constant `kEquipIdWriteAddr` (fixed guest address written on equip; `0` if the pointer-path was used instead).
+- Consumes: `gamestate::GetWeaponSnapshot()` (`WeaponSnapshot{valid, equipped_id, held_count, held_ids[]}`), `gamestate::RequestEquipWeapon(int32_t)` (already exists — posts the target), `gamestate::kNoWeapon`, `g_listener.key_down(VirtualKey)`, `GE_PAD0`, `BTN_Y`, `LD16`/`ST16`.
+- Produces: `int32_t gamestate::PeekEquipRequest()` (returns the pending target weapon id, or `kNoWeapon` if none — does NOT clear); `void gamestate::ClearEquipRequest()`. After this task, calling `RequestEquipWeapon(id)` for a held weapon makes the game cycle to it within a few frames.
 
-- [ ] **Step 1: Add a direct-write branch to `apply_equip` (primary hypothesis)**
+- [ ] **Step 1: Add peek/clear to the gamestate API**
 
-In `src/ge_gamestate.cpp`, add a constant next to the other DIRECT-path
-addresses (near line 165):
+In `src/ge_gamestate.h`, next to the existing `RequestEquipWeapon` declaration, add:
 
 ```cpp
-// Equip WRITE via fixed address (mirror of the read path). If the game honors a
-// write to the equipped-id block as a switch, this is the whole write path and
-// no player-pointer chase is needed. 0 => disabled (use the pointer path below).
-inline constexpr uint32_t kEquipIdWriteAddr = 0x447f10b0u;  // TRY FIRST
+// Non-clearing read of the pending equip target (kNoWeapon if none). The
+// actuation driver (ge_hooks) polls this across frames while it cycles the
+// game's native weapon-switch input, then calls ClearEquipRequest() once the
+// equipped weapon matches (or it gives up). Callable from any thread.
+int32_t PeekEquipRequest();
+void ClearEquipRequest();
 ```
 
-In `apply_equip()` (near line 664, after the `req` is decoded and the
-`id` range/held_mask guards at lines 666–667), insert the direct-write branch
-*before* the existing pointer-path block:
+In `src/ge_gamestate.cpp`, in the public API section (near `RequestEquipWeapon`, ~line 698), add:
 
 ```cpp
-  // Primary: direct fixed-address write (no pointer chase). Confirmed/kept only
-  // if the game actually switches when this field is written.
-  if (kEquipIdWriteAddr != 0u) {
-    ST32(base, kEquipIdWriteAddr, static_cast<uint32_t>(id));
-    return;
+int32_t PeekEquipRequest() {
+  uint32_t req = g_pending_equip.load(std::memory_order_acquire);
+  return (req & kReqFlag) ? static_cast<int32_t>(req & ~kReqFlag) : kNoWeapon;
+}
+
+void ClearEquipRequest() {
+  g_pending_equip.store(0, std::memory_order_release);
+}
+```
+
+- [ ] **Step 2: Remove the dead memory-write actuation**
+
+The old `apply_equip()` (the guest-memory writer) is now unused and its only
+caller is `OnFrame`. Delete the `apply_equip(ppc_ctx, guest_base, s);` line in
+`OnFrame` (near line 715) and delete the entire `apply_equip` function
+definition (near line 655, from `void apply_equip(void* ppc_ctx, ...)` through
+its closing `}`). Leave the `g_pending_equip` atomic and `kReqFlag` — they are
+now driven by `RequestEquipWeapon` / `PeekEquipRequest` / `ClearEquipRequest`.
+(The unused write-path constants `kEquipRequestOff` / `kStateOff` /
+`kStateInPlayMask` are `inline constexpr` and harmless; leave them.)
+
+- [ ] **Step 3: Add the cycle-to-target Y-injection driver**
+
+In `src/ge_hooks.cpp`, inside `ge_inject_keyboard()`, place this **before** the
+keyboard early-return (`if (!REXCVAR_GET(ge_keyboard_enable) || !ge_input_active()) return;`
+at ~line 1468) — right after the mouse-look block (~line 1466) — so weapon
+actuation runs even when the keyboard map is off:
+
+```cpp
+  // Weapon actuation: cycle the game's native Y (weapon-switch) input until the
+  // equipped weapon matches the pending target posted via RequestEquipWeapon.
+  // Y is edge-detected by the game, so we pulse it (assert 1 frame, release a
+  // few) and re-check the snapshot between pulses. A safety cap prevents endless
+  // pulsing if the target can't be reached (e.g. the game skips a slot).
+  {
+    constexpr int kPulseGap = 3;    // frames to release Y between pulses
+    constexpr int kMaxPulses = 12;  // give up after this many (covers any inventory)
+    static int gap = 0, pulses = 0;
+    const int32_t target = ge::gamestate::PeekEquipRequest();
+    if (target == ge::gamestate::kNoWeapon) {
+      gap = 0; pulses = 0;
+    } else {
+      const auto snap = ge::gamestate::GetWeaponSnapshot();
+      if (!snap.valid || snap.equipped_id == target || pulses >= kMaxPulses) {
+        ge::gamestate::ClearEquipRequest();
+        gap = 0; pulses = 0;
+      } else if (gap > 0) {
+        --gap;  // releasing Y between pulses (edge gap)
+      } else {
+        ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | BTN_Y);  // one Y pulse
+        ++pulses; gap = kPulseGap;
+      }
+    }
   }
 ```
 
-- [ ] **Step 2: Add a temporary debug keybind to trigger equips**
+- [ ] **Step 4: Add a TEMP debug keybind to drive it (removed in Task 2)**
 
-In `src/ge_hooks.cpp`, at the end of `ge_inject_keyboard()` (after line 1496,
-before the closing brace at 1497), add a throwaway cycle trigger. This is
-removed in Task 2.
+At the end of `ge_inject_keyboard()` (after the left-stick block, ~line 1496),
+add a throwaway trigger: press **N** to request the next carried weapon.
 
 ```cpp
-  // TEMP (Task 1 verification, removed in Task 2): press N to cycle to the next
-  // carried weapon via the bridge, so the write path can be validated on its own.
+  // TEMP (Task 1 verification, removed in Task 2): press N to request the next
+  // carried weapon; the driver above cycles Y to reach it.
   {
     static bool prev_n = false;
     const bool n = g_listener.key_down(rex::ui::VirtualKey::kN);
@@ -83,75 +133,35 @@ removed in Task 2.
         int idx = 0;
         for (int i = 0; i < snap.held_count; ++i)
           if (snap.held_ids[i] == snap.equipped_id) { idx = i; break; }
-        const int next = (idx + 1) % snap.held_count;
-        ge::gamestate::RequestEquipWeapon(snap.held_ids[next]);
-        REXKRNL_INFO("GEWPN debug cycle -> id %d", snap.held_ids[next]);
+        ge::gamestate::RequestEquipWeapon(snap.held_ids[(idx + 1) % snap.held_count]);
       }
     }
     prev_n = n;
   }
 ```
 
-Confirm `VirtualKey::kN` exists (`grep -n "kN " ../GoldenEye-Recomp-rexglue/include/rex/ui/virtual_key.h`); if the enum name differs, use the matching letter constant. Ensure `#include "ge_gamestate.h"` is present in ge_hooks.cpp (`grep -n ge_gamestate.h src/ge_hooks.cpp`); add it if missing.
+Ensure `#include "ge_gamestate.h"` is present in ge_hooks.cpp (`grep -n ge_gamestate.h src/ge_hooks.cpp`); add it if missing. `VirtualKey::kN` = 0x4E exists.
 
-- [ ] **Step 3: Build**
+- [ ] **Step 5: Build**
 
 Run: `cmake --build --preset linux-amd64-relwithdebinfo --target ge`
-Expected: compiles cleanly (relinks `librexruntimerd.so` + `ge`).
+Expected: compiles/links cleanly. The desktop binary is
+`out/build/linux-amd64-relwithdebinfo/GoldenEye` (OUTPUT_NAME, NOT `ge`).
 
-- [ ] **Step 4: Run and test the direct-write hypothesis**
+- [ ] **Step 6: Manual verification (controller-in-the-loop — needs the human)**
 
-Run the game (see Global Constraints run line, add `--log_level debug`), start a
-level, pick up at least one extra weapon, then press **N** repeatedly.
+Run: `LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets --log_level debug`
+In a level with 2+ weapons, press **N**: the weapon should switch to the next
+carried weapon each press (the driver pulses Y until `equipped_id` matches).
+If a press over/under-shoots, tune `kPulseGap` (raise if the game misses pulses)
+and re-test. This step is driven by the controller (main session) with the human
+at the screen — the implementer stops after Step 5 and reports.
 
-Expected (success case): the in-game equipped weapon changes each press, and
-`GEWPN debug cycle -> id N` lines appear in the log.
-
-- [ ] **Step 5: If the direct write did NOT switch the weapon — find the real field**
-
-Only if Step 4 failed. Enable the discovery probe in `src/ge_gamestate.cpp`:
-
-```cpp
-inline constexpr uint32_t kProbeAddr = 0x447f10a0u;  // window spanning the equip block
-inline constexpr uint32_t kProbeLen  = 128u;
-```
-
-Rebuild, run, and trigger a **native** weapon switch to see which bytes move
-when the game switches on its own:
-- If you have a USB/Bluetooth gamepad, press the game's weapon-switch button.
-- If keyboard-only, temporarily sweep candidate buttons by OR-ing one at a time
-  into `GE_PAD0` in `ge_inject_keyboard` (e.g. bind a key to `BTN_Y`, then
-  `BTN_DPAD_UP`, etc.) until the weapon changes; that identifies the native
-  switch button.
-
-Watch the `GEPROBE`-style hex dumps in the log: the field that changes to the
-*target* id one frame **before** `0x447f10b0` updates is the request field.
-Record its guest address (fixed) or, if it lives in the player struct, the base
-pointer address + offset.
-
-- [ ] **Step 6: If Step 5 was needed — wire the pointer/request path**
-
-Set `kEquipIdWriteAddr = 0u` (disable the direct write) and fill in the
-discovered constants in `src/ge_gamestate.cpp`:
-
-```cpp
-inline constexpr uint32_t kPlayerPtrAddr   = 0x________u;  // discovered player-struct pointer
-inline constexpr uint32_t kEquipRequestOff = 0x____u;      // discovered request-field offset
-// Optional in-play gate, only if a clean state field was found:
-inline constexpr uint32_t kStateOff        = 0x____u;
-inline constexpr uint32_t kStateInPlayMask = 0x________u;
-```
-
-If instead the request field is a *fixed* address (no pointer chase), set
-`kEquipIdWriteAddr` to that address and keep the pointer constants `0`. Turn the
-probe back off (`kProbeAddr = 0u`). Rebuild and repeat Step 4 until pressing N
-switches weapons.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Commit** (done by the controller after human verification)
 
 ```bash
-git add src/ge_gamestate.cpp src/ge_hooks.cpp
-git commit -m "feat(ds): wire the guest weapon-switch write path (equip actuation)
+git add src/ge_gamestate.h src/ge_gamestate.cpp src/ge_hooks.cpp
+git commit -m "feat(ds): actuate weapon switch via native-Y injection (cycle-to-target)
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
@@ -173,7 +183,9 @@ cycles, digits 1–9 jump, gated by a cvar.
 - [ ] **Step 1: Remove the Task 1 temporary debug block**
 
 Delete the `// TEMP (Task 1 verification ...)` block added to
-`ge_inject_keyboard()` in Task 1 Step 2.
+`ge_inject_keyboard()` in Task 1 Step 4 (the N-key trigger). Leave the
+cycle-to-target Y-injection driver from Task 1 Step 3 in place — the real input
+driver below posts targets that it actuates.
 
 - [ ] **Step 2: Add cvars**
 
