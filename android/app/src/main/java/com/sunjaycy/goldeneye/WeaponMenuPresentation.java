@@ -40,6 +40,14 @@ final class WeaponMenuPresentation extends Presentation {
         // Keep the panel awake while the menu is up.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
+        // Never take input focus. A Presentation window is focusable by
+        // default, so the first tap on the bottom panel moved window focus --
+        // and with it ALL gamepad/button input -- off the game until the top
+        // screen was tapped again. Non-focusable windows still receive touch,
+        // which is the only input this menu uses (forwarded to native below),
+        // so the game keeps focus permanently.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+
         surfaceView = new SurfaceView(getContext());
         setContentView(surfaceView);
 
