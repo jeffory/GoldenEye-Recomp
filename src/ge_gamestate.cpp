@@ -502,6 +502,13 @@ void dispatch(uint8_t* base, const char* line) {
     uint32_t ga = num(a); int w = (num(b) == 32) ? 4 : 2;
     if (plausible_guest_ptr(ga)) emit(out, "read @%#010x w%d = 0x%x", ga, w, rd(base, ga, w));
     else emit(out, "read @%#010x rejected (implausible)", ga);
+  } else if (nf >= 4 && std::strcmp(verb, "write") == 0) {
+    // TEMP discovery aid: poke a guest field live to test what triggers a weapon
+    // switch. write <ga> <16|32> <val>. Big-endian store, same as the game.
+    uint32_t ga = num(a); int w = (num(b) == 32) ? 4 : 2; uint32_t v = num(c);
+    if (!plausible_guest_ptr(ga)) { emit(out, "write @%#010x rejected (implausible)", ga); }
+    else { if (w == 4) ST32(base, ga, v); else ST16(base, ga, (uint16_t)v);
+           emit(out, "write @%#010x w%d = 0x%x", ga, w, v); }
   } else if (nf >= 2 && std::strcmp(verb, "dump") == 0) {
     dump(base, num(a), nf >= 3 ? num(b) : 64u, out);
   } else if (nf >= 3 && std::strcmp(verb, "snapshot") == 0) {
@@ -516,7 +523,7 @@ void dispatch(uint8_t* base, const char* line) {
     emit(out, "snap: valid=%d equipped_id=%d held_count=%d ammo[eq]=%d frame=%u",
          ss.valid, ss.equipped_id, ss.held_count, ammo, ss.frame);
   } else {
-    emit(out, "?? '%s' (find <16|32> v [lo hi] | snapshot lo hi [16|32] | next v | changed|same|dec|inc | ptr32 ga [lo hi] | list [n] | read ga <16|32> | dump ga [len] | regions | snap | reset)", line);
+    emit(out, "?? '%s' (find <16|32> v [lo hi] | snapshot lo hi [16|32] | next v | changed|same|dec|inc | ptr32 ga [lo hi] | list [n] | read ga <16|32> | write ga <16|32> v | dump ga [len] | regions | snap | reset)", line);
   }
   if (out) std::fclose(out);
 }
