@@ -290,6 +290,32 @@ void ge_watchdog_thread() {
     }
     last_cp_seq = cp_seq;
 
+    // Audio-emitter pool occupancy (GEEFFPOOL). The 200x32B X3DAudio emitter
+    // pool at 0x83064E00 (allocator sub_82144058: slot word0 == 0 means free)
+    // is the suspected "sound drops after minutes of play" culprit: once it
+    // pins at 200/200, every new positional sound silently fails to spawn --
+    // and the spawner's unchecked NULL write is what fires GEWWFAILSAFE.
+    // Sample used slots each tick: WARN on the full transition, note the
+    // recovery, and heartbeat 1/5s so a session log shows occupancy vs time.
+    {
+      static uint32_t pool_prev_used = 0;
+      static int pool_log_div = 0;
+      uint32_t pool_used = 0;
+      for (uint32_t s = 0; s < 200u; ++s) {
+        if (LD32(base, 0x83064E00u + s * 32u) != 0u) ++pool_used;
+      }
+      if (pool_used == 200u && pool_prev_used < 200u) {
+        REXKRNL_WARN("GEEFFPOOL FULL 200/200 - new positional sounds drop until slots free");
+      } else if (pool_prev_used == 200u && pool_used < 200u) {
+        REXKRNL_INFO("GEEFFPOOL recovered {}/200", pool_used);
+      }
+      pool_prev_used = pool_used;
+      if (++pool_log_div >= 20) {  // ~5s at the 250ms tick
+        pool_log_div = 0;
+        REXKRNL_INFO("GEEFFPOOL used={}/200", pool_used);
+      }
+    }
+
     uint32_t present = g_present_cpcnt.load(std::memory_order_relaxed);
     uint32_t dbg = g_dbgnow_calls.load(std::memory_order_relaxed);
     uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
