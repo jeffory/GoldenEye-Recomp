@@ -44,11 +44,15 @@ const char* WeaponMenuDialog::WeaponLabel(int id) {
   // as more ids are confirmed.
   switch (id) {
     case 1:  return "Unarmed";
+    case 4:  return "PP7 (Unsilenced)";
     case 5:  return "PP7";
+    case 6:  return "DD44";
     case 7:  return "Klobb";
     case 8:  return "KF7 Soviet";
     case 17: return "Sniper Rifle";
     case 24: return "Grenade Launcher";
+    case 26: return "Hand Grenade";
+    case 27: return "Timed Mine";
     case 29: return "Remote Mine";
     case 30: return "Detonator";
     default: break;
