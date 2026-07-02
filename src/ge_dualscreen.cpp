@@ -12,24 +12,20 @@
 #include <utility>
 
 // Config toggle for the second-screen weapon menu. Lives in the pause menu's
-// VIDEO tab (see ge_menu.cpp), persisted to ge.toml.
+// VIDEO tab (see ge_menu.cpp), persisted to ge.toml. Default ON: on hardware
+// with a secondary display (the AYN Thor's bottom panel) the menu appears out
+// of the box; single-screen devices never activate it (the platform binding
+// hands over no surface), so the default is free there.
 //
-// Default OFF (2026-07-02): the secondary surface shares the primary's Vulkan
-// device/queue, but rexglue's Presenter is effectively a per-device singleton
-// (one swapchain + one submission timeline). A second Presenter on the same
-// device makes the FIRST secondary paint spin forever on a UI-submission fence
-// that never signals -- on the Ayn Thor this wedged the native UI/input loop
-// (ANR -> system_server watchdog reboot). Verified via enter/exit tracing:
-// SecondaryUiSurface::Paint() #0 never returns; the UI thread is state=R with
-// ~40s kernel time busy-polling vkGetFenceStatus, not blocked on a syscall.
-// Until the shared-device two-presenter path is fixed in the SDK (drive the
-// secondary present off a fully independent submission timeline, or off the UI
-// thread with its own queue), keep this OFF so a connected second screen does
-// not hang the game. When off, UiThreadTick destroys the surface and does no
-// per-frame secondary work; single-screen devices are unaffected either way.
-REXCVAR_DEFINE_BOOL(ge_ds_weapon_menu, false, "Video",
-                    "Show the weapon-selection menu on a connected second screen "
-                    "(EXPERIMENTAL: hangs the render loop on current hardware)");
+// History: this was briefly forced OFF (2026-07-02) after the first on-Thor
+// bring-up hung the UI thread on the secondary's first paint. Root cause was an
+// SDK bug -- SecondaryUiSurface::Create never called immediate_drawer_->
+// SetPresenter, so VulkanImmediateDrawer::End() dereferenced a null presenter
+// into the guest zero page and spun forever (fixed in the rexglue secondary-
+// surface code, not here). The shared Vulkan device is fine. With the SDK fix
+// both screens run together (game ~59fps on top, menu on the bottom panel).
+REXCVAR_DEFINE_BOOL(ge_ds_weapon_menu, true, "Video",
+                    "Show the weapon-selection menu on a connected second screen");
 
 namespace ge {
 
