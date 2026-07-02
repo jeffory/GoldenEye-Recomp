@@ -1,4 +1,63 @@
-# HANDOFF: Thor gameplay lockup — infinite write-watch fault loop (OPEN)
+# HANDOFF: Thor gameplay lockup — ROOT CAUSE CONFIRMED (failsafe absorbs it)
+
+**Status 2026-07-02 (final): root cause captured live and symbolized.** During a 14-min Thor
+session the failsafe fired at 15:23:37 (`out/session-2026-07-02-c/ge.log` line 4173) and the
+ring recorded the entire loop: **64 back-to-back writes (~2µs apart) to host
+0x100000010 = guest virtual 0x10 — the protected zero page.** PC symbolizes to
+`__imp__sub_821448F8` (ge_recomp.5.cpp:62918), the effect-spawn "flag byte @+16, xyz floats
+@+20/24/28" write — through a **NULL object pointer** (0x10 = NULL+16). Chain: heavy combat
+exhausts the 200×32B effect pool (`sub_82144058`, pool at guest 0x82064E00) → allocator
+returns 0 → `sub_82123DB8`→`sub_821448F8` writes NULL+16 unchecked → `protect_zero` keeps
+guest page 0 NoAccess → `Memory::AccessViolationCallback` declines (v00000000 heap is not
+kGuestPhysical) → **unhandled SIGSEGV silently retries the instruction** (ExceptionHandler
+falls through) → infinite loop. That's the "lockup while shooting an enemy". All prior
+write-watch hypotheses (veto/re-arm/stale shadow) were bystanders — though the stale-shadow
+infinite loop found+fixed en route (test scenario 5) was real and could have caused lockup #2.
+
+After the failsafe unprotected page 0 the game ran clean for 6+ more minutes (user-confirmed
+"crashes seem fixed"). Residual cost: one 64-fault burst (~130µs) per first exhaustion, then
+zero — page 0 stays RW for the session.
+
+**Remaining follow-ups (all optional polish):**
+1. Ring-dump race: the watchdog dumps up to 250ms after the failsafe; healthy traffic
+   (~430 rec/s) can wrap the 128-slot ring. Fix: freeze/snapshot the ring in the failsafe
+   itself, or dump from the raw stderr trigger. (Today's capture survived only because the
+   loop records were dense.)
+2. Real fix candidates for the NULL write (beyond the failsafe): investigate WHY the pool
+   exhausts (leak? effects stop spawning once full = visual bug even without the crash);
+   or a midasm guard on sub_82123DB8 skipping the attach when the allocator returns 0;
+   or `protect_zero=false` on Android (matches post-failsafe state without the burst).
+3. Unhandled-fault silent retry in ExceptionHandlerCallback is a footgun — consider a loud
+   log + abort after N retries at that layer too (the diag `cb_unhandled` counter now at
+   least makes it visible).
+
+**Separate issue confirmed the same session: Dam displayed-fps is GPU-bound, not a lockup.**
+Dam minutes 15:20-15:25: `shown/s` collapses to ~26-29 with `drop/s`≈23 and `paint`≈35-39ms
+while the guest simulates ~50fps (`refresh/s`≈50) — spike-frame `gpu=`≈20ms > 16.6ms vsync
+budget → FIFO present quantizes the display to ~half refresh while the guest keeps producing
+(so guest-side FPS meters read ~51: the "incorrectly measured" feel). Facility: gpu 12-14ms →
+shown/s 60, everything agrees. wwf= on spike frames is 4-7 (≈0.3ms) — faults do NOT cause the
+spikes.
+
+**Render-scale A/B result (2026-07-02 16:08, resolution_scale=2 baked at boot):** Dam at 2x
+(4x pixels): gpu 39.5ms, shown/s 12.4, guest refresh 25/s, paint 80ms; GPU clock boosted to
+its 680MHz max (no thermal clamping observed; temp hit 86°C at 2x). Solving F+P=20 /
+F+4P=39.5: **P≈6.5ms pixel-rate work, F≈13.5ms resolution-independent GPU work at 1x — Dam is
+~2/3 fixed-cost (geometry/binning/per-draw), only ~1/3 fill.** 1x is already the resolution
+floor (resolution_scale is an integer upscale, min 1), so resolution can't buy Dam back.
+Realistic directions: (a) frame-pacing quality — a 30fps cap or mailbox present turns the
+26-29+23drops/s oscillation into steady pacing; (b) attack the 13.5ms fixed GPU cost in the
+SDK Vulkan backend (draw batching / geometry path) — large effort; (c) nothing — Facility-class
+levels already run 60. protect from regressions with GESHOWN wwf/paint columns.
+
+**New bug found during the experiment:** the overlay VIDEO-tab Render Scale quick-restart
+latches the 80ms skip-bit fallback on the Thor — GEWATCHDOG STALL "SKIP-BIT LATCHED / frames
+NOT presenting" at 15:48:19, render permanently skipped until app restart. The June cold-boot
+fix (CP worker priority) does not cover the quick-restart re-init window. Workaround: bake
+cvars at boot. Fix idea: re-apply the boot-time skip-bit clear / rendered# gating on the
+quick-restart path too.
+
+--- Previous session status (mechanism reference) ---
 
 **Status 2026-07-02 (evening session): instrumented + failsafed + one loop class root-fixed;
 awaiting a long device session for the verdict.** What landed (SDK uncommitted work tree +
