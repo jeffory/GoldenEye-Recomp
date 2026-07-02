@@ -7,16 +7,20 @@
 #pragma once
 
 #include <rex/cvar.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/perf/counter.h>
 #include <rex/rex_app.h>
+#include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include <functional>
 #include <string>
 
+#include "ge_dualscreen.h"
 #include "ge_fps.h"
 #include "ge_menu.h"
 #include "ge_postfx.h"
@@ -114,6 +118,19 @@ class GeApp : public rex::ReXApp {
                           [] { ge::FpsReset(); });
     // Username/server are set in the ONLINE pause-menu tab now -- no first-boot
     // prompt. They apply on the Save & Restart the ONLINE tab triggers.
+
+    // Wire up the dual-screen weapon menu. This only arms the controller; it
+    // stays completely inactive until a platform binding reports a secondary
+    // display (single-screen fallback). The provider getter is invoked later, on
+    // the UI thread, once the guest is presenting -- runtime()/graphics_system()
+    // are live by then.
+    ge::DualScreen::Get().Init(app_context(), [this]() -> rex::ui::GraphicsProvider* {
+      auto* rt = runtime();
+      if (!rt) return nullptr;
+      auto* igs = rt->graphics_system();
+      if (!igs) return nullptr;
+      return static_cast<rex::graphics::GraphicsSystem*>(igs)->provider();
+    });
   }
 
   // Tear down the menu, overlay and keybind before the drawer is destroyed.
@@ -121,6 +138,9 @@ class GeApp : public rex::ReXApp {
     rex::ui::UnregisterBind("bind_pause_menu");
     rex::ui::UnregisterBind("bind_fps_reset");
     fps_overlay_.reset();
+    // Tear the secondary surface down on the UI thread before the drawer/graphics
+    // go away.
+    ge::DualScreen::Get().Shutdown();
     if (menu_) {
       // Direct delete (not Close()) so we don't re-enter pause bookkeeping
       // during shutdown; removes itself from the drawer in its destructor.

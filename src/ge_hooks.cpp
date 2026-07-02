@@ -17,6 +17,8 @@
 
 #include "ge_init.h"   // PPCRegister/PPCContext + generated function decls
 #include "ge_fps.h"    // ge::FpsOnFrame (guest-FPS benchmark recorder)
+#include "ge_gamestate.h"  // ge::gamestate::OnFrame (game-state bridge pump)
+#include "ge_dualscreen.h"  // ge::DualScreen (second-screen weapon menu pacing)
 #include <rex/cvar.h>  // REXCVAR_DEFINE_BOOL / REXCVAR_GET (ge_freeze_diag)
 #include <rex/perf/counter.h>  // rex::perf frame-stage counters (GESPIKE)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
@@ -811,7 +813,7 @@ void ge_dbg_now(PPCRegister& r9, PPCRegister& r30) {
 // counter has moved past this -- i.e. the just-submitted frame was really
 // drawn -- so the game blocks for the real render (visible) but no longer.
 void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
-  PPCContext* ctx; uint8_t* base; getcb(ctx, base); (void)ctx; (void)base;
+  PPCContext* ctx; uint8_t* base; getcb(ctx, base);
   (void)r30;
   uint32_t a1 = r31.u32;
   auto* cpp = ge_cp();
@@ -827,6 +829,19 @@ void ge_diag_vdswap(PPCRegister& r31, PPCRegister& r30) {
   static uint32_t n = 0;
   if ((n++ & 0x3F) == 0)
     REXKRNL_INFO("GEGPU present#{} dev={:#x} cpcnt={}", n, a1, cpc);
+
+  // Pump the game-state bridge once per present (== once per displayed frame):
+  // snapshot carried weapons / ammo / equipped id for the second-screen weapon
+  // menu, and apply any pending equip request. Inert until the guest inventory
+  // layout is confirmed on-device (see ge_gamestate.cpp); safe to call here.
+  ge::gamestate::OnFrame(ctx, base);
+
+  // Pace the second-screen weapon menu: request one UI-thread paint of the
+  // secondary surface for this frame. Runs on the game thread, so it only posts
+  // a deferred UI-thread tick (the secondary surface must be touched only there)
+  // -- and it is a cheap no-op when there is no second screen / the feature is
+  // off, which is the single-screen fallback. See ge_dualscreen.cpp.
+  ge::DualScreen::Get().OnGuestPresent();
 }
 
 // F3  0x830E0670 (site 0x8209F5F0 sub_8209F5D8 -> ge_cont_8209F5F4)

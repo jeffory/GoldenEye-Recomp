@@ -546,6 +546,18 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       ImGui::Separator();
       ImGui::Spacing();
 
+      // --- Second screen (dual-screen weapon menu; see ge_dualscreen) ---
+      // Only meaningful on a device with a secondary display (e.g. AYN Thor);
+      // on single-screen devices the feature stays inactive regardless.
+      ImGui::TextColored(ImColor(kTitle), "SECOND SCREEN");
+      bool ds_on = GetCvarB("ge_ds_weapon_menu");
+      if (ImGui::Checkbox("Weapon menu on second screen", &ds_on)) {
+        SetCvarB("ge_ds_weapon_menu", ds_on);
+        if (callbacks_.persist_config) callbacks_.persist_config();
+      }
+      ImGui::Separator();
+      ImGui::Spacing();
+
       // --- Post-FX (live full-screen filter; see ge_postfx) ---
       ImGui::TextColored(ImColor(kTitle), "POST-FX");
       bool pfx_on = GetCvarB("postfx_enabled");
