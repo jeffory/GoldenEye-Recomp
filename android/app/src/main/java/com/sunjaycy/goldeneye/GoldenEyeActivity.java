@@ -57,6 +57,15 @@ import java.io.FileReader;
  * game surface, shown during boot/retries and removed once frames appear.
  */
 public class GoldenEyeActivity extends NativeActivity {
+    // NativeActivity dlopens libge.so through its own native loader, which does
+    // NOT register the library with ART -- so the nativeProvide/Release/Touch
+    // methods below would throw UnsatisfiedLinkError on first call (on EVERY
+    // device: teardownSecondaryDisplay() runs even single-screen). Loading it
+    // here too is refcounted/idempotent and makes ART resolve them.
+    static {
+        System.loadLibrary("ge");
+    }
+
     private static final String TAG = "GEBOOT";
     // A healthy boot creates its swapchain ~2s after launch and reaches a live
     // render (rendered#65) within ~5s; this window leaves a wide margin (incl. a
@@ -424,12 +433,21 @@ public class GoldenEyeActivity extends NativeActivity {
 
     // Called by WeaponMenuPresentation on the main thread.
     void provideSecondarySurface(Surface surface, int width, int height) {
+        secondarySurfaceProvided = true;
         nativeProvideSecondaryDisplaySurface(surface, width, height);
     }
 
     void releaseSecondarySurface() {
+        // Skip the JNI call when nothing was ever handed to native (every
+        // onPause on a single-screen device goes through here).
+        if (!secondarySurfaceProvided) {
+            return;
+        }
+        secondarySurfaceProvided = false;
         nativeReleaseSecondaryDisplaySurface();
     }
+
+    private boolean secondarySurfaceProvided;
 
     void forwardSecondaryTouch(int pointerId, int action, float x, float y) {
         nativeSecondaryTouch(pointerId, action, x, y);
