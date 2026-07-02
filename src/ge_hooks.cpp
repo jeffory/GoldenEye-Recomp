@@ -251,11 +251,54 @@ void ge_watchdog_thread() {
       g_cp_starved_episodes.fetch_add(1, std::memory_order_relaxed);
     }
     last_cp_seq = cp_seq;
+
     uint32_t present = g_present_cpcnt.load(std::memory_order_relaxed);
     uint32_t dbg = g_dbgnow_calls.load(std::memory_order_relaxed);
     uint32_t dev = g_ge_device.load(std::memory_order_relaxed);
     uint32_t idblk = g_ge_idblk.load(std::memory_order_relaxed);
     uint32_t submit = dev ? LD32(base, dev + 16544) : 0;
+
+    // TOTAL-FREEZE trigger. The original stall trigger below requires presents
+    // to stay ALIVE while the ring freezes -- a real 23-minute-session lockup
+    // (guest wedged in a SIGSEGV/maps-parse storm) stopped present# too and
+    // the watchdog stayed silent by design. Catch the everything-stopped case:
+    // the guest was clearly booted (dev known, submit>0) but neither submit
+    // nor present# moved for ~3s. Log once per episode with the state that
+    // identified the last one, plus the on-attach recipe.
+    {
+      static uint32_t tf_last_submit = 0, tf_last_present = 0, tf_ticks = 0;
+      static bool tf_logged = false;
+      if (dev && submit != 0 && submit == tf_last_submit && present == tf_last_present) {
+        if (++tf_ticks >= 12 && !tf_logged) {  // 12 x 250ms = ~3s of nothing
+          tf_logged = true;
+          uint32_t presented = LD32(base, dev + 16552);
+          uint32_t rg = LD32(base, 0x8242043Cu);
+          REXKRNL_INFO(
+              "GEWATCHDOG TOTAL-FREEZE: no submit/present progress ~3s | submit={} presented={} "
+              "present#={} | ring rpi={:#x} wpi={:#x} [{}] | cp_seq={} dbgnow_polls={} | "
+              "render-gate={} | skipbit-fires={} wrm-timeouts={} starved={}",
+              submit, presented, present, rpi, wpi, (rpi == wpi ? "DRAINED" : "PENDING"), cp_seq,
+              dbg, rg, g_skipbit_fallback_fires.load(std::memory_order_relaxed),
+              rex_ge_cp_wait_reg_mem_timeouts(),
+              g_cp_starved_episodes.load(std::memory_order_relaxed));
+          REXKRNL_INFO(
+              "GEWATCHDOG TOTAL-FREEZE: last-frame stages cpexec={}us cpidle={}us wrm={}us "
+              "present={}us gwait={}us gpu={}us | if a guest thread is burning CPU, attach with: "
+              "run-as com.sunjaycy.goldeneye simpleperf record -g -p <pid>",
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCpExecuteUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCpIdleUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCpWaitRegMemUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kPresentBlockUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGuestGpuWaitUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGpuFrameUs));
+        }
+      } else {
+        tf_ticks = 0;
+        tf_logged = false;
+      }
+      tf_last_submit = submit;
+      tf_last_present = present;
+    }
 
     bool present_alive = (present != last_present);
     bool ring_moved = (wpi != last_wpi) || (rpi != last_rpi);
