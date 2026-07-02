@@ -1530,7 +1530,10 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
   if (ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(ly));
 
   // TEMP (Task 1 verification, removed in Task 2): press N to request the next
-  // carried weapon; the driver above cycles Y to reach it.
+  // carried weapon; the driver above cycles Y to reach it. Disabled for the
+  // prerelease (the real scrollwheel/number input driver lands in Task 2); the
+  // second-screen weapon menu already drives switching via RequestEquipWeapon.
+#if 0
   {
     static bool prev_n = false;
     const bool n = g_listener.key_down(rex::ui::VirtualKey::kN);
@@ -1545,6 +1548,7 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
     }
     prev_n = n;
   }
+#endif
 }
 
 // ===========================================================================
