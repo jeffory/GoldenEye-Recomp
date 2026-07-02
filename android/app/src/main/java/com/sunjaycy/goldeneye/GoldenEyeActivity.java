@@ -57,15 +57,15 @@ import java.io.FileReader;
  * game surface, shown during boot/retries and removed once frames appear.
  */
 public class GoldenEyeActivity extends NativeActivity {
-    // NativeActivity dlopens libge.so through its own native loader, which does
-    // NOT register the library with ART -- so the nativeProvide/Release/Touch
-    // methods below would throw UnsatisfiedLinkError on first call (on EVERY
-    // device: teardownSecondaryDisplay() runs even single-screen). Loading it
-    // here too is refcounted/idempotent and makes ART resolve them.
-    static {
-        System.loadLibrary("ge");
-    }
-
+    // NOTE on the nativeProvide/Release/Touch methods below: NativeActivity
+    // dlopens libge.so through its own native loader, which does NOT register
+    // the library with ART, so name-based resolution would throw
+    // UnsatisfiedLinkError. System.loadLibrary("ge") here is NOT the fix: it
+    // invokes the bundled SDL3's JNI_OnLoad, which FindClass()es the SDL Java
+    // glue (org.libsdl.app.*) this app doesn't ship and JNI-aborts the process.
+    // Instead native code registers the methods explicitly (RegisterNatives in
+    // ge_android_ds.cpp, called from GeApp::OnConfigurePaths) early in
+    // android_main -- long before renderLive gates the first call from here.
     private static final String TAG = "GEBOOT";
     // A healthy boot creates its swapchain ~2s after launch and reaches a live
     // render (rendered#65) within ~5s; this window leaves a wide margin (incl. a
@@ -189,6 +189,11 @@ public class GoldenEyeActivity extends NativeActivity {
             if (hasStartedPresenting()) {
                 Log.i(TAG, "boot attempt " + attempt + " OK (presenting)");
                 hideOverlay();
+                // The render loop is live, so native init (including the
+                // RegisterNatives for the dual-screen JNI methods) finished long
+                // ago -- it is now safe to bring up the second-screen menu.
+                renderLive = true;
+                runOnUiThread(this::updateSecondaryDisplay);
                 return;
             }
         }
@@ -378,6 +383,13 @@ public class GoldenEyeActivity extends NativeActivity {
 
     /** Bring the weapon menu up if a secondary display exists, else tear it down. */
     private void updateSecondaryDisplay() {
+        // Wait for a live render loop before creating the presentation: it keeps
+        // the boot visuals clean AND guarantees the native side has registered
+        // the JNI methods below (RegisterNatives runs early in android_main,
+        // rendered#65 comes seconds later).
+        if (!renderLive) {
+            return;
+        }
         Display secondary = pickSecondaryDisplay();
         if (secondary == null) {
             teardownSecondaryDisplay();   // single-screen fallback
@@ -431,10 +443,17 @@ public class GoldenEyeActivity extends NativeActivity {
         releaseSecondarySurface();
     }
 
-    // Called by WeaponMenuPresentation on the main thread.
+    // Called by WeaponMenuPresentation on the main thread. The try/catch is a
+    // failsafe: renderLive gating means RegisterNatives has always run by the
+    // time these are reachable, but a dropped registration must degrade to
+    // "no second-screen menu", never crash the game.
     void provideSecondarySurface(Surface surface, int width, int height) {
-        secondarySurfaceProvided = true;
-        nativeProvideSecondaryDisplaySurface(surface, width, height);
+        try {
+            nativeProvideSecondaryDisplaySurface(surface, width, height);
+            secondarySurfaceProvided = true;
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "DS natives not registered; second screen disabled", e);
+        }
     }
 
     void releaseSecondarySurface() {
@@ -444,13 +463,25 @@ public class GoldenEyeActivity extends NativeActivity {
             return;
         }
         secondarySurfaceProvided = false;
-        nativeReleaseSecondaryDisplaySurface();
+        try {
+            nativeReleaseSecondaryDisplaySurface();
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "DS natives not registered on release", e);
+        }
     }
 
     private boolean secondarySurfaceProvided;
+    private volatile boolean renderLive;
 
     void forwardSecondaryTouch(int pointerId, int action, float x, float y) {
-        nativeSecondaryTouch(pointerId, action, x, y);
+        if (!secondarySurfaceProvided) {
+            return;
+        }
+        try {
+            nativeSecondaryTouch(pointerId, action, x, y);
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "DS natives not registered on touch", e);
+        }
     }
 
     // Implemented in src/ge_android_ds.cpp (libge.so).

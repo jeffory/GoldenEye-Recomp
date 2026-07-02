@@ -66,6 +66,10 @@ class GeApp : public rex::ReXApp {
     // re-enable it alongside ours (double-input / cursor fight).
     rex::cvar::SetFlagByName("mnk_mode", "false");
 #if defined(__ANDROID__)
+    // Register the dual-screen JNI methods with ART before the Java side can
+    // call them (it additionally gates on a live render loop). See
+    // ge_android_ds.cpp for why System.loadLibrary can't do this.
+    ge::AndroidDsRegisterNatives();
     // No config file / CLI on Android: turn the guest-FPS benchmark recorder on
     // here so the on-screen readout + periodic GEFPS ge.log lines are available
     // for measuring framerate on the handheld. (Desktop leaves these default-off

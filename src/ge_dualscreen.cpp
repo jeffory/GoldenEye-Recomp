@@ -12,12 +12,24 @@
 #include <utility>
 
 // Config toggle for the second-screen weapon menu. Lives in the pause menu's
-// VIDEO tab (see ge_menu.cpp), persisted to ge.toml. Default ON: on hardware
-// with a secondary display the menu should appear out of the box; on single-
-// screen devices the platform binding never activates it, so this default has no
-// cost there (see the fallback note in the header).
-REXCVAR_DEFINE_BOOL(ge_ds_weapon_menu, true, "Video",
-                    "Show the weapon-selection menu on a connected second screen");
+// VIDEO tab (see ge_menu.cpp), persisted to ge.toml.
+//
+// Default OFF (2026-07-02): the secondary surface shares the primary's Vulkan
+// device/queue, but rexglue's Presenter is effectively a per-device singleton
+// (one swapchain + one submission timeline). A second Presenter on the same
+// device makes the FIRST secondary paint spin forever on a UI-submission fence
+// that never signals -- on the Ayn Thor this wedged the native UI/input loop
+// (ANR -> system_server watchdog reboot). Verified via enter/exit tracing:
+// SecondaryUiSurface::Paint() #0 never returns; the UI thread is state=R with
+// ~40s kernel time busy-polling vkGetFenceStatus, not blocked on a syscall.
+// Until the shared-device two-presenter path is fixed in the SDK (drive the
+// secondary present off a fully independent submission timeline, or off the UI
+// thread with its own queue), keep this OFF so a connected second screen does
+// not hang the game. When off, UiThreadTick destroys the surface and does no
+// per-frame secondary work; single-screen devices are unaffected either way.
+REXCVAR_DEFINE_BOOL(ge_ds_weapon_menu, false, "Video",
+                    "Show the weapon-selection menu on a connected second screen "
+                    "(EXPERIMENTAL: hangs the render loop on current hardware)");
 
 namespace ge {
 
@@ -57,8 +69,10 @@ void DualScreen::OnGuestPresent() {
   if (!ctx) {
     return;  // not initialised yet
   }
-  // Request at most one outstanding UI-thread tick. The tick clears the flag, so
-  // we never pile up more than one pending paint regardless of frame rate.
+  // Request at most one outstanding UI-thread tick. The tick clears the flag
+  // when it FINISHES (see UiThreadTick), so presents that land while a tick is
+  // painting are coalesced instead of chaining another tick into the same
+  // deferred-queue drain pass (which would starve the UI loop).
   if (tick_queued_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
@@ -140,7 +154,21 @@ void DualScreen::DestroySurfaceLocked() {
 }
 
 void DualScreen::UiThreadTick() {
-  tick_queued_.store(false, std::memory_order_release);
+  // Clear the one-outstanding-tick flag at the END of the tick, not the start.
+  // The SDK drains its deferred-function queue in a `while (!empty())` loop, so
+  // with the flag cleared up-front, a guest present landing DURING the paint
+  // below (secondary present can block up to a vsync; presents arrive every
+  // ~18ms) re-posts the next tick into the same drain pass -- the drain never
+  // empties, and the android_main/UI loop never gets back to ALooper input
+  // polling or the primary-window paint. On the Ayn Thor that starved input
+  // (ANR), froze the top screen (GESHOWN shown/s=0), and escalated to a
+  // system_server watchdog restart. Clearing at the end means a present during
+  // the paint is simply coalesced into the next tick instead of chained into
+  // this drain (worst case the menu lags one frame).
+  struct TickFlagClearer {
+    std::atomic<bool>& flag;
+    ~TickFlagClearer() { flag.store(false, std::memory_order_release); }
+  } tick_flag_clearer{tick_queued_};
   if (shutdown_.load(std::memory_order_acquire)) {
     return;
   }

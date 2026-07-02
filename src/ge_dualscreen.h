@@ -50,6 +50,16 @@ namespace ge {
 
 class WeaponMenuDialog;
 
+#if defined(__ANDROID__)
+// Explicitly registers the GoldenEyeActivity dual-screen `native` methods with
+// ART (implemented in ge_android_ds.cpp). Must run before Java's first call --
+// GeApp::OnConfigurePaths calls it early in android_main, and the Java side
+// additionally gates on a live render loop. System.loadLibrary is not usable
+// for this: it would run the bundled SDL3 JNI_OnLoad, which aborts without the
+// org.libsdl.app.* Java glue.
+void AndroidDsRegisterNatives();
+#endif
+
 class DualScreen {
  public:
   static DualScreen& Get();
