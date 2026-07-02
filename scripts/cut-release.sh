@@ -104,8 +104,10 @@ cp "$SIGNED_APK" "$APK_OUT"
 # --- build: Linux amd64 release bundle -------------------------------------
 step "Building Linux amd64 (ge, relwithdebinfo — keeps symbols for crash diagnosis)"
 cmake --build --preset linux-amd64-relwithdebinfo --target ge
-GE_BIN="$(find out/build/linux-amd64-relwithdebinfo -name ge -type f | head -1)"
-[ -n "$GE_BIN" ] && [ -f "$GE_BIN" ] || die "ge binary not found under out/build/linux-amd64-relwithdebinfo"
+# The CMake target is `ge` but its OUTPUT_NAME is `GoldenEye`, so the built file
+# is `GoldenEye` (older builds emitted `ge`). Accept either.
+GE_BIN="$(find out/build/linux-amd64-relwithdebinfo -maxdepth 1 -type f \( -name GoldenEye -o -name ge \) | head -1)"
+[ -n "$GE_BIN" ] && [ -f "$GE_BIN" ] || die "GoldenEye/ge binary not found under out/build/linux-amd64-relwithdebinfo"
 
 step "Assembling Linux bundle (ge + resolved .so deps)"
 BUNDLE="$DIST/bundle"
