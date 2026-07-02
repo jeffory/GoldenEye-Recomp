@@ -133,6 +133,14 @@ inline constexpr uint32_t kEquipIdAddr2  = 0x447f10c8u;  // 32-bit equipped id (
 inline constexpr uint32_t kClipAddr      = 0x447f10f4u;  // 32-bit current-weapon clip
 inline constexpr uint32_t kWeaponDefAddr = 0x447f10c0u;  // 32-bit per-weapon def ptr (in-game gate)
 
+// Carried-weapons doubly-linked list. A fixed field in the player entity points
+// at the head node; each 20-byte node is {flag, weapon id, 0xcccccccc, next,
+// prev}. Walking `next` enumerates every carried weapon (the list is circular).
+// Confirmed by a pickup diff (picking up a weapon adds a node with its id).
+inline constexpr uint32_t kWeaponListHeadPtr = 0x447f1a2cu;  // -> head node
+inline constexpr uint32_t kNodeIdOff         = 0x04u;        // node: 32-bit weapon id
+inline constexpr uint32_t kNodeNextOff       = 0x0cu;        // node: 32-bit next ptr
+
 // Equip write target: the per-frame field the game reads to switch weapon (same
 // one a weapon-cycle input sets). 0 => write path disabled (requests dropped).
 inline constexpr uint32_t kEquipRequestOff = 0u;  // 32-bit "switch to this weapon" field
@@ -227,7 +235,7 @@ void run_probe(uint8_t* base, uint32_t frame) {
 namespace memscan {
 
 inline constexpr uint64_t kGuestSpan = 0x100000000ull;  // 4 GB 32-bit guest space at membase
-inline constexpr size_t   kMaxCands = 8000000u;         // cap: ~64 MB of {ga,last} pairs
+inline constexpr size_t   kMaxCands = 16000000u;        // cap: ~128 MB of {ga,last} pairs
 
 struct Cand { uint32_t ga; uint32_t last; };
 std::vector<Cand> g_cands;
@@ -343,6 +351,34 @@ void seed(uint8_t* base, int w, uint32_t val, uint32_t lo, uint32_t hi, FILE* ou
        (unsigned long long)bad, ok ? "" : " [CAPPED - narrow range or use a rarer value]");
 }
 
+// Seed the candidate set with EVERY aligned address in [lo,hi) and its current
+// value (an "unknown initial value" scan). Follow with changed/unchanged/dec/inc
+// across a game action (e.g. picking up a weapon) to isolate what moved. Bounded
+// region keeps the set under kMaxCands.
+void snapshot(uint8_t* base, uint32_t lo, uint32_t hi, int w, FILE* out) {
+  g_cands.clear();
+  g_width = w;
+  const uint32_t step = (uint32_t)w;
+  if (lo % step) lo += step - (lo % step);
+  static std::vector<uint8_t> buf;
+  const size_t kChunk = 1u << 20;
+  if (buf.size() < kChunk + 4) buf.resize(kChunk + 4);
+  bool capped = false; uint64_t bad = 0;
+  for (uint32_t ga = lo; (uint64_t)ga + step <= hi && !capped; ) {
+    size_t want = kChunk;
+    if ((uint64_t)ga + want > hi) want = (size_t)(hi - ga);
+    ssize_t got = pread(memfd(), buf.data(), want, (off_t)((uintptr_t)base + ga));
+    if (got <= 0) { bad += want / 1024u; ga += (uint32_t)want; continue; }
+    for (ssize_t i = 0; (size_t)i + step <= (size_t)got; i += step) {
+      if (g_cands.size() >= kMaxCands) { capped = true; break; }
+      g_cands.push_back({(uint32_t)(ga + i), rd_buf(buf.data() + i, w)});
+    }
+    ga += (uint32_t)got;
+  }
+  emit(out, "snapshot w%d %#x..%#x: %zu addrs, %llu KB unreadable%s", w, lo, hi,
+       g_cands.size(), (unsigned long long)bad, capped ? " [CAPPED - shrink region]" : "");
+}
+
 // Print the committed guest regions (the memory map) so we know which heaps exist.
 void regions(uint8_t* base, FILE* out) {
   size_t n = 0; uint64_t total = 0;
@@ -437,6 +473,9 @@ void dispatch(uint8_t* base, const char* line) {
     else emit(out, "read @%#010x rejected (implausible)", ga);
   } else if (nf >= 2 && std::strcmp(verb, "dump") == 0) {
     dump(base, num(a), nf >= 3 ? num(b) : 64u, out);
+  } else if (nf >= 3 && std::strcmp(verb, "snapshot") == 0) {
+    int w = (nf >= 4 && num(c) == 16) ? 2 : 4;
+    snapshot(base, num(a), num(b), w, out);
   } else if (nf >= 1 && std::strcmp(verb, "regions") == 0) {
     regions(base, out);
   } else if (nf >= 1 && std::strcmp(verb, "snap") == 0) {
@@ -446,7 +485,7 @@ void dispatch(uint8_t* base, const char* line) {
     emit(out, "snap: valid=%d equipped_id=%d held_count=%d ammo[eq]=%d frame=%u",
          ss.valid, ss.equipped_id, ss.held_count, ammo, ss.frame);
   } else {
-    emit(out, "?? '%s' (find <16|32> v [lo hi] | next v | changed|same|dec|inc | ptr32 ga [lo hi] | list [n] | read ga <16|32> | dump ga [len] | regions | snap | reset)", line);
+    emit(out, "?? '%s' (find <16|32> v [lo hi] | snapshot lo hi [16|32] | next v | changed|same|dec|inc | ptr32 ga [lo hi] | list [n] | read ga <16|32> | dump ga [len] | regions | snap | reset)", line);
   }
   if (out) std::fclose(out);
 }
@@ -499,11 +538,40 @@ WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
                          (defp >= 0x82000000u && defp < 0x84000000u);
     if (in_game) {
       s.equipped_id = id;
-      s.held_count = 1;
-      s.held_ids[0] = static_cast<uint8_t>(id);
-      s.held_mask = (1u << id);
+
+      // Walk the circular carried-weapons list from the head node, collecting
+      // every held weapon id. CRITICAL: only dereference pointers that sit in the
+      // always-readable low heap where the entity and list nodes live. Following a
+      // stray pointer into a GPU write-watch page triggers a fault-storm that
+      // hard-locks the game, so any out-of-range pointer stops the walk (we then
+      // fall back to equipped-only below -- never a lockup).
+      auto list_readable = [](uint32_t ga) { return ga >= 0x00010000u && ga < 0x70000000u; };
+      uint32_t head = LD32(base, kWeaponListHeadPtr);
+      uint32_t node = head;
+      uint32_t mask = 0;
+      for (int guard = 0; guard < kMaxWeaponSlots && list_readable(node); ++guard) {
+        int32_t wid = static_cast<int32_t>(LD32(base, node + kNodeIdOff));
+        if (wid >= 0 && wid < kMaxWeaponSlots && !(mask & (1u << wid))) {
+          mask |= (1u << wid);
+          if (s.held_count < kMaxWeaponSlots) s.held_ids[s.held_count++] = static_cast<uint8_t>(wid);
+        }
+        uint32_t next = LD32(base, node + kNodeNextOff);
+        if (next == head || !list_readable(next)) break;  // list traversed / bad ptr
+        node = next;
+      }
+
+      // Make sure the equipped weapon is present even if the walk came up empty
+      // (e.g. head pointer not yet valid this frame).
+      if (!(mask & (1u << id))) {
+        mask |= (1u << id);
+        if (s.held_count < kMaxWeaponSlots) s.held_ids[s.held_count++] = static_cast<uint8_t>(id);
+      }
+      s.held_mask = mask;
+
+      // Ammo: only the equipped weapon's clip is known so far (the per-weapon
+      // reserve pool is not mapped yet), so other slots stay 0.
       s.ammo[id] = static_cast<uint16_t>(clip);
-      s.valid = true;
+      s.valid = (s.held_count > 0);
     }
     return s;
   }
