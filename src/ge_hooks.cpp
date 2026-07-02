@@ -1017,9 +1017,10 @@ class GameInputListener final : public rex::ui::WindowInputListener,
     }
   }
 
-  // Per-frame consumption by the look hook (reset-on-read).
-  int take_dx() { std::lock_guard<std::mutex> l(m_); int v = dx_; dx_ = 0; return v; }
-  int take_dy() { std::lock_guard<std::mutex> l(m_); int v = dy_; dy_ = 0; return v; }
+  // Per-frame consumption by the look hook (reset-on-read). Float: raw XI2
+  // deltas are sub-pixel, and slow precise aim lives in the fractions.
+  float take_dx() { std::lock_guard<std::mutex> l(m_); float v = dx_; dx_ = 0.f; return v; }
+  float take_dy() { std::lock_guard<std::mutex> l(m_); float v = dy_; dy_ = 0.f; return v; }
 
   bool key_down(rex::ui::VirtualKey vk) const {
     uint16_t idx = static_cast<uint16_t>(vk);
@@ -1033,7 +1034,7 @@ class GameInputListener final : public rex::ui::WindowInputListener,
 
   void set_suppressed(bool v) {
     suppressed_.store(v, std::memory_order_relaxed);
-    if (v) { std::lock_guard<std::mutex> l(m_); dx_ = 0; dy_ = 0; }  // drop queued motion
+    if (v) { std::lock_guard<std::mutex> l(m_); dx_ = 0.f; dy_ = 0.f; }  // drop queued motion
     tick_capture();  // release the cursor immediately when the menu opens
   }
 
@@ -1049,7 +1050,8 @@ class GameInputListener final : public rex::ui::WindowInputListener,
       window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
       window_->CaptureMouse();
       std::lock_guard<std::mutex> l(m_);  // no spike on capture start
-      dx_ = 0; dy_ = 0; have_prev_ = false;
+      dx_ = 0.f; dy_ = 0.f; have_prev_ = false;
+      raw_motion_ = false;  // re-arm the warp fallback until raw deltas flow again
     } else if (!want && captured_) {
       captured_ = false;
       window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
@@ -1068,9 +1070,18 @@ class GameInputListener final : public rex::ui::WindowInputListener,
   // WindowInputListener
   void OnMouseMove(rex::ui::MouseEvent& e) override {
     std::lock_guard<std::mutex> l(m_);
+    if (raw_motion_) return;  // raw XI2 deltas drive look; warped positions are noise
     const int x = e.x(), y = e.y();
-    if (have_prev_) { dx_ += x - prev_x_; dy_ += y - prev_y_; }
+    if (have_prev_) { dx_ += float(x - prev_x_); dy_ += float(y - prev_y_); }
     prev_x_ = x; prev_y_ = y; have_prev_ = true;
+  }
+  // Raw unaccelerated deltas (X11 XI2 while captured). Once these flow, the
+  // position-difference path above is skipped: it double-counts the same
+  // motion and re-adds the OS acceleration curve the raw path exists to avoid.
+  void OnMouseRelativeMotion(rex::ui::MouseRelativeEvent& e) override {
+    std::lock_guard<std::mutex> l(m_);
+    raw_motion_ = true;
+    dx_ += e.dx(); dy_ += e.dy();
   }
   void OnMouseDown(rex::ui::MouseEvent& e) override { set_mouse_button(e.button(), true); }
   void OnMouseUp(rex::ui::MouseEvent& e) override { set_mouse_button(e.button(), false); }
@@ -1082,7 +1093,7 @@ class GameInputListener final : public rex::ui::WindowInputListener,
   void OnLostFocus(rex::ui::UISetupEvent&) override {
     std::lock_guard<std::mutex> l(m_);
     std::memset(key_down_, 0, sizeof(key_down_));
-    dx_ = 0; dy_ = 0; have_prev_ = false;
+    dx_ = 0.f; dy_ = 0.f; have_prev_ = false; raw_motion_ = false;
   }
 
  private:
@@ -1106,12 +1117,13 @@ class GameInputListener final : public rex::ui::WindowInputListener,
     set_key(vk, down);
   }
 
-  mutable std::mutex m_;     // guards dx_/dy_/prev_*/have_prev_/key_down_
+  mutable std::mutex m_;     // guards dx_/dy_/prev_*/have_prev_/raw_motion_/key_down_
   std::mutex cap_m_;         // serializes capture transitions (captured_)
   rex::ui::Window* window_ = nullptr;
-  int dx_ = 0, dy_ = 0;
+  float dx_ = 0.f, dy_ = 0.f;
   int prev_x_ = 0, prev_y_ = 0;
   bool have_prev_ = false;
+  bool raw_motion_ = false;  // XI2 raw deltas flowing -> position diffs are noise
   bool captured_ = false;
   std::atomic<bool> suppressed_{false};  // true while the pause menu is open
   bool key_down_[256] = {};
@@ -1135,8 +1147,8 @@ void ge_ensure_listener() {
   }
 }
 
-int ge_take_mouse_dx() { return g_listener.take_dx(); }
-int ge_take_mouse_dy() { return g_listener.take_dy(); }
+float ge_take_mouse_dx() { return g_listener.take_dx(); }
+float ge_take_mouse_dy() { return g_listener.take_dy(); }
 }  // namespace
 
 namespace ge {
@@ -1199,8 +1211,8 @@ void ge_mouse_camera(uint8_t* base) {
   const bool gun_sway = REXCVAR_GET(ge_gun_sway);
 
   // Consume this frame's raw mouse delta once; used for both menu and camera.
-  const float mdx = static_cast<float>(ge_take_mouse_dx());
-  const float mdy = static_cast<float>(ge_take_mouse_dy());
+  const float mdx = ge_take_mouse_dx();
+  const float mdy = ge_take_mouse_dy();
 
   // Move the menu selection crosshair (the game's own menus read these).
   {
