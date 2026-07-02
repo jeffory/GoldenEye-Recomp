@@ -49,6 +49,9 @@ const char* WeaponMenuDialog::WeaponLabel(int id) {
     case 6:  return "DD44";
     case 7:  return "Klobb";
     case 8:  return "KF7 Soviet";
+    case 10: return "D5K";
+    case 11: return "D5K (Silenced)";
+    case 12: return "Phantom";
     case 17: return "Sniper Rifle";
     case 24: return "Grenade Launcher";
     case 26: return "Hand Grenade";
