@@ -29,6 +29,11 @@ constexpr ImU32 kBtnActive = IM_COL32(96, 86, 62, 255);
 constexpr ImU32 kEquipped = IM_COL32(196, 36, 28, 255);   // red = currently equipped
 constexpr ImU32 kEquippedHover = IM_COL32(220, 60, 50, 255);
 
+// Glyph magnification for the whole panel. The default ImGui font is unreadably
+// small on the handheld's secondary display; ~3x makes it legible at arm's
+// length. Applied via SetWindowFontScale in OnDraw.
+constexpr float kFontScale = 3.0f;
+
 // Provisional weapon names. GoldenEye's carried-weapon slot order is confirmed
 // on-device alongside the bridge offsets (ge_gamestate.cpp); until then this is
 // a best-effort guess and WeaponLabel() falls back to "Slot N" for anything not
@@ -76,6 +81,11 @@ void WeaponMenuDialog::OnDraw(ImGuiIO& io) {
     return;
   }
 
+  // The secondary panel is small and viewed at arm's length on the handheld, so
+  // the default ImGui font renders tiny. Scale every glyph in this window up so
+  // headers, the unavailable message, and weapon labels are legible.
+  ImGui::SetWindowFontScale(kFontScale);
+
   const gamestate::WeaponSnapshot snap = gamestate::GetWeaponSnapshot();
 
   // Header.
@@ -109,7 +119,10 @@ void WeaponMenuDialog::OnDraw(ImGuiIO& io) {
   cols = std::min(cols, 4);
   const float spacing = 10.0f;
   const float btn_w = (avail_w - spacing * (cols - 1)) / static_cast<float>(cols);
-  const float btn_h = std::max(64.0f, screen.y * 0.16f);
+  // Two-line labels at the magnified font need headroom; size the button from the
+  // scaled line height so the name + ammo never clip.
+  const float min_btn_h = ImGui::GetTextLineHeightWithSpacing() * 2.0f + 24.0f;
+  const float btn_h = std::max(min_btn_h, screen.y * 0.16f);
 
   ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(spacing, spacing));
