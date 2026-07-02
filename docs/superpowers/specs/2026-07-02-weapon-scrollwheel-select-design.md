@@ -86,19 +86,25 @@ A per-frame poll on the game thread (alongside / within the existing
   keys auto-repeat, so track the previous-frame down state per input and fire
   only on the down transition — exactly one weapon change per detent / press.
 - **New cvars:** `ge_key_wpn_next` (`"WheelUp"`), `ge_key_wpn_prev`
-  (`"WheelDown"`), and an enable toggle (e.g. `ge_weapon_select_enable`).
-  Digits 1–9 are read directly from the listener.
+  (`"WheelDown"`), and `ge_weapon_select_enable` (**default on**). Digits 1–9 are
+  read directly from the listener.
 - Gated by `ge_input_active()` like the rest of the keyboard input, and a no-op
   when the snapshot is invalid or `held_count == 0`.
 
 ### 3. Desktop overlay — numbered HUD (`ge_weaponmenu.*` or a sibling)
 
-A small ImGui overlay on the **main** window, gated by a cvar (e.g.
-`ge_weapon_overlay`), drawing the carried weapons as a numbered list
-(`1: PP7`, `2: KF7 Soviet`, …) with the equipped weapon highlighted. Reads
-`GetWeaponSnapshot()` and reuses `WeaponLabel()`. `WeaponLabel` is factored so
-the overlay and the existing `WeaponMenuDialog` share one id→name map instead of
-duplicating it. Hidden when the snapshot is invalid or no weapons are carried.
+A small ImGui overlay pinned to the **bottom-left** of the **main** window,
+gated by the cvar `ge_weapon_overlay` (**default off**), drawing the carried
+weapons as a numbered list (`1: PP7`, `2: KF7 Soviet`, …) with the equipped
+weapon highlighted. Reads `GetWeaponSnapshot()` and reuses `WeaponLabel()`.
+`WeaponLabel` is factored so the overlay and the existing `WeaponMenuDialog`
+share one id→name map instead of duplicating it. Hidden when the snapshot is
+invalid or no weapons are carried.
+
+**In-game menu toggle.** The pause menu (`ge_menu.cpp`) is hand-authored — each
+setting is an explicit widget bound to a cvar via the `GetCvarB`/`SetCvarB`
+helpers (no auto-enumeration by category). Add one checkbox there wired to
+`ge_weapon_overlay` so the overlay can be turned on/off in-game.
 
 ## Data flow
 
