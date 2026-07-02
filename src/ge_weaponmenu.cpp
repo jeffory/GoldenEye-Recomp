@@ -34,28 +34,27 @@ constexpr ImU32 kEquippedHover = IM_COL32(220, 60, 50, 255);
 // length. Applied via SetWindowFontScale in OnDraw.
 constexpr float kFontScale = 3.0f;
 
-// Provisional weapon names. GoldenEye's carried-weapon slot order is confirmed
-// on-device alongside the bridge offsets (ge_gamestate.cpp); until then this is
-// a best-effort guess and WeaponLabel() falls back to "Slot N" for anything not
-// listed, so the UI never shows a name it cannot stand behind.
-constexpr const char* kProvisionalNames[] = {
-    "Unarmed",   "Knife",      "Hunting Knife", "Throwing Knife", "PP7",
-    "PP7 (Sil.)", "DD44",      "Klobb",         "KF7 Soviet",     "ZMG (9mm)",
-    "D5K",        "D5K (Sil.)", "Phantom",       "AR33",           "RC-P90",
-    "Shotgun",   "Auto Shotgun", "Sniper Rifle", "Cougar Magnum",  "Golden Gun",
-    "Silver PP7", "Gold PP7",  "Moonraker",     "Grenade Launcher", "Rocket Launcher",
-    "Grenades",  "Timed Mine", "Proximity Mine", "Remote Mine",    "Taser",
-    "Tank",      "Watch Laser",
-};
-
 }  // namespace
 
 const char* WeaponMenuDialog::WeaponLabel(int id) {
-  if (id >= 0 && id < static_cast<int>(std::size(kProvisionalNames))) {
-    return kProvisionalNames[id];
+  // Weapon ids confirmed on-device by reverse-engineering the equipped-weapon
+  // field (ge_gamestate.cpp): switching to each weapon and reading its id. Only
+  // ids we have actually verified are named here; anything else falls back to
+  // "Weapon N" so the UI never shows a name it cannot stand behind. Extend this
+  // as more ids are confirmed.
+  switch (id) {
+    case 1:  return "Unarmed";
+    case 5:  return "PP7";
+    case 7:  return "Klobb";
+    case 8:  return "KF7 Soviet";
+    case 17: return "Sniper Rifle";
+    case 24: return "Grenade Launcher";
+    case 29: return "Remote Mine";
+    case 30: return "Detonator";
+    default: break;
   }
   static char buf[16];
-  std::snprintf(buf, sizeof(buf), "Slot %d", id);
+  std::snprintf(buf, sizeof(buf), "Weapon %d", id);
   return buf;
 }
 
