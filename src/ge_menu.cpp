@@ -564,13 +564,17 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       if (ImGui::Checkbox("Enable Post-FX", &pfx_on)) {
         SetCvarB("postfx_enabled", pfx_on);
         if (callbacks_.persist_config) callbacks_.persist_config();
+        if (callbacks_.overlays_changed) callbacks_.overlays_changed();
       }
 
       ImGui::SetNextWindowSizeConstraints(
           ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 6.0f));
       if (ImGui::BeginCombo("Preset", "Apply preset...")) {
         for (int i = 0; i < ge::PostFxPresetCount(); ++i) {
-          if (ImGui::Selectable(ge::PostFxPresetName(i))) ge::ApplyPostFxPreset(i);
+          if (ImGui::Selectable(ge::PostFxPresetName(i))) {
+            ge::ApplyPostFxPreset(i);  // presets flip postfx_enabled too
+            if (callbacks_.overlays_changed) callbacks_.overlays_changed();
+          }
         }
         ImGui::EndCombo();
       }
@@ -627,8 +631,9 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       }
       ImGui::SameLine();
       if (ImGui::Button("Reset to Default")) {
-        ge::ResetPostFx();
+        ge::ResetPostFx();  // preset 0 = off -> the overlay dialog goes away
         if (callbacks_.persist_config) callbacks_.persist_config();
+        if (callbacks_.overlays_changed) callbacks_.overlays_changed();
       }
 
       ImGui::Spacing();
@@ -642,6 +647,7 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       if (ImGui::Checkbox("FPS Overlay", &fps_overlay)) {
         SetCvarB("ge_fps_overlay", fps_overlay);
         if (callbacks_.persist_config) callbacks_.persist_config();
+        if (callbacks_.overlays_changed) callbacks_.overlays_changed();
       }
       ImGui::SameLine();
       if (ImGui::Button("Reset Benchmark")) ge::FpsReset();
