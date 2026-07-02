@@ -74,7 +74,11 @@ class GeApp : public rex::ReXApp {
     // here so the on-screen readout + periodic GEFPS ge.log lines are available
     // for measuring framerate on the handheld. (Desktop leaves these default-off
     // and toggles them with --ge_fps_overlay / --ge_fps_log.)
-    rex::cvar::SetFlagByName("ge_fps_overlay", "true");
+    // GEFPS logging stays on (it needs no UI drawer), but the on-screen
+    // overlay now defaults OFF: a registered overlay dialog pins every
+    // present to the UI thread (see UpdateOverlayRegistration), which on the
+    // handheld quantizes the shown rate down (GESHOWN "22 shown / 52
+    // produced"). Toggle it per-session from the pause menu VIDEO tab.
     rex::cvar::SetFlagByName("ge_fps_log", "true");
     // Spike attribution lines (GESPIKE) on by default on the handheld -- rate-
     // limited to ~4/s and only emitted when a frame exceeds 2x the median.
@@ -105,8 +109,8 @@ class GeApp : public rex::ReXApp {
     // it is never written here (writing default==default is a no-op anyway).
   }
 
-  // Register the ESC pause-menu keybind and create the always-on Post-FX
-  // filter overlay once the ImGui drawer exists.
+  // Register the ESC pause-menu keybind and (conditionally) the overlay
+  // dialogs once the ImGui drawer exists.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     // Window/taskbar title shown while running. Overrides the SDK default
     // ("ge <build stamp>"); the internal app name stays "ge" so ge.toml and the
@@ -115,8 +119,8 @@ class GeApp : public rex::ReXApp {
     rex::ui::RegisterBind("bind_pause_menu", "Escape", "Pause menu",
                           [this] { TogglePauseMenu(); });
     ge::InitMouseLook();  // attach the cross-platform mouse/keyboard look listener
-    postfx_ = std::make_unique<ge::PostFxOverlay>(drawer);
-    fps_overlay_ = std::make_unique<ge::FpsOverlay>(drawer);  // guest-FPS readout
+    drawer_ = drawer;
+    UpdateOverlayRegistration();  // overlays exist only while their cvar is on
     // F2 starts a fresh benchmark window (clears avg / 1%-low / min / max).
     rex::ui::RegisterBind("bind_fps_reset", "F2", "Reset FPS benchmark",
                           [] { ge::FpsReset(); });
@@ -155,6 +159,23 @@ class GeApp : public rex::ReXApp {
   }
 
  private:
+  // Create/destroy the passive overlays to match their cvars. An ImGuiDialog's
+  // existence is what registers the ImGui drawer with the presenter, and ANY
+  // registered UI drawer forces presents onto the UI thread
+  // (Presenter::GetDesiredPaintModeFromUIThread) -- an always-on but invisible
+  // overlay silently disables the low-latency guest-thread present path. Only
+  // safe to call from the UI loop between frames (use CallInUIThreadDeferred
+  // from menu callbacks -- the menu runs inside the drawer's own draw).
+  void UpdateOverlayRegistration() {
+    if (!drawer_) return;
+    const bool want_postfx = rex::cvar::GetFlagByName("postfx_enabled") == "true";
+    const bool want_fps = rex::cvar::GetFlagByName("ge_fps_overlay") == "true";
+    if (want_postfx && !postfx_) postfx_ = std::make_unique<ge::PostFxOverlay>(drawer_);
+    if (!want_postfx && postfx_) postfx_.reset();
+    if (want_fps && !fps_overlay_) fps_overlay_ = std::make_unique<ge::FpsOverlay>(drawer_);
+    if (!want_fps && fps_overlay_) fps_overlay_.reset();
+  }
+
   // ESC handler: open or close the menu. The game keeps running underneath.
   void TogglePauseMenu() {
     if (menu_) {
@@ -187,6 +208,12 @@ class GeApp : public rex::ReXApp {
       });
     };
     cb.persist_config = [this] { PersistConfig(); };
+    cb.overlays_changed = [this] {
+      // Deferred: the menu invokes this from inside the drawer's draw, and
+      // creating/destroying dialogs mid-draw is the same hazard as the
+      // fullscreen switch above.
+      app_context().CallInUIThreadDeferred([this] { UpdateOverlayRegistration(); });
+    };
     // Perf CSV capture (VIDEO tab checkbox). Opt-in per session -- the writer
     // + its periodic fflush run on the CP worker, so it is never left on by
     // default. Lands next to ge.log in the user data dir; pull with adb and
@@ -215,7 +242,8 @@ class GeApp : public rex::ReXApp {
   }
 
   GeMenuDialog* menu_ = nullptr;  // non-owning; self-deletes via the drawer
-  std::unique_ptr<ge::PostFxOverlay> postfx_;       // always-on filter layer
-  std::unique_ptr<ge::FpsOverlay> fps_overlay_;     // guest-FPS benchmark readout
+  rex::ui::ImGuiDrawer* drawer_ = nullptr;          // set once in OnCreateDialogs
+  std::unique_ptr<ge::PostFxOverlay> postfx_;       // filter layer (alive only while enabled)
+  std::unique_ptr<ge::FpsOverlay> fps_overlay_;     // guest-FPS readout (alive only while enabled)
   static inline bool ge_perf_csv_on_ = false;       // perf-CSV capture running?
 };

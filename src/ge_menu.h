@@ -42,6 +42,13 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
     // the user data dir), set(false) stops and flushes it.
     std::function<bool()> get_perf_csv;
     std::function<void(bool)> set_perf_csv;
+    // Invoked (deferred to the UI loop by the app) after the menu changes
+    // ge_fps_overlay / postfx_enabled / applies a preset, so the app can
+    // create/destroy the overlay dialogs to match. Overlay dialogs are only
+    // kept alive while they draw: a registered (even invisible) UI drawer
+    // pins every present to the UI thread (Presenter paint-mode selection),
+    // killing the low-latency guest-thread present path.
+    std::function<void()> overlays_changed;
   };
 
   GeMenuDialog(rex::ui::ImGuiDrawer* drawer, Callbacks callbacks);

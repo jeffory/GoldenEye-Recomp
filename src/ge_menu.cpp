@@ -564,13 +564,17 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       if (ImGui::Checkbox("Enable Post-FX", &pfx_on)) {
         SetCvarB("postfx_enabled", pfx_on);
         if (callbacks_.persist_config) callbacks_.persist_config();
+        if (callbacks_.overlays_changed) callbacks_.overlays_changed();
       }
 
       ImGui::SetNextWindowSizeConstraints(
           ImVec2(0, 0), ImVec2(FLT_MAX, ImGui::GetFrameHeightWithSpacing() * 6.0f));
       if (ImGui::BeginCombo("Preset", "Apply preset...")) {
         for (int i = 0; i < ge::PostFxPresetCount(); ++i) {
-          if (ImGui::Selectable(ge::PostFxPresetName(i))) ge::ApplyPostFxPreset(i);
+          if (ImGui::Selectable(ge::PostFxPresetName(i))) {
+            ge::ApplyPostFxPreset(i);  // presets flip postfx_enabled too
+            if (callbacks_.overlays_changed) callbacks_.overlays_changed();
+          }
         }
         ImGui::EndCombo();
       }
@@ -627,8 +631,9 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       }
       ImGui::SameLine();
       if (ImGui::Button("Reset to Default")) {
-        ge::ResetPostFx();
+        ge::ResetPostFx();  // preset 0 = off -> the overlay dialog goes away
         if (callbacks_.persist_config) callbacks_.persist_config();
+        if (callbacks_.overlays_changed) callbacks_.overlays_changed();
       }
 
       ImGui::Spacing();
@@ -642,6 +647,7 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
       if (ImGui::Checkbox("FPS Overlay", &fps_overlay)) {
         SetCvarB("ge_fps_overlay", fps_overlay);
         if (callbacks_.persist_config) callbacks_.persist_config();
+        if (callbacks_.overlays_changed) callbacks_.overlays_changed();
       }
       ImGui::SameLine();
       if (ImGui::Button("Reset Benchmark")) ge::FpsReset();
@@ -674,6 +680,17 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
         if (sens < 0.05f) sens = 0.05f;
         if (sens > 20.0f) sens = 20.0f;
         SetCvarF("ge_mouse_sens", sens);
+      }
+      if (ImGui::IsItemDeactivatedAfterEdit() && callbacks_.persist_config)
+        callbacks_.persist_config();
+
+      // Look smoothing -- EMA over per-frame deltas; 0 = raw/off. Live-read by
+      // the look hook each frame; persisted on release like sensitivity.
+      float smooth = GetCvarF("ge_mouse_smooth");
+      if (ImGui::SliderFloat("Mouse Smoothing", &smooth, 0.0f, 0.9f, "%.2f")) {
+        if (smooth < 0.0f) smooth = 0.0f;
+        if (smooth > 0.9f) smooth = 0.9f;
+        SetCvarF("ge_mouse_smooth", smooth);
       }
       if (ImGui::IsItemDeactivatedAfterEdit() && callbacks_.persist_config)
         callbacks_.persist_config();
