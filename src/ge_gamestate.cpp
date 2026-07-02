@@ -45,6 +45,17 @@
 #include <cstdio>
 #include <cstring>
 
+// Fault-safe guest reads for the live per-frame path (Linux + Android). Reading
+// a stray guest pointer via a raw deref can land on a GPU write-watch guard page
+// and trip the recomp's fault handler into a retry storm that HARD-LOCKS the game
+// (see safe_ld32). /proc/self/mem + pread returns an error on such pages instead
+// of faulting, so the inventory walk can follow pointers safely.
+#if defined(__linux__)
+#define GE_SAFE_GUEST_READ 1
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 // Desktop-only discovery memory scanner (see the GEMSCAN block below). Guarded so
 // none of it compiles into the Android/shipping build.
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -93,6 +104,26 @@ inline uint32_t LD32(uint8_t* b, uint32_t ga) {
 inline void ST32(uint8_t* b, uint32_t ga, uint32_t val) {
   uint32_t v = __builtin_bswap32(val); std::memcpy(b + ga, &v, 4);
 }
+
+// Fault-safe big-endian 32-bit guest read for the live path. Reads via
+// /proc/self/mem so a guarded/unmapped page returns an error instead of faulting
+// the process (a raw deref there trips the write-watch handler into an infinite
+// retry that hard-locks the game). Returns false if the address is unreadable;
+// used by the inventory-list walk, which follows pointers that could be stale.
+#ifdef GE_SAFE_GUEST_READ
+inline int bridge_memfd() {
+  static int fd = ::open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+  return fd;
+}
+inline bool safe_ld32(uint8_t* base, uint32_t ga, uint32_t* out) {
+  uint8_t b[4];
+  if (pread(bridge_memfd(), b, 4, (off_t)((uintptr_t)base + ga)) != 4) return false;
+  *out = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+  return true;
+}
+#else
+inline bool safe_ld32(uint8_t* base, uint32_t ga, uint32_t* out) { *out = LD32(base, ga); return true; }
+#endif
 
 // A guest address is plausible if it is non-null and inside the 32-bit guest
 // space. A Xenon title spreads allocations across several heaps (0x40000000,
@@ -526,10 +557,16 @@ WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
   // per-weapon inventory array is mapped. Gated so we only publish valid=true
   // when the block clearly holds a live in-game weapon, not title-screen junk.
   if (kEquipIdAddr != 0u) {
-    int32_t id  = static_cast<int32_t>(LD32(base, kEquipIdAddr));
-    int32_t id2 = static_cast<int32_t>(LD32(base, kEquipIdAddr2));
-    uint32_t clip = LD32(base, kClipAddr);
-    uint32_t defp = LD32(base, kWeaponDefAddr);
+    // EVERY read here is fault-safe (safe_ld32): the recomp's GPU write-watch
+    // guard pages make a raw deref of a stray guest pointer trip an infinite
+    // retry that hard-locks the game. If the entity can't be read, stay inert.
+    uint32_t id_u, id2_u, clip, defp;
+    if (!safe_ld32(base, kEquipIdAddr, &id_u) || !safe_ld32(base, kEquipIdAddr2, &id2_u) ||
+        !safe_ld32(base, kClipAddr, &clip) || !safe_ld32(base, kWeaponDefAddr, &defp)) {
+      return s;
+    }
+    int32_t id  = static_cast<int32_t>(id_u);
+    int32_t id2 = static_cast<int32_t>(id2_u);
 
     // In-game gate: the two equipped-id copies agree, the id is a real slot, the
     // clip is sane, and the per-weapon def pointer points into the guest module.
@@ -540,24 +577,24 @@ WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
       s.equipped_id = id;
 
       // Walk the circular carried-weapons list from the head node, collecting
-      // every held weapon id. CRITICAL: only dereference pointers that sit in the
-      // always-readable low heap where the entity and list nodes live. Following a
-      // stray pointer into a GPU write-watch page triggers a fault-storm that
-      // hard-locks the game, so any out-of-range pointer stops the walk (we then
-      // fall back to equipped-only below -- never a lockup).
-      auto list_readable = [](uint32_t ga) { return ga >= 0x00010000u && ga < 0x70000000u; };
-      uint32_t head = LD32(base, kWeaponListHeadPtr);
-      uint32_t node = head;
-      uint32_t mask = 0;
-      for (int guard = 0; guard < kMaxWeaponSlots && list_readable(node); ++guard) {
-        int32_t wid = static_cast<int32_t>(LD32(base, node + kNodeIdOff));
-        if (wid >= 0 && wid < kMaxWeaponSlots && !(mask & (1u << wid))) {
-          mask |= (1u << wid);
-          if (s.held_count < kMaxWeaponSlots) s.held_ids[s.held_count++] = static_cast<uint8_t>(wid);
+      // every held weapon id. safe_ld32 makes following the pointers fault-proof:
+      // an unreadable/stale node just stops the walk (we fall back to equipped-only
+      // below), so a corrupt list can never lock the game.
+      uint32_t head = 0, node = 0, mask = 0;
+      if (safe_ld32(base, kWeaponListHeadPtr, &head)) {
+        node = head;
+        for (int guard = 0; guard < kMaxWeaponSlots; ++guard) {
+          uint32_t wid_u;
+          if (!safe_ld32(base, node + kNodeIdOff, &wid_u)) break;
+          int32_t wid = static_cast<int32_t>(wid_u);
+          if (wid >= 0 && wid < kMaxWeaponSlots && !(mask & (1u << wid))) {
+            mask |= (1u << wid);
+            if (s.held_count < kMaxWeaponSlots) s.held_ids[s.held_count++] = static_cast<uint8_t>(wid);
+          }
+          uint32_t next;
+          if (!safe_ld32(base, node + kNodeNextOff, &next) || next == head || next < 0x00010000u) break;
+          node = next;
         }
-        uint32_t next = LD32(base, node + kNodeNextOff);
-        if (next == head || !list_readable(next)) break;  // list traversed / bad ptr
-        node = next;
       }
 
       // Make sure the equipped weapon is present even if the walk came up empty
