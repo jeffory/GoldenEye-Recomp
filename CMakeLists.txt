@@ -27,6 +27,7 @@ set(GE_SOURCES
     src/ge_ce_patches.cpp
     src/ge_dualscreen.cpp   # dual-screen weapon-menu controller (all platforms)
     src/ge_weaponmenu.cpp   # second-screen weapon-menu UI (all platforms)
+    src/ge_asset_check.cpp  # startup required-file manifest check
 )
 
 # Android-only JNI binding: turns the secondary-display Surface (created by the

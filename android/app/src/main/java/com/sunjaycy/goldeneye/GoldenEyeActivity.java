@@ -95,6 +95,7 @@ public class GoldenEyeActivity extends NativeActivity {
     private Handler overlayHandler;
     private View overlayView;
     private TextView overlayText;
+    private ProgressBar overlaySpinner;
     private int dotPhase;
 
     // Dual-screen weapon menu (AYN Thor secondary display). The Presentation hosts
@@ -196,8 +197,22 @@ public class GoldenEyeActivity extends NativeActivity {
                 runOnUiThread(this::updateSecondaryDisplay);
                 return;
             }
+            String missing = readMissingFilesError();
+            if (missing != null) {
+                // Native vetoed the guest launch (required game files absent)
+                // and stays alive; this boot is not a wedge to retry -- turn
+                // the spinner into the error screen and stop.
+                Log.w(TAG, "boot attempt " + attempt + " -> missing game files, showing error");
+                showBootError(missing);
+                return;
+            }
         }
         if (stopWatchdog || relaunching) {
+            return;
+        }
+        String missing = readMissingFilesError();
+        if (missing != null) {
+            showBootError(missing);
             return;
         }
         if (attempt + 1 >= MAX_BOOT_ATTEMPTS) {
@@ -206,6 +221,75 @@ public class GoldenEyeActivity extends NativeActivity {
         }
         Log.w(TAG, "boot attempt " + attempt + " STALLED (no frames) -> relaunching");
         relaunchSelf(attempt + 1);
+    }
+
+    /**
+     * If the native asset check refused to launch, ge.log carries GEMISSING
+     * markers (summary line first, then up to 50 file= lines). Returns a
+     * user-facing message built from them, or null when no marker is present.
+     */
+    private String readMissingFilesError() {
+        File log = new File(getExternalFilesDir(null), "ge.log");
+        if (!log.exists()) {
+            return null;
+        }
+        int total = -1;
+        StringBuilder files = new StringBuilder();
+        int listed = 0;
+        try (BufferedReader r = new BufferedReader(new FileReader(log))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                int idx = line.indexOf("GEMISSING total=");
+                if (idx >= 0) {
+                    int j = idx + "GEMISSING total=".length();
+                    int n = 0;
+                    while (j < line.length() && Character.isDigit(line.charAt(j))) {
+                        n = n * 10 + (line.charAt(j) - '0');
+                        j++;
+                    }
+                    total = n;
+                    continue;
+                }
+                idx = line.indexOf("GEMISSING file=");
+                if (idx >= 0 && listed < 8) {
+                    files.append('\n').append(line.substring(idx + "GEMISSING file=".length()).trim());
+                    listed++;
+                }
+            }
+        } catch (Throwable t) {
+            return null;
+        }
+        if (total < 0) {
+            return null;
+        }
+        StringBuilder msg = new StringBuilder();
+        msg.append("Missing ").append(total).append(" required game file")
+           .append(total == 1 ? "" : "s").append(':').append(files);
+        if (total > listed) {
+            msg.append("\n...and ").append(total - listed).append(" more");
+        }
+        msg.append("\n\nCopy the complete GoldenEye 007 game dump into\n")
+           .append("Android/data/").append(getPackageName()).append("/files\n")
+           .append("(full list: files/user/ge_missing_files.txt)");
+        return msg.toString();
+    }
+
+    /** Turn the loading overlay into a persistent error screen (no retry). */
+    private void showBootError(String message) {
+        if (overlayHandler == null) {
+            return;
+        }
+        overlayHandler.post(() -> {
+            if (overlayView == null || overlayText == null) {
+                return;
+            }
+            overlayHandler.removeCallbacks(dotRunnable);  // stop "Loading..." updates
+            if (overlaySpinner != null) {
+                overlaySpinner.setVisibility(View.GONE);
+            }
+            overlayText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            overlayText.setText(message);
+        });
     }
 
     /** True once the native runtime has a LIVE render loop (>= RENDER_THRESHOLD real frames). */
@@ -282,6 +366,7 @@ public class GoldenEyeActivity extends NativeActivity {
             ProgressBar spinner = new ProgressBar(ctx);  // default = indeterminate circle
             LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(dp(56), dp(56));
             col.addView(spinner, sp);
+            overlaySpinner = spinner;
 
             TextView tv = new TextView(ctx);
             tv.setText("Loading GoldenEye");
@@ -320,6 +405,7 @@ public class GoldenEyeActivity extends NativeActivity {
             Log.e(TAG, "overlay show failed", t);
             overlayView = null;
             overlayText = null;
+            overlaySpinner = null;
         }
     }
 
@@ -357,6 +443,7 @@ public class GoldenEyeActivity extends NativeActivity {
                 }
                 overlayView = null;
                 overlayText = null;
+                overlaySpinner = null;
             }
         });
     }

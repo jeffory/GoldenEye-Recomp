@@ -23,6 +23,7 @@
 #include "ge_dualscreen.h"
 #include "ge_fps.h"
 #include "ge_menu.h"
+#include "ge_asset_check.h"
 #include "ge_postfx.h"
 
 // Relaunch the current executable as a fresh process (implemented in
@@ -156,6 +157,15 @@ class GeApp : public rex::ReXApp {
       menu_ = nullptr;
     }
     postfx_.reset();
+  }
+
+  // Called on the UI thread immediately before the main guest thread starts.
+  // Verify the game dump against the generated manifest so a broken install
+  // produces a clear error (instead of the guest faulting on the first file it
+  // actually needs). Returning false vetoes the guest launch.
+  bool OnPreLaunchModule() override {
+    return ge::RunStartupAssetCheck(game_data_root(), user_data_root(),
+                                    app_context());
   }
 
  private:
