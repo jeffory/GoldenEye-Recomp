@@ -251,6 +251,11 @@ public class GoldenEyeActivity extends NativeActivity {
      * If the native asset check refused to launch, ge.log carries GEMISSING
      * markers (summary line first, then up to 50 file= lines). Returns a
      * user-facing message built from them, or null when no marker is present.
+     *
+     * Also recognizes the runtime's "Entrypoint XEX not found" error: with
+     * default.xex absent (e.g. a completely empty install -- every new user's
+     * first run) the runtime aborts BEFORE the manifest check can run, so no
+     * GEMISSING markers exist and only this line names the failure.
      */
     private String readMissingFilesError() {
         File log = new File(getExternalFilesDir(null), "ge.log");
@@ -263,6 +268,11 @@ public class GoldenEyeActivity extends NativeActivity {
         try (BufferedReader r = new BufferedReader(new FileReader(log))) {
             String line;
             while ((line = r.readLine()) != null) {
+                if (line.contains("Entrypoint XEX not found")) {
+                    return "Game files not found (default.xex is missing).\n\n"
+                         + "Copy the complete GoldenEye 007 game dump into\n"
+                         + "Android/data/" + getPackageName() + "/files";
+                }
                 int idx = line.indexOf("GEMISSING total=");
                 if (idx >= 0) {
                     int j = idx + "GEMISSING total=".length();

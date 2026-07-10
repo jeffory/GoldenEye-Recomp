@@ -31,7 +31,7 @@
             android:launchMode="singleTask"
             android:resizeableActivity="false"
             android:screenOrientation="sensorLandscape"
-            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+            android:theme="@style/GeTheme">
 
             <meta-data android:name="android.app.lib_name" android:value="ge" />
 

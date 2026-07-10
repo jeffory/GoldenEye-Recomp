@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Theme.Black.NoTitleBar.Fullscreen minus the system starting window.
+         The starting window (splash) is only removed when the app's main
+         window draws a frame, which never happens when the runtime refuses
+         to boot (e.g. no game files), leaving the splash covering the boot
+         loader's error overlay forever. Our own spinner overlay appears within
+         ~1s of launch anyway, so the system splash buys nothing. -->
+    <style name="GeTheme" parent="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+        <item name="android:windowDisablePreview">true</item>
+    </style>
+</resources>
