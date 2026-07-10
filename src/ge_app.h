@@ -25,6 +25,7 @@
 #include "ge_menu.h"
 #include "ge_asset_check.h"
 #include "ge_postfx.h"
+#include "ge_touchpad.h"
 
 // Relaunch the current executable as a fresh process (implemented in
 // ge_hooks.cpp, which owns the Win32 includes). Used by the ONLINE menu's
@@ -71,6 +72,10 @@ class GeApp : public rex::ReXApp {
     // call them (it additionally gates on a live render loop). See
     // ge_android_ds.cpp for why System.loadLibrary can't do this.
     ge::AndroidDsRegisterNatives();
+    // Register the on-screen touch-controls JNI methods too (same reasoning:
+    // RegisterNatives, not System.loadLibrary). The Java overlay gates its first
+    // call on a live render loop, long after this runs.
+    ge::AndroidTouchRegisterNatives();
     // No config file / CLI on Android: turn the guest-FPS benchmark recorder on
     // here so the on-screen readout + periodic GEFPS ge.log lines are available
     // for measuring framerate on the handheld. (Desktop leaves these default-off

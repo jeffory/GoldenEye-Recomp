@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
+import android.hardware.input.InputManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -16,6 +17,7 @@ import android.util.Log;
 import android.util.TypedValue;
 import android.view.Display;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.Surface;
 import android.view.View;
 import android.view.WindowManager;
@@ -106,6 +108,14 @@ public class GoldenEyeActivity extends NativeActivity {
     private DisplayManager.DisplayListener displayListener;
     private WeaponMenuPresentation weaponPresentation;
 
+    // On-screen touch controls (ordinary phones/tablets with no controller). A
+    // translucent, non-focusable panel window over the game; shown per the
+    // ge_touch_controls policy and controller presence (InputManager).
+    private InputManager inputManager;
+    private InputManager.InputDeviceListener inputDeviceListener;
+    private TouchControlsView touchView;
+    private boolean touchOverlayAdded;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         attempt = getIntent() != null ? getIntent().getIntExtra(ATTEMPT_EXTRA, 0) : 0;
@@ -156,6 +166,19 @@ public class GoldenEyeActivity extends NativeActivity {
             };
             displayManager.registerDisplayListener(displayListener, null);
         }
+
+        // Watch for controllers connecting/disconnecting so the on-screen touch
+        // controls can auto-hide/appear. Callbacks are delivered on this (main)
+        // thread's looper (null handler), where View/WindowManager ops are legal.
+        inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
+        if (inputManager != null) {
+            inputDeviceListener = new InputManager.InputDeviceListener() {
+                @Override public void onInputDeviceAdded(int deviceId) { updateTouchControls(); }
+                @Override public void onInputDeviceRemoved(int deviceId) { updateTouchControls(); }
+                @Override public void onInputDeviceChanged(int deviceId) { updateTouchControls(); }
+            };
+            inputManager.registerInputDeviceListener(inputDeviceListener, null);
+        }
     }
 
     @Override
@@ -195,6 +218,7 @@ public class GoldenEyeActivity extends NativeActivity {
                 // ago -- it is now safe to bring up the second-screen menu.
                 renderLive = true;
                 runOnUiThread(this::updateSecondaryDisplay);
+                runOnUiThread(this::updateTouchControls);
                 return;
             }
             String missing = readMissingFilesError();
@@ -458,6 +482,7 @@ public class GoldenEyeActivity extends NativeActivity {
     protected void onResume() {
         super.onResume();
         updateSecondaryDisplay();
+        updateTouchControls();
     }
 
     @Override
@@ -465,6 +490,7 @@ public class GoldenEyeActivity extends NativeActivity {
         // Drop the secondary surface while backgrounded; native tears its surface
         // down cleanly and re-creates it on the next resume.
         teardownSecondaryDisplay();
+        removeTouchOverlay();
         super.onPause();
     }
 
@@ -576,6 +602,181 @@ public class GoldenEyeActivity extends NativeActivity {
     private native void nativeReleaseSecondaryDisplaySurface();
     private native void nativeSecondaryTouch(int pointerId, int action, float x, float y);
 
+    // --- On-screen touch controls -------------------------------------------
+
+    /** True if a real (non-virtual) gamepad/joystick is currently connected. */
+    private boolean hasGamepad() {
+        if (inputManager == null) {
+            return false;
+        }
+        for (int id : inputManager.getInputDeviceIds()) {
+            InputDevice d = inputManager.getInputDevice(id);
+            if (d == null || d.isVirtual()) {
+                continue;
+            }
+            int sources = d.getSources();
+            boolean gamepad = (sources & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD;
+            boolean joystick = (sources & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+            if (gamepad || joystick) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Show or hide the touch overlay per ge_touch_controls (auto|on|off) and
+     * controller presence. Gated on renderLive so it never fights the boot
+     * visuals / precedes native JNI registration. Main-thread only.
+     */
+    private void updateTouchControls() {
+        if (!renderLive) {
+            return;
+        }
+        String mode = touchControlsMode();
+        boolean show;
+        if ("off".equalsIgnoreCase(mode)) {
+            show = false;
+        } else if ("on".equalsIgnoreCase(mode)) {
+            show = true;
+        } else {
+            show = !hasGamepad();  // "auto"
+        }
+        if (show) {
+            addTouchOverlay();
+        } else {
+            removeTouchOverlay();
+        }
+    }
+
+    private void addTouchOverlay() {
+        if (touchOverlayAdded) {
+            return;
+        }
+        final IBinder token = getWindow().getDecorView().getWindowToken();
+        if (token == null) {
+            return;
+        }
+        try {
+            if (touchView == null) {
+                touchView = new TouchControlsView(this, this);
+            }
+            touchView.refreshConfig();
+            WindowManager.LayoutParams wlp = new WindowManager.LayoutParams();
+            wlp.type = WindowManager.LayoutParams.TYPE_APPLICATION_PANEL;
+            wlp.token = token;
+            wlp.width = WindowManager.LayoutParams.MATCH_PARENT;
+            wlp.height = WindowManager.LayoutParams.MATCH_PARENT;
+            wlp.format = PixelFormat.TRANSLUCENT;
+            // NOT_FOCUSABLE keeps this window out of key/IME focus (so it can't
+            // feed the vendor IME focus storm) while still receiving the touches
+            // that land on it. Do NOT set NOT_TOUCHABLE - the controls need them.
+            wlp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                      | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                      | WindowManager.LayoutParams.FLAG_FULLSCREEN;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                wlp.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            }
+            wlp.gravity = Gravity.TOP | Gravity.START;
+            getWindowManager().addView(touchView, wlp);
+            touchOverlayAdded = true;
+            Log.i(TAG, "touch controls shown");
+        } catch (Throwable t) {
+            Log.e(TAG, "touch overlay add failed", t);
+        }
+    }
+
+    private void removeTouchOverlay() {
+        if (!touchOverlayAdded) {
+            return;
+        }
+        touchOverlayAdded = false;
+        try {
+            // Detaching pushes a zeroed pad frame (TouchControlsView.onDetached).
+            getWindowManager().removeViewImmediate(touchView);
+        } catch (Throwable t) {
+            // ignore
+        }
+    }
+
+    // Native accessors used by TouchControlsView. Each degrades gracefully if the
+    // JNI methods failed to register (returns a sensible default), matching the
+    // dual-screen forwarding pattern.
+    void forwardTouchState(int buttons, int lt, int rt, int lx, int ly, int rx, int ry) {
+        try {
+            nativeSetTouchState(buttons, lt, rt, lx, ly, rx, ry);
+        } catch (UnsatisfiedLinkError e) {
+            // touch natives not registered; drop
+        }
+    }
+
+    String touchControlsMode() {
+        try {
+            return nativeTouchControlsMode();
+        } catch (UnsatisfiedLinkError e) {
+            return "auto";
+        }
+    }
+
+    String touchLookMode() {
+        try {
+            return nativeTouchLookMode();
+        } catch (UnsatisfiedLinkError e) {
+            return "swipe";
+        }
+    }
+
+    float touchLookSens() {
+        try {
+            return nativeTouchLookSens();
+        } catch (UnsatisfiedLinkError e) {
+            return 1.0f;
+        }
+    }
+
+    float touchOpacity() {
+        try {
+            return nativeTouchOpacity();
+        } catch (UnsatisfiedLinkError e) {
+            return 0.5f;
+        }
+    }
+
+    void requestEquipWeapon(int id) {
+        try {
+            nativeRequestEquipWeapon(id);
+        } catch (UnsatisfiedLinkError e) {
+            // ignore
+        }
+    }
+
+    int equippedWeaponId() {
+        try {
+            return nativeEquippedWeaponId();
+        } catch (UnsatisfiedLinkError e) {
+            return -1;
+        }
+    }
+
+    int carriedWeapons(int[] ids, int[] ammo) {
+        try {
+            return nativeCarriedWeapons(ids, ammo);
+        } catch (UnsatisfiedLinkError e) {
+            return -1;
+        }
+    }
+
+    // Implemented in src/ge_android_touch.cpp (libge.so).
+    private native void nativeSetTouchState(int buttons, int lt, int rt, int lx, int ly, int rx, int ry);
+    private native String nativeTouchControlsMode();
+    private native String nativeTouchLookMode();
+    private native float nativeTouchLookSens();
+    private native float nativeTouchOpacity();
+    private native void nativeRequestEquipWeapon(int id);
+    private native int nativeEquippedWeaponId();
+    private native int nativeCarriedWeapons(int[] ids, int[] ammo);
+
     @Override
     protected void onDestroy() {
         stopWatchdog = true;
@@ -585,7 +786,11 @@ public class GoldenEyeActivity extends NativeActivity {
         if (displayManager != null && displayListener != null) {
             displayManager.unregisterDisplayListener(displayListener);
         }
+        if (inputManager != null && inputDeviceListener != null) {
+            inputManager.unregisterInputDeviceListener(inputDeviceListener);
+        }
         teardownSecondaryDisplay();
+        removeTouchOverlay();
         hideOverlay();
         if (overlayThread != null) {
             overlayThread.quitSafely();

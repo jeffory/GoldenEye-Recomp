@@ -27,6 +27,7 @@ set(GE_SOURCES
     src/ge_ce_patches.cpp
     src/ge_dualscreen.cpp   # dual-screen weapon-menu controller (all platforms)
     src/ge_weaponmenu.cpp   # second-screen weapon-menu UI (all platforms)
+    src/ge_touchpad.cpp     # on-screen touch controls -> synthesized pad (all platforms)
     src/ge_asset_check.cpp  # startup required-file manifest check
 )
 
@@ -36,6 +37,7 @@ set(GE_SOURCES
 # only exists in the NDK, so it is compiled on Android alone.
 if(ANDROID)
     list(APPEND GE_SOURCES src/ge_android_ds.cpp)
+    list(APPEND GE_SOURCES src/ge_android_touch.cpp)  # on-screen touch-controls JNI
 endif()
 
 if(WIN32)
@@ -60,6 +62,15 @@ endif()
 # ("ge" -> libge.so); renaming it to libGoldenEye.so makes the app unlaunchable.
 if(NOT ANDROID)
     set_target_properties(ge PROPERTIES OUTPUT_NAME "GoldenEye")
+endif()
+
+# Some hosts (e.g. Fedora clang) need libatomic for 16-byte atomics used by
+# PadState and friends.
+find_library(ATOMIC_LIBRARY NAMES atomic HINTS /usr/lib/gcc/x86_64-redhat-linux/16)
+if(ATOMIC_LIBRARY)
+    target_link_libraries(ge PRIVATE ${ATOMIC_LIBRARY})
+else()
+    target_link_options(ge PRIVATE -latomic)
 endif()
 
 rexglue_setup_target(ge)

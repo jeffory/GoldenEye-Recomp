@@ -19,6 +19,7 @@
 #include "ge_fps.h"    // ge::FpsOnFrame (guest-FPS benchmark recorder)
 #include "ge_gamestate.h"  // ge::gamestate::OnFrame (game-state bridge pump)
 #include "ge_dualscreen.h"  // ge::DualScreen (second-screen weapon menu pacing)
+#include "ge_touchpad.h"    // ge::TouchPad (on-screen touch controls -> guest pad)
 #include <rex/cvar.h>  // REXCVAR_DEFINE_BOOL / REXCVAR_GET (ge_freeze_diag)
 #include <rex/perf/counter.h>  // rex::perf frame-stage counters (GESPIKE)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
@@ -1526,6 +1527,23 @@ REXCVAR_DEFINE_BOOL(ge_weapon_direct_switch, true, "Input",
 REXCVAR_DEFINE_STRING(ge_key_wpn_next, "WheelUp", "Input/Keybinds", "Next carried weapon");
 REXCVAR_DEFINE_STRING(ge_key_wpn_prev, "WheelDown", "Input/Keybinds", "Previous carried weapon");
 
+// On-screen touch controls (ordinary Android phones/tablets). The virtual pad is
+// drawn + hit-tested by the Java overlay (TouchControlsView); these cvars are its
+// policy/tuning knobs, read back over JNI. The synthesized pad frame is injected
+// into the guest below via ge::TouchPad (ge_touchpad.h).
+//   ge_touch_controls : auto = show only when no gamepad is connected (default),
+//                       on = always show, off = never show.
+//   ge_touch_look_mode: swipe = drag the right half to look (default), stick =
+//                       fixed right thumbstick.
+REXCVAR_DEFINE_STRING(ge_touch_controls, "auto", "Input",
+                      "On-screen touch controls: auto|on|off");
+REXCVAR_DEFINE_STRING(ge_touch_look_mode, "stick", "Input",
+                      "Touch look control: stick|swipe");
+REXCVAR_DEFINE_DOUBLE(ge_touch_look_sens, 1.0, "Input",
+                      "Touch look sensitivity").range(0.1, 8.0);
+REXCVAR_DEFINE_DOUBLE(ge_touch_opacity, 0.5, "Input",
+                      "Touch controls opacity (0..1)").range(0.1, 1.0);
+
 // Runs once per controller poll, after XamInputGetState fills the slot-0 buffer
 // and before the guest dispatches it. OR our keyboard buttons in, and set the
 // left stick / triggers when their keys are held (pad input is preserved).
@@ -1657,6 +1675,25 @@ void ge_inject_keyboard(PPCRegister& /*r11*/) {
         pressed = true; ++steps; wait = 0;
       }
     }
+  }
+
+  // On-screen touch controls: OR the Java overlay's synthesized pad frame into
+  // the guest slot-0 buffer. Independent of ge_keyboard_enable / focus (a phone
+  // has no keyboard and the overlay owns its own touches), so it runs before the
+  // keyboard gate below. Only writes fields that are actually actuated, so it
+  // never zeroes a real pad's input (the overlay is hidden when a pad is present
+  // anyway -- see the auto policy in GoldenEyeActivity). No-op on desktop, where
+  // TouchPad stays at its zeroed default.
+  if (ge::TouchPad::Get().Active()) {
+    const ge::PadState tp = ge::TouchPad::Get().GetState();
+    if (tp.buttons)
+      ST16(base, GE_PAD0 + 0, LD16(base, GE_PAD0 + 0) | tp.buttons);
+    if (tp.left_trigger) base[GE_PAD0 + 2] = tp.left_trigger;
+    if (tp.right_trigger) base[GE_PAD0 + 3] = tp.right_trigger;
+    if (tp.thumb_lx) ST16(base, GE_PAD0 + 4, static_cast<uint16_t>(tp.thumb_lx));
+    if (tp.thumb_ly) ST16(base, GE_PAD0 + 6, static_cast<uint16_t>(tp.thumb_ly));
+    if (tp.thumb_rx) ST16(base, GE_PAD0 + 8, static_cast<uint16_t>(tp.thumb_rx));
+    if (tp.thumb_ry) ST16(base, GE_PAD0 + 10, static_cast<uint16_t>(tp.thumb_ry));
   }
 
   if (!REXCVAR_GET(ge_keyboard_enable) || !ge_input_active()) return;
