@@ -45,6 +45,7 @@
 //      weapon and RequestEquipWeapon() switches it (the acceptance demo).
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -52,8 +53,16 @@
 // Fault-safe guest reads for the live per-frame path (Linux + Android). Reading
 // a stray guest pointer via a raw deref can land on a GPU write-watch guard page
 // and trip the recomp's fault handler into a retry storm that HARD-LOCKS the game
-// (see safe_ld32). /proc/self/mem + pread returns an error on such pages instead
-// of faulting, so the inventory walk can follow pointers safely.
+// (see safe_ld32). Both probes below hand the address to the KERNEL, which reports
+// an unreadable page as an error return instead of a signal.
+//
+// Two probes, because /proc/self/mem is unavailable in a shipping Android build:
+// opening it needs PTRACE_MODE_ATTACH, which SELinux grants untrusted_app only
+// when the app is DEBUGGABLE. It therefore works under `gradlew installDebug` and
+// fails with EACCES in a release APK -- which silently made this whole bridge
+// publish valid=false forever ("Weapon data unavailable" on the second screen)
+// in every shipped build, while passing every on-device debug test. The pipe
+// probe (see safe_ld32) needs no privilege and is the fallback.
 #if defined(__linux__)
 #define GE_SAFE_GUEST_READ 1
 #include <fcntl.h>
@@ -109,23 +118,72 @@ inline void ST32(uint8_t* b, uint32_t ga, uint32_t val) {
   uint32_t v = __builtin_bswap32(val); std::memcpy(b + ga, &v, 4);
 }
 
-// Fault-safe big-endian 32-bit guest read for the live path. Reads via
-// /proc/self/mem so a guarded/unmapped page returns an error instead of faulting
-// the process (a raw deref there trips the write-watch handler into an infinite
-// retry that hard-locks the game). Returns false if the address is unreadable;
-// used by the inventory-list walk, which follows pointers that could be stale.
+// Fault-safe big-endian 32-bit guest read for the live path. Returns false if the
+// address is unreadable rather than faulting the process (a raw deref on a guarded
+// page trips the write-watch handler into an infinite retry that hard-locks the
+// game). Used by the inventory-list walk, which follows pointers that could be
+// stale, and by the fixed-address equipped-weapon reads.
 #ifdef GE_SAFE_GUEST_READ
+// /proc/self/mem is the cheapest probe (one pread per read) but opening it goes
+// through the kernel's PTRACE_MODE_ATTACH check, and Android's SELinux policy
+// only grants untrusted_app self-ptrace when the app is DEBUGGABLE. In a release
+// APK the open fails with EACCES, every read below returns false, and the bridge
+// publishes valid=false forever ("Weapon data unavailable" on the second screen).
+// So it is an optimisation, not the mechanism: -1 here just means use the pipe.
 inline int bridge_memfd() {
   static int fd = ::open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
   return fd;
 }
+
+// Permission-free fault-safe probe, used wherever /proc/self/mem is denied.
+// write() copies from userspace inside the kernel: an unreadable/guarded page
+// makes copy_from_user fail and the syscall return EFAULT, rather than raising
+// SIGSEGV into the recomp's write-watch handler (whose infinite retry is what
+// hard-locked the game on the Thor -- see 2f923cf). Needs no ptrace capability,
+// so it works in a shipping build. Two syscalls per read; at ~40 reads/frame
+// that is negligible next to a 16ms frame.
+//
+// Single-consumer: only the game thread's read_snapshot() (and the desktop
+// memscan, same thread) ever probes, so the pipe needs no locking. A short
+// write/read pair can never desync the 64KiB pipe buffer.
+inline int* bridge_pipe() {
+  static int fds[2] = {-1, -1};
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    if (::pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) fds[0] = fds[1] = -1;
+  }
+  return fds;
+}
+
+// errno of the most recent failed safe_ld32 on this thread (0 = short read, not
+// an error). Diagnostic only: EACCES on the fd reads very differently from
+// EFAULT on a guarded page.
+inline int& bridge_last_errno() { static thread_local int e = 0; return e; }
+
 inline bool safe_ld32(uint8_t* base, uint32_t ga, uint32_t* out) {
   uint8_t b[4];
-  if (pread(bridge_memfd(), b, 4, (off_t)((uintptr_t)base + ga)) != 4) return false;
+  const void* src = (const void*)((uintptr_t)base + ga);
+  errno = 0;
+  const int memfd = bridge_memfd();
+  if (memfd >= 0) {
+    if (pread(memfd, b, 4, (off_t)(uintptr_t)src) != 4) {
+      bridge_last_errno() = errno;
+      return false;
+    }
+  } else {
+    int* p = bridge_pipe();
+    if (p[1] < 0) { bridge_last_errno() = EBADF; return false; }
+    // EFAULT here == "that guest address is not readable" -- the whole point.
+    if (::write(p[1], src, 4) != 4) { bridge_last_errno() = errno; return false; }
+    if (::read(p[0], b, 4) != 4) { bridge_last_errno() = errno; return false; }
+  }
   *out = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
   return true;
 }
 #else
+inline int bridge_memfd() { return -2; }  // sentinel: raw-deref build, no fd
+inline int& bridge_last_errno() { static thread_local int e = 0; return e; }
 inline bool safe_ld32(uint8_t* base, uint32_t ga, uint32_t* out) { *out = LD32(base, ga); return true; }
 #endif
 
@@ -571,6 +629,30 @@ void poll(uint8_t* base) {
 }  // namespace memscan
 #endif  // GE_MEMSCAN
 
+// --- diagnostic: why did the snapshot come back invalid? --------------------
+// The live read path publishes valid=false for four different reasons (an
+// unreadable address, the two equipped-id copies disagreeing, a nonsense clip,
+// or a def pointer outside the guest module) and says nothing about which. That
+// makes an "unavailable" weapon menu indistinguishable from a guest heap whose
+// layout has drifted out from under the hardcoded addresses. Log the decomposed
+// verdict, throttled, so a single on-device run identifies the failing term.
+void diag_snapshot(uint32_t frame, int ok_mask, uint32_t id_u, uint32_t id2_u,
+                   uint32_t clip, uint32_t defp, bool in_game, uint8_t held) {
+  if (!REXCVAR_GET(ge_gamestate_diag)) return;
+  static uint32_t last_logged = 0;
+  static bool primed = false;
+  if (primed && frame - last_logged < 120u) return;  // ~1 line / 2s at 60fps
+  last_logged = frame;
+  primed = true;
+  REXKRNL_INFO(
+      "GEGAMESTATE frame={} memfd={} errno={} reads(id/id2/clip/def)={:04b} "
+      "id={:#x} id2={:#x} clip={} defp={:#x} | gate: agree={} slot={} clip_ok={} "
+      "def_ok={} => in_game={} held={}",
+      frame, bridge_memfd(), bridge_last_errno(), ok_mask, id_u, id2_u, clip, defp,
+      id_u == id2_u, (int32_t)id_u >= 0 && (int32_t)id_u < kMaxWeaponSlots,
+      clip <= 4000u, defp >= 0x82000000u && defp < 0x84000000u, in_game, held);
+}
+
 // --- read path: build a snapshot from guest memory --------------------------
 WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
   WeaponSnapshot s{};
@@ -584,9 +666,14 @@ WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
     // EVERY read here is fault-safe (safe_ld32): the recomp's GPU write-watch
     // guard pages make a raw deref of a stray guest pointer trip an infinite
     // retry that hard-locks the game. If the entity can't be read, stay inert.
-    uint32_t id_u, id2_u, clip, defp;
-    if (!safe_ld32(base, kEquipIdAddr, &id_u) || !safe_ld32(base, kEquipIdAddr2, &id2_u) ||
-        !safe_ld32(base, kClipAddr, &clip) || !safe_ld32(base, kWeaponDefAddr, &defp)) {
+    uint32_t id_u = 0, id2_u = 0, clip = 0, defp = 0;
+    const bool ok_id   = safe_ld32(base, kEquipIdAddr, &id_u);
+    const bool ok_id2  = safe_ld32(base, kEquipIdAddr2, &id2_u);
+    const bool ok_clip = safe_ld32(base, kClipAddr, &clip);
+    const bool ok_def  = safe_ld32(base, kWeaponDefAddr, &defp);
+    const int ok_mask  = (ok_id << 3) | (ok_id2 << 2) | (ok_clip << 1) | (int)ok_def;
+    if (!(ok_id && ok_id2 && ok_clip && ok_def)) {
+      diag_snapshot(frame, ok_mask, id_u, id2_u, clip, defp, false, 0);
       return s;
     }
     int32_t id  = static_cast<int32_t>(id_u);
@@ -634,6 +721,7 @@ WeaponSnapshot read_snapshot(uint8_t* base, uint32_t frame) {
       s.ammo[id] = static_cast<uint16_t>(clip);
       s.valid = (s.held_count > 0);
     }
+    diag_snapshot(frame, ok_mask, id_u, id2_u, clip, defp, in_game, s.held_count);
     return s;
   }
 
