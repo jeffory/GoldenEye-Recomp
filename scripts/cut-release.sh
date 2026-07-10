@@ -151,7 +151,11 @@ NOTES="$DIST/notes.md"
 {
   echo "## GoldenEye Recomp $TAG"
   echo
-  echo "Prerelease build of the Android handheld port + stability fixes."
+  if [ "$PRERELEASE" -eq 1 ]; then
+    echo "Prerelease build of the Android handheld port + stability fixes."
+  else
+    echo "Release build of the Android handheld port + Linux desktop build."
+  fi
   echo
   echo "### Artifacts"
   echo "- \`GoldenEye-Recomp-$TAG-android-arm64.apk\` — signed Android APK (arm64-v8a)."
