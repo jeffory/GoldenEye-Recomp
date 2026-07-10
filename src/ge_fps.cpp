@@ -304,7 +304,8 @@ void FpsOnFrame(uint32_t frames_advanced) {
         REXKRNL_INFO(
             "GESPIKE dt={:.1f}ms med={:.1f}ms cpexec={}us cpidle={}us "
             "wrm={}us present={}us gwait={}us gpu={}us draws={} stalls={} "
-            "starved={} wwf={}",
+            "starved={} wwf={} strans={}us pcomp={}us texup={}us gio={}us "
+            "nshad={} npipe={}",
             per / 1000.0, med / 1000.0,
             GetSnapshotCounter(CounterId::kCpExecuteUs),
             GetSnapshotCounter(CounterId::kCpIdleUs),
@@ -314,7 +315,13 @@ void FpsOnFrame(uint32_t frames_advanced) {
             GetSnapshotCounter(CounterId::kGpuFrameUs),
             GetSnapshotCounter(CounterId::kDrawCalls),
             GetSnapshotCounter(CounterId::kCommandBufferStalls),
-            GetCpStarvedEpisodes(), wwf_frame);
+            GetCpStarvedEpisodes(), wwf_frame,
+            GetSnapshotCounter(CounterId::kShaderTranslateUs),
+            GetSnapshotCounter(CounterId::kPipelineCompileUs),
+            GetSnapshotCounter(CounterId::kTextureUploadUs),
+            GetSnapshotCounter(CounterId::kGuestFileIoUs),
+            GetSnapshotCounter(CounterId::kShadersTranslated),
+            GetSnapshotCounter(CounterId::kPipelinesCompiled));
       }
     }
   }
