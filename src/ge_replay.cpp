@@ -18,6 +18,7 @@
 #include "ge_replay.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -239,6 +240,23 @@ class Macro {
       REXKRNL_ERROR("GEREPLAY macro cannot open '{}'", path);
       return false;
     }
+
+    // Parses a decimal integer within [min,max]; returns false on any junk,
+    // sign, or range violation so a typo fails the load instead of wrapping.
+    auto parse_int = [](const std::string& tok, int64_t min, int64_t max, int64_t* out) {
+      if (tok.empty()) return false;
+      size_t i = (tok[0] == '-') ? 1u : 0u;
+      if (i >= tok.size()) return false;
+      for (size_t j = i; j < tok.size(); ++j) {
+        if (tok[j] < '0' || tok[j] > '9') return false;
+      }
+      errno = 0;
+      long long v = std::strtoll(tok.c_str(), nullptr, 10);
+      if (errno == ERANGE || v < min || v > max) return false;
+      *out = v;
+      return true;
+    };
+
     std::vector<MacroStep> steps;
     std::string line;
     uint32_t line_no = 0;
@@ -256,25 +274,49 @@ class Macro {
       try {
         if (tok[0] == "press") {
           step.kind = MacroStep::kPress;
-          ok = tok.size() >= 2 && ButtonByName(tok[1], &step.button);
-          if (ok) step.frames = tok.size() >= 3 ? std::stoul(tok[2]) : 2;
+          ok = tok.size() >= 2 && tok.size() <= 3 && ButtonByName(tok[1], &step.button);
+          if (ok && tok.size() == 3) {
+            int64_t frames = 0;
+            ok = parse_int(tok[2], 1, 100000, &frames);
+            if (ok) step.frames = static_cast<uint32_t>(frames);
+          } else if (ok) {
+            step.frames = 2;
+          }
         } else if (tok[0] == "stick") {
           step.kind = MacroStep::kStick;
-          ok = tok.size() >= 4 && AxisByName(tok[1], &step.axis);
+          ok = tok.size() == 4 && AxisByName(tok[1], &step.axis);
           if (ok) {
-            step.axis_value = static_cast<int16_t>(std::stoi(tok[2]));
-            step.frames = std::stoul(tok[3]);
+            int64_t axis_val = 0;
+            int64_t frames = 0;
+            ok = parse_int(tok[2], -32768, 32767, &axis_val) &&
+                 parse_int(tok[3], 1, 100000, &frames);
+            if (ok) {
+              step.axis_value = static_cast<int16_t>(axis_val);
+              step.frames = static_cast<uint32_t>(frames);
+            }
           }
         } else if (tok[0] == "wait_polls") {
           step.kind = MacroStep::kWaitPolls;
-          ok = tok.size() >= 2;
-          if (ok) step.frames = std::stoul(tok[1]);
+          ok = tok.size() == 2;
+          if (ok) {
+            int64_t frames = 0;
+            ok = parse_int(tok[1], 1, 10000000, &frames);
+            if (ok) step.frames = static_cast<uint32_t>(frames);
+          }
         } else if (tok[0] == "wait_flag") {
           step.kind = MacroStep::kWaitFlag;
-          ok = tok.size() >= 3 && tok[1] == "in_level";
+          ok = tok.size() >= 3 && tok.size() <= 4 && tok[1] == "in_level";
           if (ok) {
-            step.flag_value = std::stoul(tok[2]);
-            if (tok.size() >= 4) step.timeout = std::stoul(tok[3]);
+            int64_t flag_val = 0;
+            int64_t timeout = 36000;
+            ok = parse_int(tok[2], 0, 1, &flag_val);
+            if (ok && tok.size() == 4) {
+              ok = parse_int(tok[3], 1, 10000000, &timeout);
+            }
+            if (ok) {
+              step.flag_value = static_cast<uint32_t>(flag_val);
+              step.timeout = static_cast<uint32_t>(timeout);
+            }
           }
         } else {
           ok = false;  // unknown command token
