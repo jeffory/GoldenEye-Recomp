@@ -579,8 +579,10 @@ void ProbeOnPoll() {
   uint64_t ds = submits - g_probe.last_submits;
   g_probe.last_polls = n;
   g_probe.last_submits = submits;
-  REXKRNL_INFO("GEREPLAY PROBE polls/s={} submits/s={} polls_per_frame={:.2f} in_level={}",
-               dp, ds, ds ? double(dp) / double(ds) : 0.0, GeInLevel() ? 1 : 0);
+  REXKRNL_INFO("GEREPLAY PROBE polls/s={} submits/s={} polls_per_frame={:.2f} in_level={} "
+               "flag={} player={:08X}",
+               dp, ds, ds ? double(dp) / double(ds) : 0.0, GeInLevel() ? 1 : 0,
+               GeDbgLevelFlag(), GeDbgPlayerPtr());
 }
 
 bool ReplayOnGetState(uint32_t user_index, rex::input::X_INPUT_STATE* state) {

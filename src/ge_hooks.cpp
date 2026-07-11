@@ -2276,4 +2276,27 @@ bool GeInLevel() {
   if (!base) return false;
   return LD32(base, 0x8272B424u) == 3u;
 }
+
+// Diagnostic-only raw-value accessors backing the GEREPLAY PROBE line (see
+// ge_replay.cpp ProbeOnPoll) so a captured probe log shows the underlying
+// guest globals instead of just GeInLevel()'s derived bool. Same guarded-base
+// pattern as GeInLevel() above; 0 if guest memory isn't mapped yet.
+uint32_t GeDbgLevelFlag() {
+  auto* ks = rex::system::kernel_state();
+  if (!ks) return 0;
+  auto* mem = ks->memory();
+  if (!mem) return 0;
+  uint8_t* base = mem->virtual_membase();
+  if (!base) return 0;
+  return LD32(base, 0x8272B424u);
+}
+uint32_t GeDbgPlayerPtr() {
+  auto* ks = rex::system::kernel_state();
+  if (!ks) return 0;
+  auto* mem = ks->memory();
+  if (!mem) return 0;
+  uint8_t* base = mem->virtual_membase();
+  if (!base) return 0;
+  return LD32(base, 0x82F1FAACu);
+}
 }  // namespace ge
