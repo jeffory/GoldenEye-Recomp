@@ -380,6 +380,8 @@ class Macro {
         // else: neutral gap poll -- *out is already zeroed above.
         if (++step_polls_ >= step.frames + 2) {
           step_polls_ = 0;
+          REXKRNL_INFO("GEREPLAY macro step {} ({}) done", step_,
+                       step.kind == MacroStep::kPress ? "press" : "stick");
           ++step_;
         }
         break;
@@ -387,6 +389,7 @@ class Macro {
       case MacroStep::kWaitPolls: {
         if (++step_polls_ >= step.frames) {
           step_polls_ = 0;
+          REXKRNL_INFO("GEREPLAY macro step {} (wait_polls) done", step_);
           ++step_;
         }
         break;
@@ -395,6 +398,7 @@ class Macro {
         const bool want = step.flag_value == 1;
         if (GeInLevel() == want) {
           step_polls_ = 0;
+          REXKRNL_INFO("GEREPLAY macro step {} (wait_flag) satisfied", step_);
           ++step_;
         } else if (step.timeout == 0) {
           failed_ = true;
