@@ -32,14 +32,23 @@ STAGES = {
     "present_block_us": "Present (UI-thread paint+present block)",
     "guest_gpu_wait_us": "Guest GPU-wait (thread-time, can exceed wall)",
     "gpu_frame_us": "GPU execution (Vulkan timestamps)",
+    "shader_translate_us": "Shader translation (Xenos->SPIR-V, first encounter)",
+    "pipeline_compile_us": "Pipeline compile (frame-blocking vkCreateGraphicsPipelines)",
+    "texture_upload_us": "Texture upload (first-seen texture loads)",
+    "guest_file_io_us": "Guest file IO (NtCreateFile/NtReadFile, thread-time)",
 }
 
 
 def derive_stages(fr):
     """Add derived stage fields to a frame/spike dict (mutates + returns it)."""
     # max(0, ...) keeps the operand type: int for CSV rows, float for log lines.
+    # strans/pcomp/texup nest inside cpexec (they run on the CP thread inside
+    # ExecutePrimaryBuffer), same as the WAIT_REG_MEM fence; gio does not (guest
+    # threads).
     fr["cp_execute_net_us"] = max(
-        0, fr.get("cp_execute_us", 0) - fr.get("cp_wait_reg_mem_us", 0))
+        0, fr.get("cp_execute_us", 0) - fr.get("cp_wait_reg_mem_us", 0)
+           - fr.get("shader_translate_us", 0) - fr.get("pipeline_compile_us", 0)
+           - fr.get("texture_upload_us", 0))
     return fr
 
 GESPIKE_RE = re.compile(
@@ -47,7 +56,10 @@ GESPIKE_RE = re.compile(
     r"cpexec=(?P<cp_execute_us>\d+)us cpidle=(?P<cp_idle_us>\d+)us "
     r"wrm=(?P<cp_wait_reg_mem_us>\d+)us present=(?P<present_block_us>\d+)us "
     r"gwait=(?P<guest_gpu_wait_us>\d+)us gpu=(?P<gpu_frame_us>\d+)us "
-    r"draws=(?P<draws>\d+) stalls=(?P<stalls>\d+) starved=(?P<starved>\d+)")
+    r"draws=(?P<draws>\d+) stalls=(?P<stalls>\d+) starved=(?P<starved>\d+)"
+    r"(?: wwf=(?P<wwf>\d+) strans=(?P<shader_translate_us>\d+)us "
+    r"pcomp=(?P<pipeline_compile_us>\d+)us texup=(?P<texture_upload_us>\d+)us "
+    r"gio=(?P<guest_file_io_us>\d+)us nshad=(?P<nshad>\d+) npipe=(?P<npipe>\d+))?")
 GEFPS_RE = re.compile(
     r"GEFPS avg=(?P<avg>[\d.]+) low1=(?P<low1>[\d.]+) worst=(?P<worst>[\d.]+) "
     r"hitch=(?P<hitch>\d+) gaps=(?P<gaps>\d+) maxgap=(?P<maxgap>\d+)ms "
@@ -83,8 +95,9 @@ def analyze_log(path):
                 continue
             m = GESPIKE_RE.search(line)
             if m:
-                gespikes.append(
-                    derive_stages({k: float(v) for k, v in m.groupdict().items()}))
+                gespikes.append(derive_stages(
+                    {k: (float(v) if v is not None else 0.0)
+                     for k, v in m.groupdict().items()}))
 
     print(f"\n=== {path} (ge.log telemetry) ===")
     if gefps:

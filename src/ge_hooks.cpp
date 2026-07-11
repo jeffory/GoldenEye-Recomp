@@ -352,14 +352,19 @@ void ge_watchdog_thread() {
               g_cp_starved_episodes.load(std::memory_order_relaxed));
           REXKRNL_INFO(
               "GEWATCHDOG TOTAL-FREEZE: last-frame stages cpexec={}us cpidle={}us wrm={}us "
-              "present={}us gwait={}us gpu={}us | if a guest thread is burning CPU, attach with: "
+              "present={}us gwait={}us gpu={}us strans={}us pcomp={}us texup={}us gio={}us "
+              "| if a guest thread is burning CPU, attach with: "
               "run-as com.sunjaycy.goldeneye simpleperf record -g -p <pid>",
               rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCpExecuteUs),
               rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCpIdleUs),
               rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCpWaitRegMemUs),
               rex::perf::GetSnapshotCounter(rex::perf::CounterId::kPresentBlockUs),
               rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGuestGpuWaitUs),
-              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGpuFrameUs));
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGpuFrameUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kShaderTranslateUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kPipelineCompileUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kTextureUploadUs),
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGuestFileIoUs));
           // Full write-watch fault anatomy: if a guest thread is wedged in a
           // fault loop, the ring holds the decisions of its last iterations.
           ge_dump_fault_diag(/*full=*/true);
