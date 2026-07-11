@@ -28,7 +28,10 @@ import android.widget.TextView;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
+import java.io.InputStream;
+import java.io.OutputStream;
 
 /**
  * Thin Java shell over NativeActivity.
@@ -131,6 +134,11 @@ public class GoldenEyeActivity extends NativeActivity {
             // best-effort
         }
 
+        // First-install shader/pipeline storage seed: gives the runtime's
+        // boot-time precompile something to chew on, so first-shot pipeline
+        // compiles happen behind the loader screen instead of mid-combat.
+        seedShaderStorageFromAssets();
+
         super.onCreate(savedInstanceState);
 
         // Force the window to fill the display (the dual-screen WM left it 0x0).
@@ -178,6 +186,52 @@ public class GoldenEyeActivity extends NativeActivity {
                 @Override public void onInputDeviceChanged(int deviceId) { updateTouchControls(); }
             };
             inputManager.registerInputDeviceListener(inputDeviceListener, null);
+        }
+    }
+
+    /**
+     * Copy bundled shader-storage seed files (assets/shader_seed/*) into the
+     * runtime's cache dir, only when absent. tmp+rename so a mid-copy kill
+     * can't leave a truncated file; every failure is non-fatal (the game just
+     * boots seedless, as before this feature). See
+     * docs/superpowers/specs/2026-07-11-shader-seed-bundling-design.md.
+     */
+    private void seedShaderStorageFromAssets() {
+        try {
+            String[] names = getAssets().list("shader_seed");
+            if (names == null || names.length == 0) {
+                return;
+            }
+            File destDir = new File(getExternalFilesDir(null), "cache/shaders/shareable");
+            for (String name : names) {
+                File dest = new File(destDir, name);
+                if (dest.exists()) {
+                    continue;
+                }
+                if (!destDir.isDirectory() && !destDir.mkdirs()) {
+                    Log.w(TAG, "shader seed: cannot create " + destDir);
+                    return;
+                }
+                File tmp = new File(destDir, name + ".tmp");
+                long bytes = 0;
+                try (InputStream in = getAssets().open("shader_seed/" + name);
+                     OutputStream out = new FileOutputStream(tmp)) {
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        out.write(buf, 0, n);
+                        bytes += n;
+                    }
+                }
+                if (tmp.renameTo(dest)) {
+                    Log.i(TAG, "shader seed: copied " + name + " (" + bytes + " bytes)");
+                } else {
+                    Log.w(TAG, "shader seed: rename failed for " + name);
+                    tmp.delete();
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "shader seed: copy failed (continuing without)", t);
         }
     }
 
