@@ -92,6 +92,20 @@ git commit -q -m "chore(release): $TAG"
 # The version-bump commit above stays local until the builds succeed; if a build
 # fails, reset it with: git reset --hard HEAD~1
 
+# --- shader seed freshness (warn only) --------------------------------------
+# The bundled first-install shader seed should track real playthrough coverage;
+# refresh with scripts/refresh-shader-seed.sh after playing new content.
+SEED_DIR="android/app/src/main/assets/shader_seed"
+if [ -d "$SEED_DIR" ]; then
+  SEED_COMMIT_TS=$(git log -1 --format=%ct -- "$SEED_DIR" 2>/dev/null || echo "")
+  if [ -n "$SEED_COMMIT_TS" ]; then
+    SEED_AGE_DAYS=$(( ( $(date +%s) - SEED_COMMIT_TS ) / 86400 ))
+    if [ "$SEED_AGE_DAYS" -gt 30 ]; then
+      echo "WARNING: shader seed is ${SEED_AGE_DAYS} days old -- consider scripts/refresh-shader-seed.sh" >&2
+    fi
+  fi
+fi
+
 # --- build: Android signed release APK -------------------------------------
 rm -rf "$DIST"; mkdir -p "$DIST"
 APK_OUT="$DIST/GoldenEye-Recomp-$TAG-android-arm64.apk"
