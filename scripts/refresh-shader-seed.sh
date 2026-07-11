@@ -14,6 +14,13 @@ ADB=(adb)
 
 SRC=/sdcard/Android/data/com.sunjaycy.goldeneye/files/cache/shaders/shareable
 DEST="$(cd "$(dirname "$0")/.." && pwd)/android/app/src/main/assets/shader_seed"
+
+# Stop the game first: the runtime appends to these files continuously, and a
+# live pull can capture a torn tail that silently shrinks the committed seed
+# (the SDK drops everything after the first bad record).
+echo "Stopping the game on the device (required for a consistent pull)..."
+"${ADB[@]}" shell am force-stop com.sunjaycy.goldeneye
+
 mkdir -p "$DEST"
 
 for f in 584108A9.xsh 584108A9.fbo.vk.xpso; do
