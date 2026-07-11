@@ -1,0 +1,10 @@
+# GoldenEye XBLA: title -> solo -> Dam -> start. Refined empirically in Task 6.
+wait_polls 600          # let attract/title settle
+press START
+wait_polls 120
+press A                 # into solo menu
+wait_polls 120
+press A                 # select Dam (first mission)
+wait_polls 120
+press A                 # confirm difficulty (default)
+wait_flag in_level 1 36000

@@ -25,7 +25,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -154,6 +157,210 @@ class Player {
   size_t next_ = 0;
 };
 
+// --- menu macro ------------------------------------------------------------
+//
+// Button-name -> XINPUT bit table. Values are the guest-facing
+// X_INPUT_GAMEPAD_* constants from rex/input/input.h (host-order bit masks --
+// see the be<> note on Macro::OnPoll below). LS/RS are the thumbstick click
+// buttons, LB/RB are the shoulder buttons.
+struct ButtonName {
+  const char* name;
+  uint16_t value;
+};
+constexpr ButtonName kButtonNames[] = {
+    {"DPAD_UP", rex::input::X_INPUT_GAMEPAD_DPAD_UP},
+    {"DPAD_DOWN", rex::input::X_INPUT_GAMEPAD_DPAD_DOWN},
+    {"DPAD_LEFT", rex::input::X_INPUT_GAMEPAD_DPAD_LEFT},
+    {"DPAD_RIGHT", rex::input::X_INPUT_GAMEPAD_DPAD_RIGHT},
+    {"START", rex::input::X_INPUT_GAMEPAD_START},
+    {"BACK", rex::input::X_INPUT_GAMEPAD_BACK},
+    {"LS", rex::input::X_INPUT_GAMEPAD_LEFT_THUMB},
+    {"RS", rex::input::X_INPUT_GAMEPAD_RIGHT_THUMB},
+    {"LB", rex::input::X_INPUT_GAMEPAD_LEFT_SHOULDER},
+    {"RB", rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER},
+    {"A", rex::input::X_INPUT_GAMEPAD_A},
+    {"B", rex::input::X_INPUT_GAMEPAD_B},
+    {"X", rex::input::X_INPUT_GAMEPAD_X},
+    {"Y", rex::input::X_INPUT_GAMEPAD_Y},
+};
+
+bool ButtonByName(const std::string& name, uint16_t* out) {
+  for (const auto& b : kButtonNames) {
+    if (name == b.name) {
+      *out = b.value;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool AxisByName(const std::string& name, int* out) {
+  if (name == "LX") { *out = 0; return true; }
+  if (name == "LY") { *out = 1; return true; }
+  if (name == "RX") { *out = 2; return true; }
+  if (name == "RY") { *out = 3; return true; }
+  return false;
+}
+
+struct MacroStep {
+  enum Kind { kPress, kStick, kWaitPolls, kWaitFlag } kind;
+  uint16_t button = 0;      // kPress
+  int axis = 0;             // kStick: 0=LX 1=LY 2=RX 3=RY
+  int16_t axis_value = 0;   // kStick
+  uint32_t frames = 2;      // kPress/kStick hold, kWaitPolls count
+  uint32_t flag_value = 0;  // kWaitFlag: expected GeInLevel()?1:0
+  uint32_t timeout = 36000; // kWaitFlag: polls (~10 min) before giving up
+};
+
+// Flag-waiting menu-macro engine. Drives a scripted button sequence (see
+// bench/dam.macro) through Recorder/Player's same X_INPUT_GAMEPAD boundary,
+// so a macro's output is indistinguishable from a real pad press to the guest
+// and to anything else that consumes ReplayOnGetState.
+//
+// be<> semantics (confirmed from rex/types.h): `be<T>` has a non-explicit
+// converting constructor `endian_store(const T& src)` that calls set(), which
+// byte-swaps a host-order value into big-endian storage on a little-endian
+// host (native != E). The implicitly-defaulted copy-assignment operator only
+// copies the already-swapped `value` member with no further swap. So
+// `out->buttons = <host-order value>` goes through exactly one swap (via the
+// converting ctor + defaulted assign) -- plain assignment of a host-order
+// value is correct and matches the SDK's own input drivers, e.g.
+// xinput_input_driver.cpp: `out_state->gamepad.buttons =
+// native_state.state.Gamepad.wButtons;`. Do NOT pre-swap with
+// rex::byte_swap() before assigning -- that would double-swap.
+class Macro {
+ public:
+  // Parses `path` into steps_. Logs (REXKRNL_ERROR) and returns false on any
+  // syntax error; on failure, any previously-loaded macro state is left
+  // untouched (the new steps are only committed on full success).
+  bool Load(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+      REXKRNL_ERROR("GEREPLAY macro cannot open '{}'", path);
+      return false;
+    }
+    std::vector<MacroStep> steps;
+    std::string line;
+    uint32_t line_no = 0;
+    while (std::getline(f, line)) {
+      ++line_no;
+      const auto hash = line.find('#');
+      if (hash != std::string::npos) line.resize(hash);
+      std::istringstream iss(line);
+      std::vector<std::string> tok;
+      for (std::string t; iss >> t;) tok.push_back(std::move(t));
+      if (tok.empty()) continue;  // blank or comment-only line
+
+      MacroStep step;
+      bool ok = true;
+      try {
+        if (tok[0] == "press") {
+          step.kind = MacroStep::kPress;
+          ok = tok.size() >= 2 && ButtonByName(tok[1], &step.button);
+          if (ok) step.frames = tok.size() >= 3 ? std::stoul(tok[2]) : 2;
+        } else if (tok[0] == "stick") {
+          step.kind = MacroStep::kStick;
+          ok = tok.size() >= 4 && AxisByName(tok[1], &step.axis);
+          if (ok) {
+            step.axis_value = static_cast<int16_t>(std::stoi(tok[2]));
+            step.frames = std::stoul(tok[3]);
+          }
+        } else if (tok[0] == "wait_polls") {
+          step.kind = MacroStep::kWaitPolls;
+          ok = tok.size() >= 2;
+          if (ok) step.frames = std::stoul(tok[1]);
+        } else if (tok[0] == "wait_flag") {
+          step.kind = MacroStep::kWaitFlag;
+          ok = tok.size() >= 3 && tok[1] == "in_level";
+          if (ok) {
+            step.flag_value = std::stoul(tok[2]);
+            if (tok.size() >= 4) step.timeout = std::stoul(tok[3]);
+          }
+        } else {
+          ok = false;  // unknown command token
+        }
+      } catch (const std::exception&) {
+        ok = false;  // malformed number
+      }
+      if (!ok) {
+        REXKRNL_ERROR("GEREPLAY macro parse error at line {}", line_no);
+        return false;
+      }
+      steps.push_back(step);
+    }
+    steps_ = std::move(steps);
+    step_ = 0;
+    step_polls_ = 0;
+    failed_ = false;
+    return true;
+  }
+
+  bool Done() const { return step_ >= steps_.size() && !failed_; }
+  bool Failed() const { return failed_; }
+  size_t StepCount() const { return steps_.size(); }
+
+  // Zeros *out, then applies the current step's effect (if any) and advances
+  // the step machine. kPress/kStick hold their effect for `frames` polls, then
+  // emit a 2-poll neutral gap before the next step starts, so two consecutive
+  // presses of the same button register as distinct edges to the guest.
+  void OnPoll(rex::input::X_INPUT_GAMEPAD* out) {
+    std::memset(out, 0, sizeof(*out));
+    if (Failed() || Done()) return;
+
+    MacroStep& step = steps_[step_];
+    switch (step.kind) {
+      case MacroStep::kPress:
+      case MacroStep::kStick: {
+        if (step_polls_ < step.frames) {
+          if (step.kind == MacroStep::kPress) {
+            out->buttons = step.button;  // see be<> note above
+          } else {
+            switch (step.axis) {
+              case 0: out->thumb_lx = step.axis_value; break;
+              case 1: out->thumb_ly = step.axis_value; break;
+              case 2: out->thumb_rx = step.axis_value; break;
+              case 3: out->thumb_ry = step.axis_value; break;
+              default: break;
+            }
+          }
+        }
+        // else: neutral gap poll -- *out is already zeroed above.
+        if (++step_polls_ >= step.frames + 2) {
+          step_polls_ = 0;
+          ++step_;
+        }
+        break;
+      }
+      case MacroStep::kWaitPolls: {
+        if (++step_polls_ >= step.frames) {
+          step_polls_ = 0;
+          ++step_;
+        }
+        break;
+      }
+      case MacroStep::kWaitFlag: {
+        const bool want = step.flag_value == 1;
+        if (GeInLevel() == want) {
+          step_polls_ = 0;
+          ++step_;
+        } else if (step.timeout == 0) {
+          failed_ = true;
+          REXKRNL_ERROR("GEREPLAY macro timeout at step {}", step_);
+        } else {
+          --step.timeout;
+        }
+        break;
+      }
+    }
+  }
+
+ private:
+  std::vector<MacroStep> steps_;
+  size_t step_ = 0;
+  uint32_t step_polls_ = 0;
+  bool failed_ = false;
+};
+
 std::function<void()> g_quit_requester;
 
 // --- recording state -------------------------------------------------------
@@ -197,6 +404,20 @@ void RunSelfTest() {
     }
   }
   REXKRNL_INFO("GEREPLAY SELFTEST PASS (100 records round-tripped)");
+
+  // Macro parser syntax-check (Step 3): the macro engine itself is exercised
+  // end-to-end in later tasks; here we just confirm bench/dam.macro parses.
+  // cwd-relative path -- works when the binary is run from the repo root (see
+  // the build/run recipe); skip silently if it isn't there.
+  const char* kMacroPath = "bench/dam.macro";
+  if (std::filesystem::exists(kMacroPath)) {
+    Macro macro;
+    if (macro.Load(kMacroPath)) {
+      REXKRNL_INFO("GEREPLAY SELFTEST macro parse OK ({} steps)", macro.StepCount());
+    } else {
+      REXKRNL_ERROR("GEREPLAY SELFTEST macro parse FAIL");
+    }
+  }
 }
 
 // --- probe -------------------------------------------------------------
