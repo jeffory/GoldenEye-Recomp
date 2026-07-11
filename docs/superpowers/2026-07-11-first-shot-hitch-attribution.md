@@ -70,3 +70,16 @@ Target **blocking pipeline compilation**, in this order:
 
 A per-site split of `kPipelineCompileUs` (which of the four blocking sites dominates) would
 sharpen item 2 if needed; the counters make that a 10-minute addition.
+
+## Addendum (2026-07-11, shader-seed work)
+
+The shader-seed feature exposed a pre-existing SDK bug that corrects one mechanism claim
+above: **Android never actually loaded `.xsh`/`.xpso` across sessions** — `fopen("a+b")`'s
+initial read position is EOF on bionic (start-of-file on glibc), so the storage header read
+failed silently on every Android boot and the files were rebuilt from scratch each session.
+The low `strans` in these captures came from within-session/load-screen translation, not
+cross-session storage. Fixed in SDK `fix/android-storage-append-read` (explicit seeks);
+combined with the bundled seed, a fresh install now precompiles at boot (verified: 173
+pipelines, 2.64MB driver blob within 20s, combat `pcomp` clean over a 17-min acceptance
+session; three menu-context compiles remain as seed-coverage gaps that future seed
+refreshes absorb).
