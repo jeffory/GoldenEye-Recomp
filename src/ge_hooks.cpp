@@ -2255,17 +2255,16 @@ void ge_ce_watch_sfx_save() {
 }
 
 // GeInLevel(): declared in ge_hooks.h for ge_replay.cpp's poll-cadence probe
-// (tags each GEREPLAY PROBE line with menu vs. in-level context). Reads the
-// same solo-fullscreen-view guest global (0x8272B424 == 3) as the readers at
-// ge_ce_remote_weapon_sfx/ge_ce_play_at_location above (~line 2119/2146), and
-// reuses this file's LD32 helper verbatim. Unlike those readers -- which run
-// only from inside a guest hook with a live PPCContext, so getcb()'s direct
-// kernel_state()->memory()->virtual_membase() is always safe there -- this
-// accessor is invoked from the input-override callback and must not assume a
-// guest thread context is fully live, so it guards the chain the same way
-// ge_cp()/ge_gs() above (~line 156) guard against a not-yet-initialized
-// kernel/graphics system: null-check every link, false (not a crash) if any
-// is missing.
+// (tags each GEREPLAY PROBE line with menu vs. in-level context) and gates
+// the recorder/replayer's kWaitLevel sync barrier. Unlike the solo-
+// fullscreen-view readers at ge_ce_remote_weapon_sfx/ge_ce_play_at_location
+// above (~line 2119/2146) -- which run only from inside a guest hook with a
+// live PPCContext, so getcb()'s direct kernel_state()->memory()->
+// virtual_membase() is always safe there -- this accessor is invoked from
+// the input-override callback and must not assume a guest thread context is
+// fully live, so it guards the chain the same way ge_cp()/ge_gs() above
+// (~line 156) guard against a not-yet-initialized kernel/graphics system:
+// null-check every link, false (not a crash) if any is missing.
 namespace ge {
 bool GeInLevel() {
   auto* ks = rex::system::kernel_state();
@@ -2274,13 +2273,39 @@ bool GeInLevel() {
   if (!mem) return false;
   uint8_t* base = mem->virtual_membase();
   if (!base) return false;
-  return LD32(base, 0x8272B424u) == 3u;
+  // True while a mission is loading/running: 0x82F1E704 is the current stage
+  // number -- 90 on every frontend screen INCLUDING the attract demo, the
+  // mission's stage id otherwise (Dam=0x21). Flips at difficulty select.
+  // (The screen flag at 0x8272B424 is NOT usable: it reads 3 everywhere.)
+  return LD32(base, 0x82F1E704u) != 90u;
 }
 
 // Diagnostic-only raw-value accessors backing the GEREPLAY PROBE line (see
 // ge_replay.cpp ProbeOnPoll) so a captured probe log shows the underlying
 // guest globals instead of just GeInLevel()'s derived bool. Same guarded-base
 // pattern as GeInLevel() above; 0 if guest memory isn't mapped yet.
+//
+// task-6 RE hunt (full evidence: .superpowers/sdd/task-6-re-hunt.md). The
+// three accessors read the finalist guest globals found by the run-2 diff
+// scan over guest statics 0x82700000..0x83070000 and verified across three
+// attract cycles (run 3) plus a macro-driven real Dam mission (run 8):
+//  - GeDbgLevelFlag: 0x82C8681C -- frontend-overlay alpha. 0x50 at
+//    title/menus AND during a real mission (stale; the overlay just isn't
+//    drawn in-level), 0 ONLY while an attract demo plays (the frontend
+//    hides itself). I.e. an ATTRACT detector, not a level detector.
+//    Setter sub_8211C320(v) (menu init: 80 @0x821098B4; attract start: 0
+//    @0x820F01BC), getter sub_8211C330, drawn by sub_8209A8B0.
+//  - GeDbgPlayerPtr: 0x8272B3A8 -- "boot frontend session": 1 from boot,
+//    ->0 at the first attract demo or first menu commitment, does NOT
+//    return to 1 across demo/title-interlude cycling. One-way; weak.
+//  - GeDbgStageNum: 0x82F1E704 -- CURRENT STAGE NUMBER, the winner. The
+//    per-frame dispatcher sub_8209EC28 runs the frontend when it reads 90,
+//    the game loop otherwise; stage-setup continuation ge_cont_8209F5F4
+//    stores the new stage. 90 (0x5A) = frontend INCLUDING attract demos
+//    and title interludes; flips to the mission stage id (Dam = 0x21) at
+//    difficulty select (level load start, dossier still up) and stays
+//    there through loading and gameplay (verified in-mission, run 8).
+//    This is the global GeInLevel() above now reads (LD32(...) != 90).
 uint32_t GeDbgLevelFlag() {
   auto* ks = rex::system::kernel_state();
   if (!ks) return 0;
@@ -2288,7 +2313,7 @@ uint32_t GeDbgLevelFlag() {
   if (!mem) return 0;
   uint8_t* base = mem->virtual_membase();
   if (!base) return 0;
-  return LD32(base, 0x8272B424u);
+  return LD32(base, 0x82C8681Cu);
 }
 uint32_t GeDbgPlayerPtr() {
   auto* ks = rex::system::kernel_state();
@@ -2297,6 +2322,15 @@ uint32_t GeDbgPlayerPtr() {
   if (!mem) return 0;
   uint8_t* base = mem->virtual_membase();
   if (!base) return 0;
-  return LD32(base, 0x82F1FAACu);
+  return LD32(base, 0x8272B3A8u);
+}
+uint32_t GeDbgStageNum() {
+  auto* ks = rex::system::kernel_state();
+  if (!ks) return 0;
+  auto* mem = ks->memory();
+  if (!mem) return 0;
+  uint8_t* base = mem->virtual_membase();
+  if (!base) return 0;
+  return LD32(base, 0x82F1E704u);
 }
 }  // namespace ge

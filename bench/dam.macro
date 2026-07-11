@@ -1,10 +1,16 @@
-# GoldenEye XBLA: title -> solo -> Dam -> start. Refined empirically in Task 6.
-wait_polls 600          # let attract/title settle
+# GoldenEye XBLA: title -> solo -> Dam -> gameplay. Verified sequence from the
+# RE hunt: START, A, A, A (~5s apart) reaches difficulty select; the stage
+# global flips there; after the load, START dismisses the mission dossier
+# (A only cycles dossier pages). wait_flag rides the stage global.
+wait_polls 600
+press START
+wait_polls 300
+press A
+wait_polls 300
+press A
+wait_polls 300
+press A
+wait_flag in_level 1 36000
+wait_polls 600
 press START
 wait_polls 120
-press A                 # into solo menu
-wait_polls 120
-press A                 # select Dam (first mission)
-wait_polls 120
-press A                 # confirm difficulty (default)
-wait_flag in_level 1 36000

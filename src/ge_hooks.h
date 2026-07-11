@@ -16,10 +16,12 @@
 
 namespace ge {
 
-// True while the guest is actually in a level (solo full-screen view; see the
-// 0x8272B424 readers in ge_hooks.cpp), false at the menu/attract loop or
-// before guest memory is mapped. Used by the input-replay probe
-// (ge_replay.cpp) to tag poll-cadence samples with menu vs. in-level context.
+// True while a mission is loading or running: the current-stage-number
+// global at 0x82F1E704 is != 90 (see ge_hooks.cpp). False on every frontend
+// screen INCLUDING the attract demo (stage reads 90 there too) or before
+// guest memory is mapped. Used by the input-replay probe (ge_replay.cpp) to
+// tag poll-cadence samples with menu vs. in-level context, and as the
+// recorder/replayer state machine's sync barrier.
 // Safe to call from any thread.
 bool GeInLevel();
 
@@ -27,7 +29,10 @@ bool GeInLevel();
 // ge_replay.cpp's GEREPLAY PROBE line can log the underlying guest globals
 // instead of just the derived bool. Same guarded-base pattern as GeInLevel();
 // return 0 if guest memory isn't mapped yet. Safe to call from any thread.
-uint32_t GeDbgLevelFlag();  // raw u32 @ 0x8272B424 (solo full-screen screen flag)
-uint32_t GeDbgPlayerPtr();  // raw u32 @ 0x82F1FAAC (current-player table ptr)
+// task-6 RE-hunt finalists (evidence: .superpowers/sdd/task-6-re-hunt.md;
+// full semantics at the definitions in ge_hooks.cpp):
+uint32_t GeDbgLevelFlag();  // 0x82C8681C frontend-overlay alpha (0 = attract demo playing)
+uint32_t GeDbgPlayerPtr();  // 0x8272B3A8 boot-frontend session flag (one-way 1->0)
+uint32_t GeDbgStageNum();   // 0x82F1E704 current stage number (90 = frontend; GeInLevel()'s source)
 
 }  // namespace ge

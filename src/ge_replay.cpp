@@ -92,7 +92,8 @@ struct ReplayHeader {
   uint32_t version;       // 1
   uint32_t poll_hz_hint;  // informational (from the probe, e.g. 60)
   uint32_t reserved;      // 0
-  uint64_t level_flag_addr;  // 0x8272B424
+  uint64_t level_flag_addr;  // informational: guest global GeInLevel() anchors
+                             // on, 0x82F1E704 (current stage number; task-6)
   uint32_t record_count;     // patched on Close(); 0 = read to EOF
 };
 #pragma pack(pop)
@@ -107,7 +108,7 @@ class Recorder {
       REXKRNL_WARN("GEREPLAY cannot open '{}' for recording", path);
       return false;
     }
-    ReplayHeader h{kReplayMagic, 1, 60, 0, 0x8272B424ull, 0};
+    ReplayHeader h{kReplayMagic, 1, 60, 0, 0x82F1E704ull, 0};
     std::fwrite(&h, sizeof(h), 1, file_);
     count_ = 0;
     return true;
@@ -415,12 +416,27 @@ class Macro {
 
 std::function<void()> g_quit_requester;
 
+// Real (nonzero) pad-state test shared by the recorder's menu-input gate and
+// its dossier-dismiss detection below. Sticks need real deflection (~25%) so
+// ADC drift on an idle pad can't arm anything.
+bool IsNonzeroGamepadState(const rex::input::X_INPUT_GAMEPAD& gp) {
+  return gp.buttons || gp.left_trigger || gp.right_trigger ||
+         std::abs(int(gp.thumb_lx)) > 8000 || std::abs(int(gp.thumb_ly)) > 8000 ||
+         std::abs(int(gp.thumb_rx)) > 8000 || std::abs(int(gp.thumb_ry)) > 8000;
+}
+
 // --- recording state -------------------------------------------------------
 Recorder g_recorder;
 std::atomic<bool> g_recording{false};
 bool g_record_armed = false;
 std::string g_record_path;
 bool g_saw_menu_input = false;
+// Set once, after in_level && g_saw_menu_input, by the first real pad state
+// seen while in_level -- the player's mission-dossier dismiss press. The
+// recorder arms on the next all-neutral poll after that (see the Recording
+// control block below), using the input-gated dossier as a load-time-
+// invariant sync barrier instead of in_level's edge directly.
+bool g_saw_level_input = false;
 
 // --- replay state machine ---------------------------------------------------
 // kIdle -> kMacro (only if a macro is loaded) -> kWaitLevel -> kPlaying -> kDone.
@@ -580,9 +596,9 @@ void ProbeOnPoll() {
   g_probe.last_polls = n;
   g_probe.last_submits = submits;
   REXKRNL_INFO("GEREPLAY PROBE polls/s={} submits/s={} polls_per_frame={:.2f} in_level={} "
-               "flag={} player={:08X}",
+               "flag={:08X} player={:08X} stage={:08X}",
                dp, ds, ds ? double(dp) / double(ds) : 0.0, GeInLevel() ? 1 : 0,
-               GeDbgLevelFlag(), GeDbgPlayerPtr());
+               GeDbgLevelFlag(), GeDbgPlayerPtr(), GeDbgStageNum());
 }
 
 bool ReplayOnGetState(uint32_t user_index, rex::input::X_INPUT_STATE* state) {
@@ -597,13 +613,8 @@ bool ReplayOnGetState(uint32_t user_index, rex::input::X_INPUT_STATE* state) {
 
   // Track menu input to gate recording (Attract mode sets the in-level flag too;
   // require real menu input first so an idle title screen can't start the recording.)
-  // Sticks need real deflection (~25%) so ADC drift on an idle pad can't arm us.
-  if (!in_level) {
-    if (state->gamepad.buttons || state->gamepad.left_trigger || state->gamepad.right_trigger ||
-        std::abs(int(state->gamepad.thumb_lx)) > 8000 || std::abs(int(state->gamepad.thumb_ly)) > 8000 ||
-        std::abs(int(state->gamepad.thumb_rx)) > 8000 || std::abs(int(state->gamepad.thumb_ry)) > 8000) {
-      g_saw_menu_input = true;
-    }
+  if (!in_level && IsNonzeroGamepadState(state->gamepad)) {
+    g_saw_menu_input = true;
   }
 
   // Replay state machine. Each active state (kMacro/kWaitLevel/kPlaying)
@@ -649,12 +660,24 @@ bool ReplayOnGetState(uint32_t user_index, rex::input::X_INPUT_STATE* state) {
       break;
   }
 
-  // Recording control
+  // Recording control. The dossier screen waits for input, making it the
+  // natural sync barrier: record from just after the player's dismiss press,
+  // and replays anchored at the macro's own dismiss press align regardless
+  // of load-time variance. Once in_level && g_saw_menu_input holds, first
+  // wait for a real (nonzero) pad state -- the dossier-dismiss press itself
+  // -- then arm the recorder at the very next all-neutral poll, so the
+  // recording's first frame is the neutral gap right after the press rather
+  // than the press (or its trailing hold) itself.
   if (g_record_armed) {
     if (!g_recording.load(std::memory_order_relaxed)) {
-      if (in_level && g_saw_menu_input && g_recorder.Open(g_record_path)) {
-        g_recording.store(true, std::memory_order_relaxed);
-        REXKRNL_INFO("GEREPLAY recording started -> {}", g_record_path);
+      if (in_level && g_saw_menu_input) {
+        if (!g_saw_level_input) {
+          if (IsNonzeroGamepadState(state->gamepad)) g_saw_level_input = true;
+        } else if (!IsNonzeroGamepadState(state->gamepad) &&
+                   g_recorder.Open(g_record_path)) {
+          g_recording.store(true, std::memory_order_relaxed);
+          REXKRNL_INFO("GEREPLAY recording started -> {}", g_record_path);
+        }
       }
     } else if (!in_level) {
       g_recorder.Close();
