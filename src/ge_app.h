@@ -174,7 +174,7 @@ class GeApp : public rex::ReXApp {
     // polling gamepad state. quit_requester mirrors the pause menu's on_quit
     // (TogglePauseMenu(), below) deferred to the UI thread -- this can be
     // invoked from a guest thread once ge_bench_exit finishes a replay.
-    ge::ReplayInit([this] {
+    ge::ReplayInit(user_data_root(), [this] {
       app_context().CallInUIThreadDeferred([this] {
         if (runtime() && runtime()->kernel_state()) {
           runtime()->kernel_state()->TerminateTitle();

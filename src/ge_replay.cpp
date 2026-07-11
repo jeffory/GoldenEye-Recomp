@@ -11,12 +11,15 @@
 // variable ratio means records need an explicit per-record frame index
 // instead (see the task brief's documented fallback).
 //
-// Recorder/replayer bodies land in later tasks; ReplayOnGetState always
-// returns false here (never substitutes a state), so this skeleton has no
-// gameplay effect with the harness cvars at their defaults.
+// Task 5 lands the replayer: a kIdle -> kMacro -> kWaitLevel -> kPlaying ->
+// kDone state machine driving the same X_INPUT_GAMEPAD boundary as the
+// recorder, plus the GEBENCH summary line and ge_bench_exit auto-quit. With
+// the harness cvars at their defaults (nothing to play, nothing to record),
+// ReplayOnGetState still has no gameplay effect.
 
 #include "ge_replay.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -34,7 +37,9 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 
@@ -71,6 +76,11 @@ REXCVAR_DEFINE_BOOL(ge_bench_exit, false, "GE",
 // to measure (see presenter.cpp's "how many guest frames actually reach the
 // display" comment) and would corrupt the polls_per_frame ratio if the host
 // ever drops presents.
+//
+// Task 5 reuses the same counter as BenchOnPoll's submit-gate: the brief
+// specified `rex_ge_present_submit_count()`, which does not exist anywhere in
+// the SDK (grepped the whole tree) -- this is the same substitution as above,
+// for the same reason.
 extern "C" uint64_t rex_ge_guest_refresh_count();
 
 namespace ge {
@@ -412,6 +422,92 @@ bool g_record_armed = false;
 std::string g_record_path;
 bool g_saw_menu_input = false;
 
+// --- replay state machine ---------------------------------------------------
+// kIdle -> kMacro (only if a macro is loaded) -> kWaitLevel -> kPlaying -> kDone.
+// Record and play are mutually exclusive (ReplayInit refuses to arm this
+// machine -- leaving it at kIdle -- if recording is also armed), so whenever
+// g_state != kIdle, ReplayOnGetState's switch returns before it can reach the
+// recorder branch: a replaying run never also records.
+enum ReplayState { kIdle, kMacro, kWaitLevel, kPlaying, kDone };
+Player g_player;
+Macro g_macro;
+ReplayState g_state = kIdle;
+// A loaded macro reaching Done() counts as evidence of real menu navigation
+// for the kWaitLevel gate below, same as g_saw_menu_input -- a scripted
+// macro drives synthesized pad state, so it never sets g_saw_menu_input
+// itself (that tracker only looks at pre-substitution, i.e. real, input).
+bool g_macro_ran = false;
+// Synthesized X_INPUT_STATE::packet_number, monotonic across every poll the
+// state machine substitutes (kMacro and kPlaying both write it).
+uint32_t g_packet = 0;
+
+// --- bench (GEBENCH) ---------------------------------------------------------
+struct BenchState {
+  std::vector<int64_t> poll_ts_us;
+  int64_t strans_us = 0;
+  int64_t pcomp_us = 0;
+  int64_t texup_us = 0;
+  int64_t gio_us = 0;
+  uint64_t last_refresh = 0;  // rex_ge_guest_refresh_count() as of the last poll
+};
+BenchState g_bench;
+
+void BenchStart() {
+  g_bench = BenchState{};
+  g_bench.last_refresh = rex_ge_guest_refresh_count();
+}
+
+// Called once per substituted playback poll. Always records a poll timestamp
+// (frame-time percentiles are derived from poll-to-poll deltas); only adds
+// the four stage totals when the guest-refresh-count has advanced since the
+// last poll, so a guest that polls more than once per frame (see the Task-2
+// probe) can't have these per-frame accumulators double-counted into the
+// running totals.
+void BenchOnPoll() {
+  int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count();
+  g_bench.poll_ts_us.push_back(us);
+
+  uint64_t refresh = rex_ge_guest_refresh_count();
+  if (refresh != g_bench.last_refresh) {
+    g_bench.last_refresh = refresh;
+    g_bench.strans_us += rex::perf::GetSnapshotCounter(rex::perf::CounterId::kShaderTranslateUs);
+    g_bench.pcomp_us += rex::perf::GetSnapshotCounter(rex::perf::CounterId::kPipelineCompileUs);
+    g_bench.texup_us += rex::perf::GetSnapshotCounter(rex::perf::CounterId::kTextureUploadUs);
+    g_bench.gio_us += rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGuestFileIoUs);
+  }
+}
+
+void BenchFinish() {
+  const auto& ts = g_bench.poll_ts_us;
+  if (ts.size() < 2) { REXKRNL_WARN("GEBENCH too short"); return; }
+  std::vector<int64_t> ft;
+  ft.reserve(ts.size() - 1);
+  for (size_t i = 1; i < ts.size(); ++i) ft.push_back(ts[i] - ts[i - 1]);
+  std::sort(ft.begin(), ft.end());
+  // avg is the fps of the *median* poll interval (not a mean of per-poll fps
+  // samples) -- same basis as low1/worst, which are also interval percentiles.
+  // Per the Task-2 probe, polls_per_frame is steady (~1) on both desktop and
+  // arm64, so a poll interval approximates a sim-frame interval.
+  auto fps = [](int64_t us) { return us > 0 ? 1e6 / double(us) : 0.0; };
+  double dur_s = double(ts.back() - ts.front()) / 1e6;
+  int64_t p50 = ft[ft.size() / 2];
+  int64_t p99 = ft[size_t(double(ft.size() - 1) * 0.99)];
+  int64_t worst = ft.back();
+  size_t hitches = size_t(std::count_if(ft.begin(), ft.end(),
+                                        [](int64_t us) { return us > 41667; }));
+  REXKRNL_INFO(
+      "GEBENCH frames={} dur={:.1f}s avg={:.1f} low1={:.1f} worst={:.1f} hitch={} "
+      "strans_ms={:.1f} pcomp_ms={:.1f} texup_ms={:.1f} gio_ms={:.1f}",
+      ft.size(), dur_s, fps(p50), fps(p99), fps(worst), hitches,
+      g_bench.strans_us / 1000.0, g_bench.pcomp_us / 1000.0, g_bench.texup_us / 1000.0,
+      g_bench.gio_us / 1000.0);
+  if (REXCVAR_GET(ge_bench_exit) && g_quit_requester) {
+    g_quit_requester();
+  }
+}
+
 // --- self-test -------------------------------------------------------------
 void RunSelfTest() {
   const std::string path =
@@ -508,6 +604,49 @@ bool ReplayOnGetState(uint32_t user_index, rex::input::X_INPUT_STATE* state) {
     }
   }
 
+  // Replay state machine. Each active state (kMacro/kWaitLevel/kPlaying)
+  // returns directly from this switch, so whenever a replay is armed the
+  // recorder branch below is unreachable this poll -- see the g_state comment
+  // at its declaration for why that's the record/play mutual exclusion.
+  switch (g_state) {
+    case kMacro: {
+      rex::input::X_INPUT_GAMEPAD pad{};
+      g_macro.OnPoll(&pad);
+      state->gamepad = pad;
+      state->packet_number = ++g_packet;
+      if (g_macro.Failed()) { g_state = kDone; break; }
+      if (g_macro.Done()) {
+        g_macro_ran = true;
+        g_state = kWaitLevel;
+      }
+      return true;
+    }
+    case kWaitLevel:
+      // Attract mode sets the in-level flag too (same as the recorder's
+      // guard above); require real menu input OR a completed macro as
+      // evidence of actual navigation before treating this as playback start.
+      if (in_level && (g_saw_menu_input || g_macro_ran)) {
+        g_state = kPlaying;
+        BenchStart();
+        REXKRNL_INFO("GEREPLAY playback started ({} polls)", g_player.remaining());
+      }
+      return false;  // live input passes through until the level starts
+    case kPlaying: {
+      rex::input::X_INPUT_GAMEPAD pad{};
+      if (!g_player.Next(&pad)) {
+        BenchFinish();
+        g_state = kDone;
+        return false;
+      }
+      BenchOnPoll();
+      state->gamepad = pad;
+      state->packet_number = ++g_packet;
+      return true;
+    }
+    default:
+      break;
+  }
+
   // Recording control
   if (g_record_armed) {
     if (!g_recording.load(std::memory_order_relaxed)) {
@@ -524,12 +663,12 @@ bool ReplayOnGetState(uint32_t user_index, rex::input::X_INPUT_STATE* state) {
     }
   }
 
-  return false;  // recorder/replayer land here in later tasks
+  return false;
 }
 
 }  // namespace
 
-void ReplayInit(std::function<void()> quit_requester) {
+void ReplayInit(std::filesystem::path user_data_root, std::function<void()> quit_requester) {
   g_quit_requester = std::move(quit_requester);
 
   if (REXCVAR_GET(ge_replay_selftest)) {
@@ -538,6 +677,35 @@ void ReplayInit(std::function<void()> quit_requester) {
 
   g_record_path = REXCVAR_GET(ge_replay_record);
   g_record_armed = !g_record_path.empty();
+
+  // Resolve playback/macro activation: an explicit cvar wins; otherwise fall
+  // back to well-known files dropped in the user-data root (e.g. adb push,
+  // where there's no config file or CLI to set cvars for an on-device bench
+  // run).
+  std::string play_path = REXCVAR_GET(ge_replay_play);
+  std::string macro_path = REXCVAR_GET(ge_replay_macro);
+  if (play_path.empty()) {
+    auto candidate = user_data_root / "ge_replay.bin";
+    if (std::filesystem::exists(candidate)) {
+      play_path = rex::path_to_utf8(candidate);
+    }
+  }
+  if (macro_path.empty()) {
+    auto candidate = user_data_root / "ge_replay.macro";
+    if (std::filesystem::exists(candidate)) {
+      macro_path = rex::path_to_utf8(candidate);
+    }
+  }
+
+  if (g_record_armed && !play_path.empty()) {
+    // Record and play are mutually exclusive -- leave g_state at kIdle so
+    // ReplayOnGetState's switch falls through to the (armed) recorder branch
+    // untouched.
+    REXKRNL_WARN("GEREPLAY record and play both set; recording wins");
+  } else if (!play_path.empty() && g_player.Open(play_path)) {
+    g_state = (!macro_path.empty() && g_macro.Load(macro_path)) ? kMacro : kWaitLevel;
+  }
+
   if (g_record_armed) {
     std::atexit([] { g_recorder.Close(); });
   }
