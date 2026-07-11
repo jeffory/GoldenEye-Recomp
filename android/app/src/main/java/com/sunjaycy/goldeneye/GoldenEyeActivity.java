@@ -203,31 +203,35 @@ public class GoldenEyeActivity extends NativeActivity {
                 return;
             }
             File destDir = new File(getExternalFilesDir(null), "cache/shaders/shareable");
+            byte[] buf = new byte[65536];
             for (String name : names) {
-                File dest = new File(destDir, name);
-                if (dest.exists()) {
-                    continue;
-                }
-                if (!destDir.isDirectory() && !destDir.mkdirs()) {
-                    Log.w(TAG, "shader seed: cannot create " + destDir);
-                    return;
-                }
-                File tmp = new File(destDir, name + ".tmp");
-                long bytes = 0;
-                try (InputStream in = getAssets().open("shader_seed/" + name);
-                     OutputStream out = new FileOutputStream(tmp)) {
-                    byte[] buf = new byte[65536];
-                    int n;
-                    while ((n = in.read(buf)) > 0) {
-                        out.write(buf, 0, n);
-                        bytes += n;
+                try {
+                    File dest = new File(destDir, name);
+                    if (dest.exists()) {
+                        continue;
                     }
-                }
-                if (tmp.renameTo(dest)) {
-                    Log.i(TAG, "shader seed: copied " + name + " (" + bytes + " bytes)");
-                } else {
-                    Log.w(TAG, "shader seed: rename failed for " + name);
-                    tmp.delete();
+                    if (!destDir.isDirectory() && !destDir.mkdirs()) {
+                        Log.w(TAG, "shader seed: cannot create " + destDir);
+                        return;
+                    }
+                    File tmp = new File(destDir, name + ".tmp");
+                    long bytes = 0;
+                    try (InputStream in = getAssets().open("shader_seed/" + name);
+                         OutputStream out = new FileOutputStream(tmp)) {
+                        int n;
+                        while ((n = in.read(buf)) != -1) {
+                            out.write(buf, 0, n);
+                            bytes += n;
+                        }
+                    }
+                    if (tmp.renameTo(dest)) {
+                        Log.i(TAG, "shader seed: copied " + name + " (" + bytes + " bytes)");
+                    } else {
+                        Log.w(TAG, "shader seed: rename failed for " + name);
+                        tmp.delete();
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "shader seed: copy failed for " + name + " (continuing)", t);
                 }
             }
         } catch (Throwable t) {
