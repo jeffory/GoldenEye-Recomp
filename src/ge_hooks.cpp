@@ -20,6 +20,7 @@
 #include "ge_gamestate.h"  // ge::gamestate::OnFrame (game-state bridge pump)
 #include "ge_dualscreen.h"  // ge::DualScreen (second-screen weapon menu pacing)
 #include "ge_touchpad.h"    // ge::TouchPad (on-screen touch controls -> guest pad)
+#include "ge_hooks.h"  // ge::GeInLevel() declaration (defined below)
 #include <rex/cvar.h>  // REXCVAR_DEFINE_BOOL / REXCVAR_GET (ge_freeze_diag)
 #include <rex/perf/counter.h>  // rex::perf frame-stage counters (GESPIKE)
 #include <rex/hook.h>  // ThreadState, kernel_state, memory
@@ -2252,3 +2253,27 @@ void ge_ce_watch_sfx_save() {
   ctx->r4.u32 = ctx->r4.u32 + ctx->r4.u32;
   ge_cont_82184E48(*ctx, base);
 }
+
+// GeInLevel(): declared in ge_hooks.h for ge_replay.cpp's poll-cadence probe
+// (tags each GEREPLAY PROBE line with menu vs. in-level context). Reads the
+// same solo-fullscreen-view guest global (0x8272B424 == 3) as the readers at
+// ge_ce_remote_weapon_sfx/ge_ce_play_at_location above (~line 2119/2146), and
+// reuses this file's LD32 helper verbatim. Unlike those readers -- which run
+// only from inside a guest hook with a live PPCContext, so getcb()'s direct
+// kernel_state()->memory()->virtual_membase() is always safe there -- this
+// accessor is invoked from the input-override callback and must not assume a
+// guest thread context is fully live, so it guards the chain the same way
+// ge_cp()/ge_gs() above (~line 156) guard against a not-yet-initialized
+// kernel/graphics system: null-check every link, false (not a crash) if any
+// is missing.
+namespace ge {
+bool GeInLevel() {
+  auto* ks = rex::system::kernel_state();
+  if (!ks) return false;
+  auto* mem = ks->memory();
+  if (!mem) return false;
+  uint8_t* base = mem->virtual_membase();
+  if (!base) return false;
+  return LD32(base, 0x8272B424u) == 3u;
+}
+}  // namespace ge
