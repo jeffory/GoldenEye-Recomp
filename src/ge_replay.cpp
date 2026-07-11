@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -67,6 +68,9 @@ REXCVAR_DEFINE_BOOL(ge_bench_exit, false, "GE",
 // display" comment) and would corrupt the polls_per_frame ratio if the host
 // ever drops presents.
 extern "C" uint64_t rex_ge_guest_refresh_count();
+
+namespace ge {
+namespace {
 
 #pragma pack(push, 1)
 struct ReplayHeader {
@@ -150,9 +154,6 @@ class Player {
   size_t next_ = 0;
 };
 
-namespace ge {
-namespace {
-
 std::function<void()> g_quit_requester;
 
 // --- recording state -------------------------------------------------------
@@ -164,7 +165,8 @@ bool g_saw_menu_input = false;
 
 // --- self-test -------------------------------------------------------------
 void RunSelfTest() {
-  const std::string path = "/tmp/claude-1000/-home-keith-Projects-GoldenEye-Recomp/e13e463a-cbdf-4b94-a278-02419ca85208/scratchpad/ge_replay_selftest.bin";
+  const std::string path =
+      (std::filesystem::temp_directory_path() / "ge_replay_selftest.bin").string();
   Recorder rec;
   if (!rec.Open(path)) {
     REXKRNL_ERROR("GEREPLAY SELFTEST FAIL (open)");
@@ -230,19 +232,21 @@ bool ReplayOnGetState(uint32_t user_index, rex::input::X_INPUT_STATE* state) {
     ProbeOnPoll();
   }
 
+  const bool in_level = GeInLevel();
+
   // Track menu input to gate recording (Attract mode sets the in-level flag too;
   // require real menu input first so an idle title screen can't start the recording.)
-  if (!GeInLevel()) {
+  // Sticks need real deflection (~25%) so ADC drift on an idle pad can't arm us.
+  if (!in_level) {
     if (state->gamepad.buttons || state->gamepad.left_trigger || state->gamepad.right_trigger ||
-        state->gamepad.thumb_lx || state->gamepad.thumb_ly ||
-        state->gamepad.thumb_rx || state->gamepad.thumb_ry) {
+        std::abs(int(state->gamepad.thumb_lx)) > 8000 || std::abs(int(state->gamepad.thumb_ly)) > 8000 ||
+        std::abs(int(state->gamepad.thumb_rx)) > 8000 || std::abs(int(state->gamepad.thumb_ry)) > 8000) {
       g_saw_menu_input = true;
     }
   }
 
   // Recording control
   if (g_record_armed) {
-    bool in_level = GeInLevel();
     if (!g_recording.load(std::memory_order_relaxed)) {
       if (in_level && g_saw_menu_input && g_recorder.Open(g_record_path)) {
         g_recording.store(true, std::memory_order_relaxed);
