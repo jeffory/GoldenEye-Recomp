@@ -1265,6 +1265,12 @@ constexpr uint32_t GE_OFF_GUN_X     = 0x10BCu;      // gun X
 constexpr uint32_t GE_OFF_GUN_Y     = 0x10C0u;      // gun Y
 constexpr uint32_t GE_OFF_AIM_MODE  = 0x22Cu;       // aim-mode (1 = aiming)
 constexpr uint32_t GE_OFF_AIM_MULT  = 0x11ACu;      // aim-turn multiplier (slows when zoomed)
+constexpr uint32_t GE_IN_TANK_FLAG  = 0x82F1F8D4u;  // authoritative mounted-state flag
+constexpr uint32_t GE_PLAYER_TANK_PROP = 0x82F1F8DCu;
+constexpr uint32_t GE_TANK_TURRET_RAD  = 0x82F1F900u;
+constexpr uint32_t GE_TANK_TURRET_ACCUM = 0x82F1F904u;
+constexpr uint32_t GE_TANK_TURRET_TARGET = 0x82F1F910u;
+constexpr uint32_t GE_TANK_TURRET_RECIP = 0x82003C64u; // 1 / (1 - smoothing)
 enum GESettingFlag {
   GE_SET_AutoAim   = 0x10,
   GE_SET_LookAhead = 0x80,
@@ -1765,6 +1771,47 @@ void ge_mouse_camera(uint8_t* base) {
 
   if (game_control_disabled) return;
 
+  // The ordinary camera yaw is rebuilt from the tank body + turret every
+  // simulation tick, so writing player->vv_theta (the on-foot mouse path)
+  // cannot turn the tank horizontally. Shift both the native turret target and
+  // its smoothed current value by the same mouse delta instead. This preserves
+  // the game's steering, collision rollback, controller input, and interpolation
+  // while making mouse-X act on the same turret state that native tank controls
+  // ultimately drive. The accumulator uses the reciprocal constant from this
+  // exact XBLA build rather than assuming the N64 smoothing rate.
+  //
+  // Fork note (vs. upstream PR #116): our camera/crosshair paths consume the
+  // EMA-smoothed delta cdx (ge_mouse_smooth), not the raw mdx upstream used --
+  // see the smoothing block above. Drive the turret from cdx so tank aim gets
+  // the same feel as on-foot aim, and zero look_cdx (not mdx, which the menu
+  // cursor above still needs) so only the on-foot yaw path below is skipped.
+  // At the default ge_mouse_smooth=0, cdx == mdx and this is identical to
+  // upstream.
+  const bool in_tank = LD32(base, GE_IN_TANK_FLAG) == 1u &&
+                       LD32(base, GE_PLAYER_TANK_PROP) != 0u;
+  float look_cdx = cdx;
+  if (in_tank && cdx != 0.f) {
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kTau = 2.f * kPi;
+    const float delta_rad =
+        (invert_x ? -1.f : 1.f) * (cdx / 10.f) * sensitivity * (kPi / 180.f);
+    auto wrap_tau = [kTau](float angle) {
+      angle = std::fmod(angle, kTau);
+      if (angle < 0.f) angle += kTau;
+      return angle;
+    };
+
+    const float target =
+        wrap_tau(LDF32(base, GE_TANK_TURRET_TARGET) + delta_rad);
+    const float current =
+        wrap_tau(LDF32(base, GE_TANK_TURRET_RAD) + delta_rad);
+    STF32(base, GE_TANK_TURRET_TARGET, target);
+    STF32(base, GE_TANK_TURRET_RAD, current);
+    STF32(base, GE_TANK_TURRET_ACCUM,
+          current * LDF32(base, GE_TANK_TURRET_RECIP));
+    look_cdx = 0.f;  // do not also write the transient on-foot camera yaw
+  }
+
   const uint32_t aim_mode = LD32(base, player + GE_OFF_AIM_MODE);
   if (aim_mode != prev_aim_mode) {
     if (aim_mode != 0) {  // entering aim mode -> reset gun position
@@ -1829,14 +1876,14 @@ void ge_mouse_camera(uint8_t* base) {
       }
     }
 
-    if (cdx != 0.f || cdy != 0.f) {
+    if (look_cdx != 0.f || cdy != 0.f) {
       float camX = LDF32(base, player + GE_OFF_CAM_X);
       float camY = LDF32(base, player + GE_OFF_CAM_Y);
 
-      camX += (invert_x ? -1.f : 1.f) * (cdx / 10.f) * sensitivity;
+      camX += (invert_x ? -1.f : 1.f) * (look_cdx / 10.f) * sensitivity;
 
       // Add 'sway' to the gun as the camera turns.
-      const float gun_sway_x = ((cdx / 16000.f) * sensitivity) * bounds;
+      const float gun_sway_x = ((look_cdx / 16000.f) * sensitivity) * bounds;
       const float gun_sway_y = ((cdy / 16000.f) * sensitivity) * bounds;
       float gun_sway_x_changed = gX + gun_sway_x;
       float gun_sway_y_changed = gY + gun_sway_y;
