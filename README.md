@@ -25,6 +25,10 @@ the game runs as a real native executable.
 - **Weapon quick select** — instant switching via number keys / scroll wheel on
   PC, or a touch menu on the second screen of dual-screen Android handhelds.
   See [Weapon quick select](#weapon-quick-select).
+- **Restored music** the Xbox 360 build shipped but never played — the 007
+  watch/pause theme, Mission Select music after a mission ends, and the
+  Control/Caverns elevator tracks. Plays from your own music banks via the
+  game's native audio system.
 - Smooth, stable 60 FPS (recompiled, with GPU-pacing fixes for the original's
   frame timing).
 
@@ -164,6 +168,29 @@ source lives in [`src/`](src/):
 `ge_app` (app + window/menus glue), `ge_menu` (pause/settings menu),
 `ge_hooks` (mid-asm fixups), `ge_postfx` (filters). `ge_manifest.toml` /
 `ge_config.toml` drive the recompiler.
+
+## Credits
+
+Huge thanks to **[mrfox-1](https://github.com/mrfox-1)** for the community fixes
+this build ships:
+
+- **Restored native XACT music transitions** — the watch/pause theme, Mission
+  Select music, and the Control/Caverns elevator tracks. The Xbox 360 build left
+  the `music_xtrack_play` / `music_xtrack_stop` script opcodes as printf-only
+  stubs; mrfox-1 reverse-engineered the mission-music state machine and the
+  logical-cue translation table to wire them back up, so the music plays from
+  your own banks through the game's own audio system.
+  ([upstream PR #114](https://github.com/SunJaycy/GoldenEye-Recomp/pull/114))
+- **Tank turret mouse aiming** — horizontal aim while mounted, which the ordinary
+  mouse path could never do because the game rebuilds the camera yaw from the
+  turret every tick.
+  ([upstream PR #116](https://github.com/SunJaycy/GoldenEye-Recomp/pull/116))
+
+Both were adapted to this fork; the reverse-engineering behind them is theirs.
+Original work: [GoldenEye-Recomp-Watch-Music-Fix](https://github.com/mrfox-1/GoldenEye-Recomp-Watch-Music-Fix).
+
+The community DATA/code bug-fixes are from the **BeanTools / GoldenEye
+Community Edition** patch set.
 
 ## Legal
 
