@@ -2,18 +2,28 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship Linux release bundles that load on Steam Deck (and any distro back to glibc 2.36) by building them in a Debian 12 container instead of natively on Fedora 44, with an ABI floor gate that prevents the regression from recurring.
+**Goal:** Ship Linux release bundles that load on Steam Deck (and any distro back to glibc 2.39) by building them in an Ubuntu 24.04 container instead of natively on Fedora 44, with an ABI floor gate that prevents the regression from recurring.
 
 **Architecture:** Four new files in the game repo — a Dockerfile, a container build script, an ABI floor checker, and a bundle smoke test — composed by the existing `scripts/cut-release.sh`. No `.cpp` changes and no SDK changes. The build runs under rootless podman with a shadowing bind mount over `/sdk/out` so container artifacts never clobber the native dev build.
 
-**Tech Stack:** podman (rootless), Debian 12 (`debian:12`), clang-19 + lld-19 from apt.llvm.org, libstdc++-12, CMake 3.31, Ninja, GNU binutils (`objdump`), bash.
+**Tech Stack:** podman (rootless), Ubuntu 24.04 (`ubuntu:24.04`), clang-19 + lld-19 from apt.llvm.org, g++-13/libstdc++-13, CMake 3.31, Ninja, GNU binutils (`objdump`), bash.
 
 **Spec:** `docs/superpowers/specs/2026-08-04-linux-release-container-design.md`
 
+> **Base image retooled 2026-08-04 (Task 4b):** this plan was originally written and mostly
+> executed against **Debian 12** (`debian:12`, `GLIBC` ≤ 2.36, `GLIBCXX` ≤ 3.4.30, image tag
+> `goldeneye-linux-release:bookworm`). Task 4's real container build failed: the SDK
+> specializes `std::chrono::clock_time_conversion`, and Debian 12's `libstdc++-12` does not
+> declare that template at all — a compile error, not a too-new-symbol problem — and the
+> plan's documented fallback (`libstdc++-13` from bookworm-backports) does not exist on
+> bookworm. The base moved to **Ubuntu 24.04**, which ships `g++-13`/`libstdc++-13-dev` in
+> `main`. The values below are updated to match; the task narrative further down is kept
+> as-executed for history, with values corrected in place.
+
 ## Global Constraints
 
-- ABI floor for all shipped Linux binaries: **`GLIBC` ≤ 2.36**, **`GLIBCXX` ≤ 3.4.30**. Overridable via `ABI_MAX_GLIBC` / `ABI_MAX_GLIBCXX`.
-- Base image is **`debian:12`**. Do not substitute a newer base — it raises the floor.
+- ABI floor for all shipped Linux binaries: **`GLIBC` ≤ 2.39**, **`GLIBCXX` ≤ 3.4.33**. Overridable via `ABI_MAX_GLIBC` / `ABI_MAX_GLIBCXX`.
+- Base image is **`ubuntu:24.04`**. Do not substitute a different base without re-checking the floor against SteamOS.
 - **No changes to any `.cpp`/`.h` file, to `CMakePresets.json`, or to the SDK repo.** The fix is entirely build-environment.
 - Container runtime is **podman** (rootless). Docker is installed but is not a requirement.
 - Use `--security-opt label=disable`, **never** `:z`/`:Z` mount flags — the latter recursively relabel the user's source repos on SELinux.
@@ -26,7 +36,7 @@
 
 ### Task 1: Measure the Steam Deck baseline
 
-Establishes that the 2.36 / 3.4.30 ceiling actually sits below SteamOS. If the Deck turns out to be *below* 2.36, the whole base-image choice changes, so this runs first.
+Establishes that the 2.39 / 3.4.33 ceiling actually sits below SteamOS. If the Deck turns out to be *below* 2.39, the whole base-image choice changes, so this runs first.
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-08-04-linux-release-container-design.md` (record measured values)
@@ -49,11 +59,11 @@ Record all three lines.
 
 - [ ] **Step 2: Confirm the ceiling is below SteamOS**
 
-The measured glibc must be **≥ 2.36** and the measured `GLIBCXX_3.4.*` must be **≥ 3.4.30**.
+The measured glibc must be **≥ 2.39** and the measured `GLIBCXX_3.4.*` must be **≥ 3.4.33**.
 
 - If both hold: the plan proceeds unchanged.
-- If glibc < 2.36: STOP. Report to the user — the base image must drop to Ubuntu 22.04 (2.35) or the Steam Runtime `sniper` image (2.31), which changes Task 3.
-- If `GLIBCXX` < 3.4.30: STOP and report — `libstdc++-11` or `libc++` would be needed.
+- If glibc < 2.39: STOP. Report to the user — the base image must drop to Ubuntu 22.04 (2.35) or the Steam Runtime `sniper` image (2.31), which changes Task 3.
+- If `GLIBCXX` < 3.4.33: STOP and report — `libstdc++-11` or `libc++` would be needed.
 
 - [ ] **Step 3: Record the measurement in the spec**
 
@@ -61,7 +71,7 @@ Add to the "Testing" section of the spec, under the "Baseline measurement" parag
 
 ```markdown
 **Measured 2026-08-04 on the Steam Deck (SteamOS <version>):** glibc <X.YZ>, GLIBCXX_3.4.<N>,
-CXXABI_1.3.<M>. The 2.36 / 3.4.30 ceiling therefore sits <D> glibc releases below the target.
+CXXABI_1.3.<M>. The 2.39 / 3.4.33 ceiling therefore sits <D> glibc releases below the target.
 ```
 
 - [ ] **Step 4: Commit**
@@ -82,7 +92,7 @@ The regression gate. Built first (before anything that produces binaries) becaus
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: `scripts/check-abi-floor.sh <binary> [<binary> ...]` — exit `0` when every binary is within the floor, `1` when one exceeds it (offending symbols printed to stderr), `2` on usage/tooling error. Reads `ABI_MAX_GLIBC` (default `2.36`) and `ABI_MAX_GLIBCXX` (default `3.4.30`).
+- Produces: `scripts/check-abi-floor.sh <binary> [<binary> ...]` — exit `0` when every binary is within the floor, `1` when one exceeds it (offending symbols printed to stderr), `2` on usage/tooling error. Reads `ABI_MAX_GLIBC` (default `2.39`) and `ABI_MAX_GLIBCXX` (default `3.4.33`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -165,17 +175,17 @@ Create `scripts/check-abi-floor.sh`:
 # regression at release time instead of on a player's device.
 #
 # Usage: scripts/check-abi-floor.sh <binary> [<binary> ...]
-# Env:   ABI_MAX_GLIBC   (default 2.36)     ABI_MAX_GLIBCXX (default 3.4.30)
+# Env:   ABI_MAX_GLIBC   (default 2.39)     ABI_MAX_GLIBCXX (default 3.4.33)
 set -euo pipefail
 
-MAX_GLIBC="${ABI_MAX_GLIBC:-2.36}"
-MAX_GLIBCXX="${ABI_MAX_GLIBCXX:-3.4.30}"
+MAX_GLIBC="${ABI_MAX_GLIBC:-2.39}"
+MAX_GLIBCXX="${ABI_MAX_GLIBCXX:-3.4.33}"
 
 [ $# -gt 0 ] || { echo "usage: $0 <binary> [<binary> ...]" >&2; exit 2; }
 command -v objdump >/dev/null 2>&1 || { echo "error: objdump not found (install binutils)" >&2; exit 2; }
 
 # ver_gt A B -> true when A is strictly newer than B, compared component-wise.
-# `sort -V` is what makes 2.9 < 2.36 and 3.4.9 < 3.4.30 come out right; a plain
+# `sort -V` is what makes 2.9 < 2.39 and 3.4.9 < 3.4.33 come out right; a plain
 # string compare gets both backwards.
 ver_gt() {
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
@@ -249,7 +259,7 @@ git commit -m "build: add ABI floor gate for Linux release binaries (#12)"
 
 **Interfaces:**
 - Consumes: floor values confirmed in Task 1
-- Produces: image tag `goldeneye-linux-release:bookworm` with `clang`, `clang++`, `ld.lld`, `cmake`, `ninja`, `pkg-config` on `PATH` and GTK3 dev headers installed; workdir `/work`
+- Produces: image tag `goldeneye-linux-release:noble` with `clang`, `clang++`, `ld.lld`, `cmake`, `ninja`, `pkg-config` on `PATH` and GTK3 dev headers installed; workdir `/work`
 
 - [ ] **Step 1: Write the Dockerfile**
 
@@ -258,12 +268,12 @@ Create `docker/linux-release.Dockerfile`:
 ```dockerfile
 # Build image for shipped Linux releases.
 #
-# Debian 12 pins the ABI floor at glibc 2.36 / GLIBCXX_3.4.30 — below SteamOS (Steam Deck)
+# Ubuntu 24.04 pins the ABI floor at glibc 2.39 / GLIBCXX_3.4.33 — below SteamOS (Steam Deck)
 # and every currently-supported distro. Building releases here instead of on the Fedora 44
 # host is the fix for issue #12. Do not bump the base image without re-checking the floor.
 #
 # See docs/superpowers/specs/2026-08-04-linux-release-container-design.md
-FROM debian:12
+FROM ubuntu:24.04
 
 ARG LLVM_VERSION=19
 ARG CMAKE_VERSION=3.31.6
@@ -276,12 +286,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates wget gnupg \
       ninja-build pkg-config python3 git file binutils \
-      libstdc++-12-dev libgtk-3-dev \
+      g++-13 libstdc++-13-dev libgtk-3-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# Debian 12's stock clang-14 cannot do -std=c++23, which the project requires.
+# Ubuntu 24.04's stock clang cannot do -std=c++23 the way the project needs; pull clang-19
+# from apt.llvm.org's noble repo instead.
 RUN wget -qO /usr/share/keyrings/llvm.asc https://apt.llvm.org/llvm-snapshot.gpg.key \
- && echo "deb [signed-by=/usr/share/keyrings/llvm.asc] http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-${LLVM_VERSION} main" \
+ && echo "deb [signed-by=/usr/share/keyrings/llvm.asc] http://apt.llvm.org/noble/ llvm-toolchain-noble-${LLVM_VERSION} main" \
       > /etc/apt/sources.list.d/llvm.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends "clang-${LLVM_VERSION}" "lld-${LLVM_VERSION}" \
@@ -290,7 +301,7 @@ RUN wget -qO /usr/share/keyrings/llvm.asc https://apt.llvm.org/llvm-snapshot.gpg
  && ln -sf "/usr/bin/clang++-${LLVM_VERSION}" /usr/bin/clang++ \
  && ln -sf "/usr/bin/ld.lld-${LLVM_VERSION}"  /usr/bin/ld.lld
 
-# Debian 12 ships cmake 3.25.1, which only barely satisfies the project's
+# Ubuntu 24.04 ships cmake 3.28.3, which only barely satisfies the project's
 # cmake_minimum_required(VERSION 3.25). Use a current upstream build instead.
 RUN wget -qO /tmp/cmake.tar.gz \
       "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" \
@@ -303,12 +314,12 @@ WORKDIR /work
 
 - [ ] **Step 2: Build the image**
 
-Run: `podman build -f docker/linux-release.Dockerfile -t goldeneye-linux-release:bookworm .`
-Expected: builds clean. First run pulls `debian:12` and takes several minutes.
+Run: `podman build -f docker/linux-release.Dockerfile -t goldeneye-linux-release:noble .`
+Expected: builds clean. First run pulls `ubuntu:24.04` and takes several minutes.
 
 - [ ] **Step 3: Verify the toolchain and the floor it produces**
 
-This is the test that the image is fit for purpose — it proves `libstdc++-12` handles the C++23 the codebase actually uses (`std::expected`, `std::atomic::wait/notify`) *and* that what it emits is inside the floor.
+This is the test that the image is fit for purpose — it proves `libstdc++-13` handles the C++23 the codebase actually uses (`std::expected`, `std::atomic::wait/notify`) *and* that what it emits is inside the floor.
 
 ```bash
 cat > /tmp/abi-probe.cpp <<'EOF'
@@ -330,21 +341,34 @@ int main() {
   printf("%d %f %f\n", f(true).value(), sqrtf(x), atan2f(x, x));
 }
 EOF
-podman run --rm --security-opt label=disable -v /tmp:/t goldeneye-linux-release:bookworm \
+podman run --rm --security-opt label=disable -v /tmp:/t goldeneye-linux-release:noble \
   bash -c 'clang++ --version | head -1 && cmake --version | head -1 &&
            clang++ -std=c++23 -O2 /t/abi-probe.cpp -o /t/abi-probe && echo BUILD_OK'
 scripts/check-abi-floor.sh /tmp/abi-probe
 ```
 
 Expected: `clang version 19.x`, `cmake version 3.31.6`, `BUILD_OK`, then `ABI floor OK`.
-If `<expected>` fails to compile, fall back to `libstdc++-13` from bookworm-backports and set `ABI_MAX_GLIBCXX=3.4.32` — see the spec's Risks section.
+
+**Historical note:** this step originally targeted `debian:12` with `libstdc++-12`, and its
+documented fallback for a compile failure was "pull `libstdc++-13` from bookworm-backports and
+set `ABI_MAX_GLIBCXX=3.4.32`." That fallback does not exist — `apt-cache policy
+libstdc++-13-dev` returns an empty candidate on bookworm — and the real failure was worse than
+a too-new-symbol problem anyway: the SDK's `std::chrono::clock_time_conversion` specialization
+does not compile at all against `libstdc++-12`, because that template isn't declared there. See
+the spec's Risks section ("RESOLVED — libstdc++-12 could not compile the SDK's C++23...") for
+the full account. `libstdc++-13` is now the *primary* toolchain (via Ubuntu 24.04), not a
+fallback.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add docker/linux-release.Dockerfile
-git commit -m "build: add Debian 12 release container image (glibc 2.36 floor)"
+git commit -m "build: add Ubuntu 24.04 release container image (glibc 2.39 floor)"
 ```
+
+(The commit that actually landed for this step, `023b1a3`, predates the Task 4b retool and
+reads `"build: add Debian 12 release container image (glibc 2.36 floor)"` — real git history,
+left as-is. The Dockerfile retool itself is a separate, later commit.)
 
 ---
 
@@ -354,7 +378,7 @@ git commit -m "build: add Debian 12 release container image (glibc 2.36 floor)"
 - Create: `scripts/build-linux-container.sh`
 
 **Interfaces:**
-- Consumes: image `goldeneye-linux-release:bookworm` (Task 3)
+- Consumes: image `goldeneye-linux-release:noble` (Task 3)
 - Produces: `scripts/build-linux-container.sh [--sdk DIR] [--rebuild-image] [-j N]`. On success leaves the binary at `out/build/linux-amd64-container/GoldenEye` and the SDK shared objects in `$SDK_DIR/out-container/`. Both paths are fixed and callers derive them directly; the trailing `GE_BIN=` / `SDK_OUT=` lines it prints are informational only, for humans reading a release log.
 
 - [ ] **Step 1: Write the script**
@@ -363,18 +387,18 @@ Create `scripts/build-linux-container.sh`:
 
 ```bash
 #!/usr/bin/env bash
-# Build the Linux amd64 `ge` binary inside the Debian 12 release container.
+# Build the Linux amd64 `ge` binary inside the Ubuntu 24.04 release container.
 #
 # Building on the Fedora 44 host pins the artifacts to glibc 2.43 / GLIBCXX_3.4.35, which
-# will not load on a Steam Deck (issue #12). This builds against Debian 12's glibc 2.36 /
-# libstdc++-12 instead. No source changes are involved — only the toolchain differs.
+# will not load on a Steam Deck (issue #12). This builds against Ubuntu 24.04's glibc 2.39 /
+# libstdc++-13 instead. No source changes are involved — only the toolchain differs.
 #
 # Usage: scripts/build-linux-container.sh [--sdk DIR] [--rebuild-image] [-j N]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK_DIR="/home/keith/Projects/GoldenEye-Recomp-rexglue"
-IMAGE="goldeneye-linux-release:bookworm"
+IMAGE="goldeneye-linux-release:noble"
 DOCKERFILE="$ROOT/docker/linux-release.Dockerfile"
 BUILD_SUBDIR="out/build/linux-amd64-container"
 REBUILD_IMAGE=0
@@ -454,7 +478,7 @@ cat /tmp/native-sdk-before.txt
 Run: `scripts/build-linux-container.sh`
 Expected: image reused from Task 3, CMake configures, Ninja builds, final output ends with `GE_BIN=.../out/build/linux-amd64-container/GoldenEye` and `SDK_OUT=.../out-container`. This is a cold full rebuild of SDK + game and will take a while.
 
-If CMake fails on a missing C++23 library feature, that is the known `libstdc++-12` risk — apply the `libstdc++-13` fallback from Task 3 Step 3 and re-run.
+If CMake fails on a missing C++23 library feature, that is the known `libstdc++-13` risk — apply the `libstdc++-13` fallback from Task 3 Step 3 and re-run.
 
 - [ ] **Step 4: Verify the produced binaries are within the floor**
 
@@ -496,7 +520,7 @@ git commit -m "build: add containerized Linux release build script"
 
 **Interfaces:**
 - Consumes: an assembled bundle directory containing `ge` and the SDK `.so` files
-- Produces: `scripts/smoke-test-bundle.sh <bundle-dir>` — exit `0` when every library resolves inside a stock `debian:12` runtime, `1` when any is `not found`, `2` on usage error
+- Produces: `scripts/smoke-test-bundle.sh <bundle-dir>` — exit `0` when every library resolves inside a stock `ubuntu:24.04` runtime, `1` when any is `not found`, `2` on usage error
 
 - [ ] **Step 1: Write the script**
 
@@ -506,7 +530,7 @@ Create `scripts/smoke-test-bundle.sh`:
 #!/usr/bin/env bash
 # Prove an assembled Linux bundle loads on a stock old distro, without needing one.
 #
-# Runs `ldd` against the bundle inside a clean debian:12 container carrying only *runtime*
+# Runs `ldd` against the bundle inside a clean ubuntu:24.04 container carrying only *runtime*
 # packages (no -dev). Anything reported "not found" is a dependency the shipped tarball
 # would fail on. This verifies loading only; it does not launch the game, which needs a GPU
 # and game assets.
@@ -521,8 +545,8 @@ BUNDLE="$(cd "$BUNDLE" && pwd)"
 
 command -v podman >/dev/null 2>&1 || { echo "error: podman not found" >&2; exit 2; }
 
-echo "==> Resolving bundle deps in a clean debian:12 runtime"
-out="$(podman run --rm --security-opt label=disable -v "$BUNDLE":/bundle:ro debian:12 \
+echo "==> Resolving bundle deps in a clean ubuntu:24.04 runtime"
+out="$(podman run --rm --security-opt label=disable -v "$BUNDLE":/bundle:ro ubuntu:24.04 \
   bash -euo pipefail -c '
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >/dev/null
@@ -534,12 +558,12 @@ echo "$out"
 
 if printf '%s\n' "$out" | grep -q 'not found'; then
   echo >&2
-  echo "FAIL: unresolved libraries on a stock debian:12 — this bundle will not load" >&2
+  echo "FAIL: unresolved libraries on a stock ubuntu:24.04 — this bundle will not load" >&2
   printf '%s\n' "$out" | grep 'not found' >&2
   exit 1
 fi
 
-echo "SMOKE TEST OK: all libraries resolve on stock debian:12"
+echo "SMOKE TEST OK: all libraries resolve on stock ubuntu:24.04"
 ```
 
 ```bash
@@ -549,7 +573,7 @@ chmod +x scripts/smoke-test-bundle.sh
 - [ ] **Step 2: Run it against the known-bad v1.6.0 bundle**
 
 Run: `scripts/smoke-test-bundle.sh dist/bundle`
-Expected: FAIL. Debian 12's libm/libstdc++ cannot satisfy `GLIBC_2.43`/`GLIBCXX_3.4.35`, so `ldd` reports `not found`. This confirms the smoke test detects the real defect rather than passing vacuously.
+Expected: FAIL. Ubuntu 24.04's libm/libstdc++ cannot satisfy `GLIBC_2.43`/`GLIBCXX_3.4.35`, so `ldd` reports `not found`. This confirms the smoke test detects the real defect rather than passing vacuously.
 
 - [ ] **Step 3: Assemble a bundle from the container build**
 
@@ -566,13 +590,13 @@ ls -la /tmp/ge-bundle
 - [ ] **Step 4: Run the smoke test against it**
 
 Run: `scripts/smoke-test-bundle.sh /tmp/ge-bundle`
-Expected: `SMOKE TEST OK: all libraries resolve on stock debian:12`.
+Expected: `SMOKE TEST OK: all libraries resolve on stock ubuntu:24.04`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add scripts/smoke-test-bundle.sh
-git commit -m "build: add bundle link smoke test against stock debian:12"
+git commit -m "build: add bundle link smoke test against stock ubuntu:24.04"
 ```
 
 ---
@@ -604,7 +628,7 @@ USE_CONTAINER=1
 Update the usage comment at the top of the file (`:8-16`) to list the flag:
 
 ```bash
-#   --no-container Build the Linux bundle natively instead of in the Debian 12
+#   --no-container Build the Linux bundle natively instead of in the Ubuntu 24.04
 #                  container. The native build is pinned to this host's glibc and
 #                  will NOT run on Steam Deck or older distros (issue #12).
 ```
@@ -627,10 +651,10 @@ Replace `scripts/cut-release.sh:118-124` (from the `# --- build: Linux amd64` co
 
 ```bash
 # --- build: Linux amd64 release bundle -------------------------------------
-# Built in the Debian 12 container by default: a native Fedora build inherits this
+# Built in the Ubuntu 24.04 container by default: a native Fedora build inherits this
 # host's glibc 2.43 / GLIBCXX_3.4.35 floor and will not load on a Steam Deck (#12).
 if [ "$USE_CONTAINER" -eq 1 ]; then
-  step "Building Linux amd64 in the release container (glibc 2.36 floor)"
+  step "Building Linux amd64 in the release container (glibc 2.39 floor)"
   "$ROOT/scripts/build-linux-container.sh" --sdk "$SDK_DIR"
   GE_BIN="$(find out/build/linux-amd64-container -maxdepth 1 -type f \( -name GoldenEye -o -name ge \) | head -1)"
   SDK_LIB_DIR="$SDK_DIR/out-container"
@@ -668,7 +692,7 @@ if [ "$USE_CONTAINER" -eq 1 ]; then
   "$ROOT/scripts/check-abi-floor.sh" "$BUNDLE"/ge "$BUNDLE"/*.so \
     || die "release binaries exceed the ABI floor — see issue #12"
   "$ROOT/scripts/smoke-test-bundle.sh" "$BUNDLE" \
-    || die "bundle failed to resolve its libraries on stock debian:12"
+    || die "bundle failed to resolve its libraries on stock ubuntu:24.04"
 else
   echo "WARNING: --no-container build; skipping ABI floor + smoke checks." >&2
   echo "         Do NOT publish this bundle — it is pinned to this host's glibc." >&2
@@ -691,11 +715,11 @@ Append this section to `docs/RELEASING.md`:
 ```markdown
 ## Linux builds and the ABI floor
 
-Linux release bundles are built inside a Debian 12 container, not on the host. A native
+Linux release bundles are built inside an Ubuntu 24.04 container, not on the host. A native
 Fedora build links against this workstation's glibc 2.43 / GLIBCXX_3.4.35 and will not load
 on a Steam Deck or any older distro — that was issue #12, where v1.6.0 failed with
-`version 'GLIBC_2.43' not found`. The container pins the floor at **glibc 2.36 /
-GLIBCXX_3.4.30**, below SteamOS and every currently-supported distro.
+`version 'GLIBC_2.43' not found`. The container pins the floor at **glibc 2.39 /
+GLIBCXX_3.4.33**, below SteamOS and every currently-supported distro.
 
 `cut-release.sh` does this automatically. Two checks gate the release, both before the tag
 is pushed:
@@ -703,7 +727,7 @@ is pushed:
 - `scripts/check-abi-floor.sh` — fails if any shipped binary needs a symbol version above
   the floor.
 - `scripts/smoke-test-bundle.sh` — fails if the bundle cannot resolve its libraries inside
-  a stock `debian:12` runtime.
+  a stock `ubuntu:24.04` runtime.
 
 ### If the floor gate fails
 
@@ -729,7 +753,7 @@ Design notes: `docs/superpowers/specs/2026-08-04-linux-release-container-design.
 
 ```bash
 git add scripts/cut-release.sh docs/RELEASING.md
-git commit -m "release: build Linux bundles in the Debian 12 container by default (#12)"
+git commit -m "release: build Linux bundles in the Ubuntu 24.04 container by default (#12)"
 ```
 
 ---

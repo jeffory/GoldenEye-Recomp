@@ -7,17 +7,17 @@
 # regression at release time instead of on a player's device.
 #
 # Usage: scripts/check-abi-floor.sh <binary> [<binary> ...]
-# Env:   ABI_MAX_GLIBC   (default 2.36)     ABI_MAX_GLIBCXX (default 3.4.30)
+# Env:   ABI_MAX_GLIBC   (default 2.39)     ABI_MAX_GLIBCXX (default 3.4.33)
 set -euo pipefail
 
-MAX_GLIBC="${ABI_MAX_GLIBC:-2.36}"
-MAX_GLIBCXX="${ABI_MAX_GLIBCXX:-3.4.30}"
+MAX_GLIBC="${ABI_MAX_GLIBC:-2.39}"
+MAX_GLIBCXX="${ABI_MAX_GLIBCXX:-3.4.33}"
 
 [ $# -gt 0 ] || { echo "usage: $0 <binary> [<binary> ...]" >&2; exit 2; }
 command -v objdump >/dev/null 2>&1 || { echo "error: objdump not found (install binutils)" >&2; exit 2; }
 
 # ver_gt A B -> true when A is strictly newer than B, compared component-wise.
-# `sort -V` is what makes 2.9 < 2.36 and 3.4.9 < 3.4.30 come out right; a plain
+# `sort -V` is what makes 2.9 < 2.39 and 3.4.9 < 3.4.33 come out right; a plain
 # string compare gets both backwards.
 ver_gt() {
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]

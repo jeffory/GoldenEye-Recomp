@@ -56,31 +56,46 @@ SDK or in any `.cpp` changes.
 scripts/cut-release.sh
   ├─ Android APK          (native NDK — unchanged)
   ├─ scripts/build-linux-container.sh   ← replaces the native cmake step
-  │     └─ podman run  goldeneye-linux-release:bookworm
+  │     └─ podman run  goldeneye-linux-release:noble
   ├─ scripts/check-abi-floor.sh         ← hard gate
-  ├─ link smoke test      (clean debian:12, runtime libs only)
+  ├─ link smoke test      (clean ubuntu:24.04, runtime libs only)
   └─ tarball, tag, notes, upload        (unchanged)
 ```
 
 ### 1. Container image — `docker/linux-release.Dockerfile`
 
-Built locally, tagged `goldeneye-linux-release:bookworm`.
+Built locally, tagged `goldeneye-linux-release:noble`.
 
-- **Base `debian:12`** — glibc 2.36, `libstdc++-12` → `GLIBCXX_3.4.30`. Comfortably below
+> **Base image history.** The original plan (Task 1-3 below) chose `debian:12`. That build
+> failed for a real reason, not a configuration mistake: the SDK specializes
+> `std::chrono::clock_time_conversion` for its custom clocks, and Debian 12's `libstdc++-12`
+> does not declare that template at all (zero occurrences in `/usr/include/c++/12/chrono`) —
+> compilation fails with "explicit specialization of undeclared template", not a missing
+> symbol. The documented fallback, `libstdc++-13` from bookworm-backports, does not exist:
+> `apt-cache policy libstdc++-13-dev` returns an empty candidate on bookworm. The human
+> partner chose **Ubuntu 24.04** instead, which ships `g++-13`/`libstdc++-13-dev` in main —
+> no PPA, no backports — and does declare the template. This is recorded here so the base
+> image is not "helpfully" moved back to Debian by a future reader of the original rationale
+> below.
+
+- **Base `ubuntu:24.04`** — glibc 2.39, `libstdc++-13` → `GLIBCXX_3.4.33`. Comfortably below
   SteamOS and every currently-supported distro, while still new enough for the codebase's
-  C++23.
-- **clang-19 + lld-19 from apt.llvm.org/bookworm.** Debian 12's stock clang-14 cannot do
-  `-std=c++23`. The presets already select `clang`/`clang++`, so a `update-alternatives`
-  symlink is enough — `CMakePresets.json` is not modified.
-- **`libstdc++-12-dev`** — the target libstdc++ headers.
+  C++23 (including the `std::chrono::clock_time_conversion` specialization Debian 12 could
+  not compile).
+- **clang-19 + lld-19 from apt.llvm.org/noble.** Ubuntu 24.04's stock clang cannot do
+  `-std=c++23` the way the project needs. The presets already select `clang`/`clang++`, so a
+  `update-alternatives` symlink is enough — `CMakePresets.json` is not modified.
+- **`g++-13` / `libstdc++-13-dev`** — the target compiler and libstdc++ headers. This is the
+  package that actually fixes the chrono build failure; Ubuntu 24.04 ships it in `main` as
+  the default GCC, so no PPA or backports repo is needed.
 - **`libgtk-3-dev`** — the *only* external system dependency
   (`rexglue_helpers.cmake:26-27`, `pkg_check_modules(GTK3 REQUIRED gtk+-3.0)`). It pulls the
   X11/Wayland/pango/cairo dev chain transitively. SDL3, Vulkan-Headers, volk, FFmpeg,
   glslang, SPIRV-Tools and imgui are all vendored submodules;
   `find_package(Vulkan QUIET)` is optional and Vulkan is loaded via volk at runtime.
 - **`ninja-build`, `pkg-config`, `python3`.**
-- **CMake 3.31 from the official binary tarball.** Debian 12 ships 3.25.1, which only barely
-  satisfies the project's `cmake_minimum_required(VERSION 3.25)`.
+- **CMake 3.31 from the official binary tarball.** Ubuntu 24.04 ships 3.28.3, which only
+  barely satisfies the project's `cmake_minimum_required(VERSION 3.25)`.
 
 The image is content-stable; the script builds it on first use and reuses it thereafter.
 
@@ -130,8 +145,8 @@ scripts/check-abi-floor.sh <binary> [<binary> ...]
 
 Parses the `Version References` block of `objdump -p` for each input, extracts every
 required `GLIBC_x.y` and `GLIBCXX_x.y.z`, and exits non-zero if any exceeds the ceiling
-(`GLIBC 2.36`, `GLIBCXX 3.4.30`, overridable by env var). Version comparison is numeric per
-component, not lexical — `GLIBC_2.9` must not compare greater than `GLIBC_2.36`. Failure
+(`GLIBC 2.39`, `GLIBCXX 3.4.33`, overridable by env var). Version comparison is numeric per
+component, not lexical — `GLIBC_2.9` must not compare greater than `GLIBC_2.39`. Failure
 prints the offending symbols, obtained via `objdump -T | grep`, so the regression is
 immediately actionable.
 
@@ -141,7 +156,7 @@ symbol, instead of failing silently on a player's device.
 
 ### 4. Link smoke test
 
-Runs the assembled bundle under a clean `debian:12` container with only *runtime* packages
+Runs the assembled bundle under a clean `ubuntu:24.04` container with only *runtime* packages
 (`libgtk-3-0`, no `-dev`), and asserts `LD_LIBRARY_PATH=. ldd ge` reports no `not found`.
 This demonstrates the tarball resolves on a stock old system without access to a Deck. It
 verifies loading only — it does not launch the game, which needs a GPU and game assets.
@@ -175,15 +190,17 @@ rather than inferred from symbol tables alone.
 
 **Baseline measurement (do first).** Record the Deck's actual `ldd --version` and its highest
 `GLIBCXX_3.4.*` (`strings /usr/lib/libstdc++.so.6 | grep GLIBCXX_3.4 | sort -V | tail -1`).
-This confirms the chosen `GLIBC 2.36` / `GLIBCXX 3.4.30` ceiling really sits below SteamOS,
-and pins down the true floor for future reference. If SteamOS turns out to be *below* 2.36,
+This confirms the chosen `GLIBC 2.39` / `GLIBCXX 3.4.33` ceiling really sits below SteamOS,
+and pins down the true floor for future reference. If SteamOS turns out to be *below* 2.39,
 the ceiling drops accordingly and the base image is revisited.
 
 **Measured 2026-08-04 over SSH on the Steam Deck (SteamOS, `deck@192.168.1.6`):**
 `glibc 2.41` (`glibc 2.41+r65+ge7c419a29575-1`), `GLIBCXX_3.4.34`, `CXXABI_1.3.15`, from
-`gcc-libs 15.1.1`. The 2.36 / 3.4.30 ceiling therefore sits five glibc releases and four
-GLIBCXX revisions below the target — confirmed safe, and with room to spare for players on
-non-SteamOS distros.
+`gcc-libs 15.1.1`. The originally-chosen 2.36 / 3.4.30 (Debian 12) ceiling sat five glibc
+releases and four GLIBCXX revisions below the target. Debian 12 was later abandoned (see the
+base-image history note under "Container image" above) in favor of Ubuntu 24.04's 2.39 /
+3.4.33, which still sits comfortably below the Deck's 2.41 / 3.4.34 — two glibc releases and
+one GLIBCXX revision of margin.
 
 That measurement also corrects the version attribution above: the Deck runs GCC 15.1's
 libstdc++ and tops out at `GLIBCXX_3.4.34`, and `objdump -T` on it finds **no**
@@ -193,9 +210,9 @@ build cannot run on a GCC 15 target no matter how close the versions look.
 
 1. `check-abi-floor.sh` against the **existing** `dist/bundle/{ge,librexruntimerd.so}` must
    FAIL, naming the seven known symbols. This proves the gate detects the real bug.
-2. The same script against a trivial `debian:12`-built binary must PASS.
-3. Full container build produces `GoldenEye`; `objdump -p` shows max `GLIBC_2.36` /
-   `GLIBCXX_3.4.30`; the gate passes.
+2. The same script against a trivial `ubuntu:24.04`-built binary must PASS.
+3. Full container build produces `GoldenEye`; `objdump -p` shows max `GLIBC_2.39` /
+   `GLIBCXX_3.4.33`; the gate passes.
 4. Smoke test resolves all libraries in the clean runtime container.
 5. Native `--no-container` path still produces a working build, and
    `$SDK_DIR/out/linux-amd64` is untouched by the container build (shadow-mount isolation
@@ -207,12 +224,21 @@ build cannot run on a GCC 15 target no matter how close the versions look.
 
 ## Risks
 
-- **libstdc++-12 must compile the SDK's C++23.** `<expected>` is the only newer-libstdc++
-  header in use (SDK, 2 files) and GCC 12 has it; `std::atomic::wait/notify` is header-inline
-  before GCC 16, so the `GLIBCXX_3.4.35` dependency disappears on its own. Other C++23
-  *library* usage that does not need a distinctive header cannot be ruled out until the first
-  build runs. Fallback: `libstdc++-13` from bookworm-backports, raising the floor to
-  `GLIBCXX_3.4.32` — still well under the 3.4.35 that broke us.
+- **RESOLVED — libstdc++-12 could not compile the SDK's C++23, and Debian 12 was
+  abandoned as the base.** This risk was originally written expecting an *ABI-symbol*
+  problem (a newer libstdc++ requiring a newer-than-floor `GLIBCXX_x.y.z`), with a
+  documented fallback of pulling `libstdc++-13` from bookworm-backports. Task 4's actual
+  container build hit something worse: the SDK specializes
+  `std::chrono::clock_time_conversion` for its custom clocks, and Debian 12's `libstdc++-12`
+  does not declare that template *at all* — `explicit specialization of undeclared
+  template`, a compile-time hard failure, not a linkable-but-too-new symbol. The documented
+  fallback also turned out not to exist: `apt-cache policy libstdc++-13-dev` returns an
+  empty candidate on bookworm, so there was no in-place fix. The human partner chose to move
+  the base image to **Ubuntu 24.04**, which ships `g++-13`/`libstdc++-13-dev` in `main` (no
+  PPA, no backports) and does declare the template. The new floor is `GLIBC 2.39` /
+  `GLIBCXX 3.4.33` — still comfortably under the Deck's `2.41` / `3.4.34` (see the Testing
+  section) and under the `GLIBC_2.43` / `GLIBCXX_3.4.35` that broke us on Fedora 44 in the
+  first place.
 - **Launching on the Deck may surface non-ABI problems** unrelated to #12 (GPU/driver,
   controller mapping, asset paths). Deck hardware is available locally, so these are
   discoverable — but they are separate issues from the symbol-version fix and should not
