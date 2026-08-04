@@ -74,7 +74,7 @@ The branch ships a record→replay loop-back self-test. This is the repo's estab
 
 ```bash
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets \
   --ge_replay_selftest=true --log_level=info 2>&1 | grep -i "selftest"
 ```
 
@@ -210,7 +210,7 @@ A zero `gpu_med_ms` means either GPU timestamps are off or the build lacks perf 
 
 ```bash
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets \
   --ge_replay_macro=bench/dam.macro --ge_replay_play=bench/dam-walk.gerp \
   --ge_gpu_timestamps=true --ge_bench_exit=true --log_level=info \
   --log_file=/tmp/claude-1000/-home-keith-Projects-GoldenEye-Recomp/bef81402-f292-48e5-8003-ea1a62aef9f9/scratchpad/ge-task2.log
@@ -349,7 +349,7 @@ Expected: success. A compile error about `paths.user_data_root` being unpopulate
 ```bash
 SCRATCH=/tmp/claude-1000/-home-keith-Projects-GoldenEye-Recomp/bef81402-f292-48e5-8003-ea1a62aef9f9/scratchpad
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets --log_level=info \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets --log_level=info \
   --log_file=$SCRATCH/ge-task3-nofile.log &
 sleep 25 && kill %1 2>/dev/null
 grep "GECVAR" $SCRATCH/ge-task3-nofile.log
@@ -362,7 +362,7 @@ Then create an override file at the recorded path and confirm it applies:
 ```bash
 printf '# phase-0 test\nge_fps_log=true\nrender_target_path_vulkan=fbo\n' > <recorded-path>/ge_cvars.txt
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets --log_level=info \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets --log_level=info \
   --log_file=$SCRATCH/ge-task3-withfile.log &
 sleep 25 && kill %1 2>/dev/null
 grep "GECVAR\|render target" $SCRATCH/ge-task3-withfile.log
@@ -375,7 +375,7 @@ Expected: two `GECVAR override applied` lines, `GECVAR applied 2 override(s)`, a
 ```bash
 printf 'garbage line with no equals\n=missingname\nnot_a_real_cvar=7\n\n# comment only\n' > <recorded-path>/ge_cvars.txt
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets --log_level=info \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets --log_level=info \
   --log_file=$SCRATCH/ge-task3-malformed.log &
 sleep 25 && kill %1 2>/dev/null
 grep "GECVAR" $SCRATCH/ge-task3-malformed.log
