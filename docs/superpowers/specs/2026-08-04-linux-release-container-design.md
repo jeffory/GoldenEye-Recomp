@@ -1,0 +1,202 @@
+# Containerized Linux Release Build (Steam Deck Compatibility) — Design
+
+**Date:** 2026-08-04
+**Repos touched:** game only (`docker/`, `scripts/`, `docs/RELEASING.md`) — no SDK or source changes
+**Status:** Approved
+**Closes:** issue #12 ("Can't launch on Steam Deck")
+
+## Problem
+
+`scripts/cut-release.sh:120` builds the Linux amd64 bundle natively on the Fedora 44
+workstation (glibc 2.43, GCC 16.1.1) and bundles only the SDK's own `.so` files. libc, libm
+and libstdc++ come from the player's system, so every shipped tarball silently inherits the
+build host's symbol-version floor and cannot load on any older distro. A Steam Deck user
+(#12) gets:
+
+```
+/usr/lib/libm.so.6: version `GLIBC_2.43' not found (required by ge)
+/usr/lib/libm.so.6: version `GLIBC_2.43' not found (required by librexruntimerd.so)
+/usr/lib/libstdc++.so.6: version `GLIBCXX_3.4.35' not found (required by librexruntimerd.so)
+```
+
+Measured on the shipped v1.6.0 artifact with `objdump -T dist/bundle/{ge,librexruntimerd.so}`,
+the break is exactly **seven symbols** in two groups:
+
+| Group | Symbols | Cause |
+|---|---|---|
+| `libm` @ `GLIBC_2.43` | `sqrtf` (in `ge`); `acosf`, `asinf`, `atan2f`, `log10f` (in `librexruntimerd.so`) | glibc 2.43 version-bumped a batch of float math functions; the `@GLIBC_2.2.5` originals still exist everywhere |
+| `libstdc++` @ `GLIBCXX_3.4.35` | `std::__detail::__wait_impl`, `__notify_impl`, `__wait_args::_M_setup_proxy_wait` | GCC 15 moved `std::atomic::wait/notify` out-of-line into libstdc++; the SDK uses it in ~10 files |
+
+`libc.so.6` itself needs only `GLIBC_2.38`, so those seven symbols are the entire barrier.
+
+### Rejected alternatives
+
+- **`.symver` pinning via a force-included header.** Measured with clang 20 on this host:
+  `.symver` on an *undefined* symbol is strictly per-TU **and** must appear *after* the
+  reference. A separate stub TU emitting the directives has zero effect on other TUs, and
+  `-include` can only prepend. The asm-label variant
+  (`extern "C" float f(float) __asm__("sqrtf@GLIBC_2.2.5")` plus macros) leaks because
+  `<cmath>`'s C++ overloads bypass the macros. Making it work would mean appending directives
+  to the bottom of every TU touching those functions, in both repos, permanently.
+- **`-static-libstdc++`.** `ge` and `librexruntimerd.so` exchange C++ objects and exceptions;
+  two static libstdc++ copies break RTTI and exception matching across the DSO boundary. It
+  also does nothing for the libm half.
+- **Bundling the host `libstdc++.so.6`.** Fedora 44's libstdc++ itself requires
+  `GLIBC_ABI_GNU2_TLS`, which pushes the floor back up to roughly glibc 2.41. Circular.
+
+Building against an older toolchain is the only approach that fixes both groups at once,
+needs no source changes, and carries no ABI risk.
+
+## Architecture
+
+Four new pieces in the game repo, composed by the existing release script. Nothing in the
+SDK or in any `.cpp` changes.
+
+```
+scripts/cut-release.sh
+  ├─ Android APK          (native NDK — unchanged)
+  ├─ scripts/build-linux-container.sh   ← replaces the native cmake step
+  │     └─ podman run  goldeneye-linux-release:bookworm
+  ├─ scripts/check-abi-floor.sh         ← hard gate
+  ├─ link smoke test      (clean debian:12, runtime libs only)
+  └─ tarball, tag, notes, upload        (unchanged)
+```
+
+### 1. Container image — `docker/linux-release.Dockerfile`
+
+Built locally, tagged `goldeneye-linux-release:bookworm`.
+
+- **Base `debian:12`** — glibc 2.36, `libstdc++-12` → `GLIBCXX_3.4.30`. Comfortably below
+  SteamOS and every currently-supported distro, while still new enough for the codebase's
+  C++23.
+- **clang-19 + lld-19 from apt.llvm.org/bookworm.** Debian 12's stock clang-14 cannot do
+  `-std=c++23`. The presets already select `clang`/`clang++`, so a `update-alternatives`
+  symlink is enough — `CMakePresets.json` is not modified.
+- **`libstdc++-12-dev`** — the target libstdc++ headers.
+- **`libgtk-3-dev`** — the *only* external system dependency
+  (`rexglue_helpers.cmake:26-27`, `pkg_check_modules(GTK3 REQUIRED gtk+-3.0)`). It pulls the
+  X11/Wayland/pango/cairo dev chain transitively. SDL3, Vulkan-Headers, volk, FFmpeg,
+  glslang, SPIRV-Tools and imgui are all vendored submodules;
+  `find_package(Vulkan QUIET)` is optional and Vulkan is loaded via volk at runtime.
+- **`ninja-build`, `pkg-config`, `python3`.**
+- **CMake 3.31 from the official binary tarball.** Debian 12 ships 3.25.1, which only barely
+  satisfies the project's `cmake_minimum_required(VERSION 3.25)`.
+
+The image is content-stable; the script builds it on first use and reuses it thereafter.
+
+### 2. Build script — `scripts/build-linux-container.sh`
+
+Runs the build under **podman** (rootless, and the Fedora-native choice; docker is present
+but not required). Usage:
+
+```
+scripts/build-linux-container.sh [--sdk DIR] [--rebuild-image]
+```
+
+Mount layout — the isolation is the substantive part of this script:
+
+| Host path | Container path | Purpose |
+|---|---|---|
+| game repo | `/work` | sources plus `generated/` PPC code |
+| `$SDK_DIR` | `/sdk` | built via `add_subdirectory` (`generated/rexglue.cmake:11`) |
+| `$SDK_DIR/out-container/` | `/sdk/out` | **shadowing bind mount** |
+| `out/build/linux-amd64-container/` | same, under `/work` | separate CMake cache |
+
+The `/sdk/out` entry is a second bind mount layered over the already-mounted `/sdk`, so that
+path inside the container resolves to the host's `out-container/` rather than to the SDK
+repo's own `out/`. It exists because the SDK hardcodes its output directory to
+`${REXGLUE_ROOT}/out/${REX_PLATFORM}` (SDK `CMakeLists.txt:191-193`) — a shared
+location *outside* any build tree. Without that shadowing, a release build overwrites the
+`out/linux-amd64/librexruntimerd.so` that native dev builds and `LD_LIBRARY_PATH` runs
+depend on, and every switch between native and release forces a full relink.
+
+Inside the container the script configures with `-B /work/out/build/linux-amd64-container`,
+`-DREXSDK_DIR=/sdk`, `-DCMAKE_BUILD_TYPE=RelWithDebInfo` and `-G Ninja`, then builds target
+`ge`. RelWithDebInfo is retained deliberately: it keeps symbols for crash diagnosis, matching
+today's release.
+
+`CMakeLists.txt:69` hints libatomic at `/usr/lib/gcc/x86_64-redhat-linux/16`; in the
+container that `find_library` misses and the existing `-latomic` fallback (line 73) applies.
+No change needed.
+
+Output: `out/build/linux-amd64-container/GoldenEye` plus
+`$SDK_DIR/out-container/*.so` for the bundle step.
+
+### 3. ABI floor gate — `scripts/check-abi-floor.sh`
+
+```
+scripts/check-abi-floor.sh <binary> [<binary> ...]
+```
+
+Parses the `Version References` block of `objdump -p` for each input, extracts every
+required `GLIBC_x.y` and `GLIBCXX_x.y.z`, and exits non-zero if any exceeds the ceiling
+(`GLIBC 2.36`, `GLIBCXX 3.4.30`, overridable by env var). Version comparison is numeric per
+component, not lexical — `GLIBC_2.9` must not compare greater than `GLIBC_2.36`. Failure
+prints the offending symbols, obtained via `objdump -T | grep`, so the regression is
+immediately actionable.
+
+This is the durable part of the change: it is precisely the check that would have caught #12
+before upload, and it fails loudly at release time when future SDK code pulls in a newer
+symbol, instead of failing silently on a player's device.
+
+### 4. Link smoke test
+
+Runs the assembled bundle under a clean `debian:12` container with only *runtime* packages
+(`libgtk-3-0`, no `-dev`), and asserts `LD_LIBRARY_PATH=. ldd ge` reports no `not found`.
+This demonstrates the tarball resolves on a stock old system without access to a Deck. It
+verifies loading only — it does not launch the game, which needs a GPU and game assets.
+
+### 5. `cut-release.sh` integration
+
+The `step "Building Linux amd64"` block (lines 118-124) calls `build-linux-container.sh`
+instead of `cmake --build --preset linux-amd64-relwithdebinfo`, and the dependency-copy loop
+(lines 131-134) reads from `$SDK_DIR/out-container/` instead of `$SDK_DIR/out/linux-amd64`.
+The floor gate and smoke test run after bundle assembly and before the tag is pushed, so a
+failure never leaves a dangling tag — consistent with the script's existing
+build-before-tag ordering (lines 91-93).
+
+A new `--no-container` flag restores the current native path verbatim, for local iteration
+and as an escape hatch if the image is unavailable. The Android APK step is untouched.
+
+## Error handling
+
+- Missing podman → fail in the preconditions block alongside the existing `gh` / keystore
+  checks, not midway through a release.
+- Image build failure → abort before the version-bump commit is created.
+- Compile failure inside the container → propagates as a non-zero exit; the version-bump
+  commit stays local and is recoverable with `git reset --hard HEAD~1` as documented at
+  `cut-release.sh:91-93`.
+- Floor gate or smoke test failure → abort before pushing the tag.
+
+## Testing
+
+1. `check-abi-floor.sh` against the **existing** `dist/bundle/{ge,librexruntimerd.so}` must
+   FAIL, naming the seven known symbols. This proves the gate detects the real bug.
+2. The same script against a trivial `debian:12`-built binary must PASS.
+3. Full container build produces `GoldenEye`; `objdump -p` shows max `GLIBC_2.36` /
+   `GLIBCXX_3.4.30`; the gate passes.
+4. Smoke test resolves all libraries in the clean runtime container.
+5. Native `--no-container` path still produces a working build, and
+   `$SDK_DIR/out/linux-amd64` is untouched by the container build (overlay isolation holds).
+6. The container-built binary runs on this Fedora 44 host (forward compatibility).
+
+## Risks
+
+- **libstdc++-12 must compile the SDK's C++23.** `<expected>` is the only newer-libstdc++
+  header in use (SDK, 2 files) and GCC 12 has it; `std::atomic::wait/notify` is header-inline
+  before GCC 15, so the `GLIBCXX_3.4.35` dependency disappears on its own. Other C++23
+  *library* usage that does not need a distinctive header cannot be ruled out until the first
+  build runs. Fallback: `libstdc++-13` from bookworm-backports, raising the floor to
+  `GLIBCXX_3.4.32` — still well under the 3.4.35 that broke us.
+- **Deck hardware is not available here.** The floor gate and smoke test prove the linking
+  class of bug is fixed. Only the issue reporter or a physical Deck can confirm it launches.
+- **First container build is slow** (cold ccache-less full rebuild of SDK + game). Release
+  builds only; day-to-day development stays on the fast native path.
+
+## Out of scope
+
+- Windows and Android release paths.
+- Containerizing day-to-day development builds.
+- Shipping a Flatpak or AppImage, or Steam Runtime (`sniper`) packaging. The floor chosen
+  here makes the plain tarball work on the Deck in Desktop Mode, which is how the reporter
+  and the README instruct users to run it.
