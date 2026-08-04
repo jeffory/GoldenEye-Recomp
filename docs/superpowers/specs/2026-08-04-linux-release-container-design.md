@@ -88,8 +88,10 @@ Built locally, tagged `goldeneye-linux-release:noble`.
 - **`g++-13` / `libstdc++-13-dev`** — the target compiler and libstdc++ headers. This is the
   package that actually fixes the chrono build failure; Ubuntu 24.04 ships it in `main` as
   the default GCC, so no PPA or backports repo is needed.
-- **`libgtk-3-dev`** — the *only* external system dependency
-  (`rexglue_helpers.cmake:26-27`, `pkg_check_modules(GTK3 REQUIRED gtk+-3.0)`). It pulls the
+- **`libgtk-3-dev`, `libx11-xcb-dev` and `libxi-dev`** — the external system dependencies the
+  build needs: the SDK's `src/ui/CMakeLists.txt` does
+  `pkg_check_modules(... REQUIRED gtk+-3.0 / x11-xcb / xi)` for the GTK window, the XCB
+  surface handle, and XInput2 raw mouse motion respectively. `libgtk-3-dev` pulls the
   X11/Wayland/pango/cairo dev chain transitively. SDL3, Vulkan-Headers, volk, FFmpeg,
   glslang, SPIRV-Tools and imgui are all vendored submodules;
   `find_package(Vulkan QUIET)` is optional and Vulkan is loaded via volk at runtime.

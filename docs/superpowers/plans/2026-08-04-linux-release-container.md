@@ -279,14 +279,15 @@ ARG LLVM_VERSION=19
 ARG CMAKE_VERSION=3.31.6
 ENV DEBIAN_FRONTEND=noninteractive
 
-# libgtk-3-dev is the ONLY external dependency the build needs: the SDK's
-# rexglue_helpers.cmake does pkg_check_modules(GTK3 REQUIRED gtk+-3.0). SDL3,
-# Vulkan-Headers, volk, FFmpeg, glslang, SPIRV-Tools and imgui are all vendored
+# libgtk-3-dev, libx11-xcb-dev and libxi-dev are the external deps the build needs: the
+# SDK's src/ui/CMakeLists.txt does pkg_check_modules(... REQUIRED gtk+-3.0 / x11-xcb / xi)
+# for the GTK window, the XCB surface handle, and XInput2 raw mouse motion respectively.
+# SDL3, Vulkan-Headers, volk, FFmpeg, glslang, SPIRV-Tools and imgui are all vendored
 # submodules, and Vulkan itself is loaded through volk at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates wget gnupg \
       ninja-build pkg-config python3 git file binutils \
-      g++-13 libstdc++-13-dev libgtk-3-dev \
+      g++-13 libstdc++-13-dev libgtk-3-dev libx11-xcb-dev libxi-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu 24.04's stock clang cannot do -std=c++23 the way the project needs; pull clang-19
