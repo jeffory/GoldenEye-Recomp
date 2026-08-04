@@ -8,6 +8,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/logging/macros.h>
 #include <rex/perf/counter.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
@@ -17,6 +18,8 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
 
@@ -116,6 +119,23 @@ class GeApp : public rex::ReXApp {
     // it is never written here (writing default==default is a no-op anyway).
   }
 
+  // Runs right after rex::InitLogging(), still early in SetupEnvironment --
+  // well before SetupPresentation touches init-only cvars like
+  // render_target_path_vulkan. Deliberately NOT called from the end of
+  // OnConfigurePaths above: that runs *before* rex::InitLogging() (see
+  // ReXApp::SetupEnvironment), so any REXKRNL_* logging done from there is
+  // silently served by a lazily-created early stdout-only logger and never
+  // reaches --log_file / ge.log -- verified empirically (the GECVAR lines
+  // showed up on stdout but never in the log file) before moving the call
+  // here. user_data_root() is used instead of a PathConfig& (this hook takes
+  // none) -- it is populated from the same path_config right after
+  // OnConfigurePaths returns, so it holds the identical value.
+  void OnPostInitLogging() override {
+    // Last, so a pushed file can override every default set in
+    // OnConfigurePaths above. See ApplyCvarOverrides for why this exists.
+    ApplyCvarOverrides(user_data_root() / "ge_cvars.txt");
+  }
+
   // Register the ESC pause-menu keybind and (conditionally) the overlay
   // dialogs once the ImGui drawer exists.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
@@ -187,6 +207,63 @@ class GeApp : public rex::ReXApp {
   }
 
  private:
+  // Apply "name=value" cvar overrides from a text file, if one exists.
+  //
+  // Android reads no config file and takes no CLI, so cvars are otherwise
+  // hardcoded in OnConfigurePaths below -- and init-only cvars like
+  // render_target_path_vulkan then cost a full rebuild + reinstall to change.
+  // This lets `adb push` swap a config between runs instead. Applied last so it
+  // beats the hardcoded defaults; on desktop, CLI flags still win as usual.
+  //
+  // Format: one name=value per line. '#' starts a comment. Blank lines and
+  // lines without '=' are skipped. Unknown cvar names are logged and ignored.
+  static void ApplyCvarOverrides(const std::filesystem::path& file) {
+    std::error_code ec;
+    if (!std::filesystem::exists(file, ec) || ec) {
+      return;
+    }
+    std::ifstream in(file);
+    if (!in) {
+      REXKRNL_WARN("GECVAR override file exists but could not be opened: {}", file.string());
+      return;
+    }
+    auto trim = [](std::string& s) {
+      const char* ws = " \t\r\n";
+      const auto b = s.find_first_not_of(ws);
+      if (b == std::string::npos) {
+        s.clear();
+        return;
+      }
+      s = s.substr(b, s.find_last_not_of(ws) - b + 1);
+    };
+    std::string line;
+    int applied = 0;
+    while (std::getline(in, line)) {
+      const auto hash = line.find('#');
+      if (hash != std::string::npos) {
+        line.erase(hash);
+      }
+      const auto eq = line.find('=');
+      if (eq == std::string::npos) {
+        continue;
+      }
+      std::string name = line.substr(0, eq);
+      std::string value = line.substr(eq + 1);
+      trim(name);
+      trim(value);
+      if (name.empty()) {
+        continue;
+      }
+      if (rex::cvar::SetFlagByName(name, value)) {
+        REXKRNL_INFO("GECVAR override applied: {}={}", name, value);
+        ++applied;
+      } else {
+        REXKRNL_WARN("GECVAR override rejected (unknown cvar or bad value): {}={}", name, value);
+      }
+    }
+    REXKRNL_INFO("GECVAR applied {} override(s) from {}", applied, file.string());
+  }
+
   // Create/destroy the passive overlays to match their cvars. An ImGuiDialog's
   // existence is what registers the ImGui drawer with the presenter, and ANY
   // registered UI drawer forces presents onto the UI thread
