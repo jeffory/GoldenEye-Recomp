@@ -464,6 +464,12 @@ uint32_t g_packet = 0;
 // --- bench (GEBENCH) ---------------------------------------------------------
 struct BenchState {
   std::vector<int64_t> poll_ts_us;
+  // Per-frame samples, not running totals: the attribution question (see
+  // docs/superpowers/specs/2026-08-05-phase0-dam-gpu-attribution-design.md)
+  // compares a *median* GPU frame time against a 13.5ms fixed cost, and a mean
+  // would be dragged by the very hitches the analysis excludes.
+  std::vector<int64_t> gpu_us;
+  std::vector<int64_t> draws;
   int64_t strans_us = 0;
   int64_t pcomp_us = 0;
   int64_t texup_us = 0;
@@ -496,6 +502,10 @@ void BenchOnPoll() {
     g_bench.pcomp_us += rex::perf::GetSnapshotCounter(rex::perf::CounterId::kPipelineCompileUs);
     g_bench.texup_us += rex::perf::GetSnapshotCounter(rex::perf::CounterId::kTextureUploadUs);
     g_bench.gio_us += rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGuestFileIoUs);
+    g_bench.gpu_us.push_back(
+        rex::perf::GetSnapshotCounter(rex::perf::CounterId::kGpuFrameUs));
+    g_bench.draws.push_back(
+        rex::perf::GetSnapshotCounter(rex::perf::CounterId::kDrawCalls));
   }
 }
 
@@ -517,10 +527,22 @@ void BenchFinish() {
   int64_t worst = ft.back();
   size_t hitches = size_t(std::count_if(ft.begin(), ft.end(),
                                         [](int64_t us) { return us > 41667; }));
+  // Percentile over a copy (sorts in place). p is 0..100.
+  auto pctl = [](std::vector<int64_t> v, int p) -> double {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    size_t idx = size_t(double(v.size() - 1) * (double(p) / 100.0));
+    return double(v[idx]);
+  };
+  const double gpu_med_ms = pctl(g_bench.gpu_us, 50) / 1000.0;
+  const double gpu_p95_ms = pctl(g_bench.gpu_us, 95) / 1000.0;
+  const double draws_med = pctl(g_bench.draws, 50);
   REXKRNL_INFO(
       "GEBENCH frames={} dur={:.1f}s avg={:.1f} low1={:.1f} worst={:.1f} hitch={} "
+      "gpu_med_ms={:.2f} gpu_p95_ms={:.2f} draws_med={:.0f} "
       "strans_ms={:.1f} pcomp_ms={:.1f} texup_ms={:.1f} gio_ms={:.1f}",
       ft.size(), dur_s, fps(p50), fps(p99), fps(worst), hitches,
+      gpu_med_ms, gpu_p95_ms, draws_med,
       g_bench.strans_us / 1000.0, g_bench.pcomp_us / 1000.0, g_bench.texup_us / 1000.0,
       g_bench.gio_us / 1000.0);
   if (REXCVAR_GET(ge_bench_exit) && g_quit_requester) {
