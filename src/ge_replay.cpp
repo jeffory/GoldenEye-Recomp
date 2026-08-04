@@ -537,14 +537,25 @@ void BenchFinish() {
   const double gpu_med_ms = pctl(g_bench.gpu_us, 50) / 1000.0;
   const double gpu_p95_ms = pctl(g_bench.gpu_us, 95) / 1000.0;
   const double draws_med = pctl(g_bench.draws, 50);
+  // gpu_med_ms can be built from far fewer samples than `frames=` suggests --
+  // samples are only appended when the guest refresh advances (BenchOnPoll's
+  // guard), and the SDK's GPU-timestamp slots can themselves skip. Surface
+  // the sample count and how many came back zero so a reader can sanity-check
+  // the estimator instead of trusting frames= as a proxy for it. Appended at
+  // the end of the format string (not inserted) because perf_report.py's
+  // GEBENCH_RE is unanchored -- appending is safe, inserting would break it.
+  const size_t gpu_n = g_bench.gpu_us.size();
+  const size_t gpu_zero = size_t(
+      std::count(g_bench.gpu_us.begin(), g_bench.gpu_us.end(), int64_t{0}));
   REXKRNL_INFO(
       "GEBENCH frames={} dur={:.1f}s avg={:.1f} low1={:.1f} worst={:.1f} hitch={} "
       "gpu_med_ms={:.2f} gpu_p95_ms={:.2f} draws_med={:.0f} "
-      "strans_ms={:.1f} pcomp_ms={:.1f} texup_ms={:.1f} gio_ms={:.1f}",
+      "strans_ms={:.1f} pcomp_ms={:.1f} texup_ms={:.1f} gio_ms={:.1f} "
+      "gpu_n={} gpu_zero={}",
       ft.size(), dur_s, fps(p50), fps(p99), fps(worst), hitches,
       gpu_med_ms, gpu_p95_ms, draws_med,
       g_bench.strans_us / 1000.0, g_bench.pcomp_us / 1000.0, g_bench.texup_us / 1000.0,
-      g_bench.gio_us / 1000.0);
+      g_bench.gio_us / 1000.0, gpu_n, gpu_zero);
   if (REXCVAR_GET(ge_bench_exit) && g_quit_requester) {
     g_quit_requester();
   }
