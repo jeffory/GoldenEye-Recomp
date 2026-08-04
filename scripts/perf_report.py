@@ -75,7 +75,8 @@ GEBENCH_RE = re.compile(
     r"gpu_med_ms=(?P<gpu_med>[\d.]+) gpu_p95_ms=(?P<gpu_p95>[\d.]+) "
     r"draws_med=(?P<draws_med>[\d.]+) "
     r"strans_ms=(?P<strans>[\d.]+) pcomp_ms=(?P<pcomp>[\d.]+) "
-    r"texup_ms=(?P<texup>[\d.]+) gio_ms=(?P<gio>[\d.]+)")
+    r"texup_ms=(?P<texup>[\d.]+) gio_ms=(?P<gio>[\d.]+) "
+    r"gpu_n=(?P<gpu_n>\d+) gpu_zero=(?P<gpu_zero>\d+)")
 
 EDRAM_RE = re.compile(
     r"EDRAM round-trips frame (?P<frame>\d+): (?P<passes>\d+) transfer passes, "
@@ -95,16 +96,31 @@ def fps(ms):
 
 
 def analyze_log(path):
-    gefps, geshown, gespikes, gebench, edram = [], [], [], [], []
+    gefps, geshown, gespikes, gebench = [], [], [], []
+    # EDRAM lines are aggregated over the benchmark window only (between a
+    # "GEREPLAY playback started" line and the terminal GEBENCH line) so idle/
+    # menu frames before or after the replay can't dilute the statistic. If no
+    # window start marker is found in the file at all, edram_all is reported
+    # instead and the output says so -- see the reporting block below.
+    edram_all, edram_window = [], []
+    window_open = False
+    saw_window_start = False
     with open(path, errors="replace") as f:
         for line in f:
+            if "GEREPLAY playback started" in line:
+                window_open = True
+                saw_window_start = True
             m = GEBENCH_RE.search(line)
             if m:
                 gebench.append({k: float(v) for k, v in m.groupdict().items()})
+                window_open = False
                 continue
             m = EDRAM_RE.search(line)
             if m:
-                edram.append({k: float(v) for k, v in m.groupdict().items()})
+                rec = {k: float(v) for k, v in m.groupdict().items()}
+                edram_all.append(rec)
+                if window_open:
+                    edram_window.append(rec)
                 continue
             m = GEFPS_RE.search(line)
             if m:
@@ -144,20 +160,31 @@ def analyze_log(path):
               f"avg {b['avg']:.1f}fps, 1%-low {b['low1']:.1f}, "
               f"hitches {int(b['hitch'])}")
         print(f"  GPU: median {b['gpu_med']:.2f}ms, p95 {b['gpu_p95']:.2f}ms, "
-              f"median draws/frame {int(b['draws_med'])}")
+              f"median draws/frame {int(b['draws_med'])} "
+              f"(from {int(b['gpu_n'])} gpu samples, {int(b['gpu_zero'])} zero)")
         print(f"  CPU stages: pcomp {b['pcomp']:.1f}ms, texup {b['texup']:.1f}ms, "
               f"strans {b['strans']:.1f}ms, gio {b['gio']:.1f}ms")
         if b["gpu_med"] == 0.0:
             print("  !! gpu_med_ms is 0 -- Release build (perf counters compiled "
                   "out) or ge_gpu_timestamps off. Measurement is INVALID.")
+        if b["gpu_n"] > 0 and b["gpu_zero"] / b["gpu_n"] > 0.5:
+            print(f"  !! {int(b['gpu_zero'])}/{int(b['gpu_n'])} gpu samples are zero -- "
+                  f"gpu_med_ms may not be trustworthy.")
+    if saw_window_start:
+        edram, edram_note = edram_window, ""
+    else:
+        edram, edram_note = edram_all, " (whole file -- no replay window found)"
     if edram:
         passes = sorted(e["passes"] for e in edram)
         draws = sorted(e["draws"] for e in edram)
         depth = sorted(e["depth"] for e in edram)
-        print(f"EDRAM round-trips over {len(edram)} frames: "
-              f"median {pct(passes, 50):.0f} transfer passes/frame "
-              f"(p95 {pct(passes, 95):.0f}), median {pct(draws, 50):.0f} transfer "
-              f"draws, median {pct(depth, 50):.0f} host-depth stores")
+        span = int(max(e["frame"] for e in edram) - min(e["frame"] for e in edram)) + 1
+        if span >= 1:
+            print(f"EDRAM round-trips{edram_note}: {len(edram)}/{span} submissions had "
+                  f"any round-trip ({100.0 * len(edram) / span:.0f}% coverage); on those, "
+                  f"median {pct(passes, 50):.0f} transfer passes (p95 {pct(passes, 95):.0f}), "
+                  f"median {pct(draws, 50):.0f} transfer draws, median {pct(depth, 50):.0f} "
+                  f"host-depth stores")
     if gespikes:
         cluster_spikes(gespikes)
     else:
@@ -248,10 +275,17 @@ def analyze_csv(path):
 SELFTEST_GEBENCH = (
     "GEBENCH frames=3601 dur=60.0s avg=59.9 low1=41.2 worst=22.0 hitch=3 "
     "gpu_med_ms=13.48 gpu_p95_ms=19.02 draws_med=412 "
-    "strans_ms=0.0 pcomp_ms=12.5 texup_ms=3.2 gio_ms=0.4")
+    "strans_ms=0.0 pcomp_ms=12.5 texup_ms=3.2 gio_ms=0.4 "
+    "gpu_n=3601 gpu_zero=12")
 SELFTEST_EDRAM = (
     "EDRAM round-trips frame 5123: 47 transfer passes, 188 transfer draws, "
     "12 host-depth stores across 61 reconfigs (14 skipped as no-op)")
+# A second sample, 10 submissions later, with different counts -- exercises the
+# coverage arithmetic (span/percentage) in the report block below, which a
+# single sample line can't: coverage is only meaningful across >1 frame.
+SELFTEST_EDRAM_2 = (
+    "EDRAM round-trips frame 5133: 9 transfer passes, 22 transfer draws, "
+    "3 host-depth stores across 15 reconfigs (2 skipped as no-op)")
 
 
 def selftest():
@@ -264,7 +298,7 @@ def selftest():
         g = m.groupdict()
         for key, want in (("frames", "3601"), ("gpu_med", "13.48"),
                           ("gpu_p95", "19.02"), ("draws_med", "412"),
-                          ("pcomp", "12.5")):
+                          ("pcomp", "12.5"), ("gpu_n", "3601"), ("gpu_zero", "12")):
             if g[key] != want:
                 failures.append(f"GEBENCH {key}: got {g[key]!r}, want {want!r}")
 
@@ -277,6 +311,31 @@ def selftest():
                           ("depth", "12"), ("reconfigs", "61"), ("skipped", "14")):
             if g[key] != want:
                 failures.append(f"EDRAM {key}: got {g[key]!r}, want {want!r}")
+
+    m2 = EDRAM_RE.search(SELFTEST_EDRAM_2)
+    if not m2:
+        failures.append("EDRAM_RE did not match the second sample line")
+    else:
+        g2 = m2.groupdict()
+        for key, want in (("frame", "5133"), ("passes", "9"), ("draws", "22"),
+                          ("depth", "3"), ("reconfigs", "15"), ("skipped", "2")):
+            if g2[key] != want:
+                failures.append(f"EDRAM(2) {key}: got {g2[key]!r}, want {want!r}")
+
+    # Exercise the coverage arithmetic the EDRAM report block computes (see
+    # analyze_log): two submissions 10 apart span 11 submissions, 2 of which
+    # had any round-trip -- a real span/coverage computation, not a single
+    # sample that can't distinguish "40 passes on every frame" from "40 passes
+    # on 3% of frames" (the defect this whole reporting change fixes).
+    if m and m2:
+        frames = [float(m.group("frame")), float(m2.group("frame"))]
+        span = int(max(frames) - min(frames)) + 1
+        if span != 11:
+            failures.append(f"EDRAM coverage span: got {span}, want 11")
+        coverage = 100.0 * len(frames) / span if span >= 1 else 0.0
+        want_coverage = 200.0 / 11.0
+        if abs(coverage - want_coverage) > 0.01:
+            failures.append(f"EDRAM coverage pct: got {coverage:.4f}, want {want_coverage:.4f}")
 
     if failures:
         for f in failures:
