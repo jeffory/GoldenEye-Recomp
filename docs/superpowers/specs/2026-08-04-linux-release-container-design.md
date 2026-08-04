@@ -170,6 +170,15 @@ and as an escape hatch if the image is unavailable. The Android APK step is unto
 
 ## Testing
 
+A Steam Deck is available locally, so the fix is verified end-to-end on the actual target
+rather than inferred from symbol tables alone.
+
+**Baseline measurement (do first).** Record the Deck's actual `ldd --version` and its highest
+`GLIBCXX_3.4.*` (`strings /usr/lib/libstdc++.so.6 | grep GLIBCXX_3.4 | sort -V | tail -1`).
+This confirms the chosen `GLIBC 2.36` / `GLIBCXX 3.4.30` ceiling really sits below SteamOS,
+and pins down the true floor for future reference. If SteamOS turns out to be *below* 2.36,
+the ceiling drops accordingly and the base image is revisited.
+
 1. `check-abi-floor.sh` against the **existing** `dist/bundle/{ge,librexruntimerd.so}` must
    FAIL, naming the seven known symbols. This proves the gate detects the real bug.
 2. The same script against a trivial `debian:12`-built binary must PASS.
@@ -177,8 +186,12 @@ and as an escape hatch if the image is unavailable. The Android APK step is unto
    `GLIBCXX_3.4.30`; the gate passes.
 4. Smoke test resolves all libraries in the clean runtime container.
 5. Native `--no-container` path still produces a working build, and
-   `$SDK_DIR/out/linux-amd64` is untouched by the container build (overlay isolation holds).
+   `$SDK_DIR/out/linux-amd64` is untouched by the container build (shadow-mount isolation
+   holds).
 6. The container-built binary runs on this Fedora 44 host (forward compatibility).
+7. **On-device:** copy the bundle to the Deck, run `./run.sh` in Desktop Mode against real
+   game data, and confirm it launches and renders. This is the acceptance criterion for
+   closing #12 — everything above only proves the *linking* class of bug is fixed.
 
 ## Risks
 
@@ -188,8 +201,10 @@ and as an escape hatch if the image is unavailable. The Android APK step is unto
   *library* usage that does not need a distinctive header cannot be ruled out until the first
   build runs. Fallback: `libstdc++-13` from bookworm-backports, raising the floor to
   `GLIBCXX_3.4.32` — still well under the 3.4.35 that broke us.
-- **Deck hardware is not available here.** The floor gate and smoke test prove the linking
-  class of bug is fixed. Only the issue reporter or a physical Deck can confirm it launches.
+- **Launching on the Deck may surface non-ABI problems** unrelated to #12 (GPU/driver,
+  controller mapping, asset paths). Deck hardware is available locally, so these are
+  discoverable — but they are separate issues from the symbol-version fix and should not
+  block it.
 - **First container build is slow** (cold ccache-less full rebuild of SDK + game). Release
   builds only; day-to-day development stays on the fast native path.
 
