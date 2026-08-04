@@ -224,6 +224,20 @@ build cannot run on a GCC 15 target no matter how close the versions look.
    game data, and confirm it launches and renders. This is the acceptance criterion for
    closing #12 — everything above only proves the *linking* class of bug is fixed.
 
+**Verified on the Steam Deck 2026-08-04 (over SSH, `deck@192.168.1.6`).** The
+container-built bundle was copied to `~/Games/goldeneye-test/` and checked on the real
+device:
+
+- `LD_LIBRARY_PATH=. ldd ./ge` reports **no** unresolved libraries. The issue-#12 failure
+  (`version 'GLIBC_2.43' not found`, `version 'GLIBCXX_3.4.35' not found`) does not occur.
+- Running `./ge` gets past the dynamic loader into `main()` and reaches GTK initialisation,
+  failing only with `Failed to initialize GTK+` — expected over SSH, where there is no
+  display. The binary executes on SteamOS.
+
+Still outstanding: launching in Desktop Mode against real game data, to confirm it renders
+and plays. That requires the game assets and a graphical session, so it is the owner's step.
+
+
 ## Risks
 
 - **RESOLVED — libstdc++-12 could not compile the SDK's C++23, and Debian 12 was
