@@ -69,6 +69,19 @@ GESHOWN_RE = re.compile(
     r"refresh/s=(?P<refresh>[\d.]+) drop/s=(?P<drop>[\d.]+) "
     r"submit/s=(?P<submit>[\d.]+) paint=(?P<paint>[\d.]+)ms")
 
+GEBENCH_RE = re.compile(
+    r"GEBENCH frames=(?P<frames>\d+) dur=(?P<dur>[\d.]+)s avg=(?P<avg>[\d.]+) "
+    r"low1=(?P<low1>[\d.]+) worst=(?P<worst>[\d.]+) hitch=(?P<hitch>\d+) "
+    r"gpu_med_ms=(?P<gpu_med>[\d.]+) gpu_p95_ms=(?P<gpu_p95>[\d.]+) "
+    r"draws_med=(?P<draws_med>[\d.]+) "
+    r"strans_ms=(?P<strans>[\d.]+) pcomp_ms=(?P<pcomp>[\d.]+) "
+    r"texup_ms=(?P<texup>[\d.]+) gio_ms=(?P<gio>[\d.]+)")
+
+EDRAM_RE = re.compile(
+    r"EDRAM round-trips frame (?P<frame>\d+): (?P<passes>\d+) transfer passes, "
+    r"(?P<draws>\d+) transfer draws, (?P<depth>\d+) host-depth stores "
+    r"across (?P<reconfigs>\d+) reconfigs \((?P<skipped>\d+) skipped as no-op\)")
+
 
 def pct(sorted_vals, p):
     if not sorted_vals:
@@ -82,9 +95,17 @@ def fps(ms):
 
 
 def analyze_log(path):
-    gefps, geshown, gespikes = [], [], []
+    gefps, geshown, gespikes, gebench, edram = [], [], [], [], []
     with open(path, errors="replace") as f:
         for line in f:
+            m = GEBENCH_RE.search(line)
+            if m:
+                gebench.append({k: float(v) for k, v in m.groupdict().items()})
+                continue
+            m = EDRAM_RE.search(line)
+            if m:
+                edram.append({k: float(v) for k, v in m.groupdict().items()})
+                continue
             m = GEFPS_RE.search(line)
             if m:
                 gefps.append({k: float(v) for k, v in m.groupdict().items()})
@@ -117,6 +138,26 @@ def analyze_log(path):
         if pct(prod, 50) - pct(shown, 50) > 3:
             print(f"  !! produced ({pct(prod, 50):.1f}/s) > shown "
                   f"({pct(shown, 50):.1f}/s): the present path is dropping frames")
+    if gebench:
+        b = gebench[-1]
+        print(f"Benchmark: {int(b['frames'])} frames in {b['dur']:.1f}s, "
+              f"avg {b['avg']:.1f}fps, 1%-low {b['low1']:.1f}, "
+              f"hitches {int(b['hitch'])}")
+        print(f"  GPU: median {b['gpu_med']:.2f}ms, p95 {b['gpu_p95']:.2f}ms, "
+              f"median draws/frame {int(b['draws_med'])}")
+        print(f"  CPU stages: pcomp {b['pcomp']:.1f}ms, texup {b['texup']:.1f}ms, "
+              f"strans {b['strans']:.1f}ms, gio {b['gio']:.1f}ms")
+        if b["gpu_med"] == 0.0:
+            print("  !! gpu_med_ms is 0 -- Release build (perf counters compiled "
+                  "out) or ge_gpu_timestamps off. Measurement is INVALID.")
+    if edram:
+        passes = sorted(e["passes"] for e in edram)
+        draws = sorted(e["draws"] for e in edram)
+        depth = sorted(e["depth"] for e in edram)
+        print(f"EDRAM round-trips over {len(edram)} frames: "
+              f"median {pct(passes, 50):.0f} transfer passes/frame "
+              f"(p95 {pct(passes, 95):.0f}), median {pct(draws, 50):.0f} transfer "
+              f"draws, median {pct(depth, 50):.0f} host-depth stores")
     if gespikes:
         cluster_spikes(gespikes)
     else:
@@ -200,10 +241,57 @@ def analyze_csv(path):
             print(f"  {STAGES[col]:52s} {v / 16667.0 * 100:5.1f}%")
 
 
+# Sample lines for --selftest. Copied verbatim from real output: the GEBENCH
+# format is produced by BenchFinish() in src/ge_replay.cpp, the EDRAM line by
+# the SDK's render_target_cache.cpp. If either format changes, this fails loudly
+# rather than silently parsing nothing.
+SELFTEST_GEBENCH = (
+    "GEBENCH frames=3601 dur=60.0s avg=59.9 low1=41.2 worst=22.0 hitch=3 "
+    "gpu_med_ms=13.48 gpu_p95_ms=19.02 draws_med=412 "
+    "strans_ms=0.0 pcomp_ms=12.5 texup_ms=3.2 gio_ms=0.4")
+SELFTEST_EDRAM = (
+    "EDRAM round-trips frame 5123: 47 transfer passes, 188 transfer draws, "
+    "12 host-depth stores across 61 reconfigs (14 skipped as no-op)")
+
+
+def selftest():
+    failures = []
+
+    m = GEBENCH_RE.search(SELFTEST_GEBENCH)
+    if not m:
+        failures.append("GEBENCH_RE did not match the sample line")
+    else:
+        g = m.groupdict()
+        for key, want in (("frames", "3601"), ("gpu_med", "13.48"),
+                          ("gpu_p95", "19.02"), ("draws_med", "412"),
+                          ("pcomp", "12.5")):
+            if g[key] != want:
+                failures.append(f"GEBENCH {key}: got {g[key]!r}, want {want!r}")
+
+    m = EDRAM_RE.search(SELFTEST_EDRAM)
+    if not m:
+        failures.append("EDRAM_RE did not match the sample line")
+    else:
+        g = m.groupdict()
+        for key, want in (("frame", "5123"), ("passes", "47"), ("draws", "188"),
+                          ("depth", "12"), ("reconfigs", "61"), ("skipped", "14")):
+            if g[key] != want:
+                failures.append(f"EDRAM {key}: got {g[key]!r}, want {want!r}")
+
+    if failures:
+        for f in failures:
+            print(f"FAIL: {f}")
+        return 1
+    print("selftest: OK (GEBENCH + EDRAM parsers)")
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
         return 1
+    if argv[1] == "--selftest":
+        return selftest()
     for path in argv[1:]:
         if path.endswith(".csv"):
             analyze_csv(path)
