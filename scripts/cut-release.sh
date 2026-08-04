@@ -14,9 +14,11 @@
 #   --allow-dirty  Skip the clean-working-tree check.
 #   --sdk DIR      Path to the ReXGlue SDK checkout
 #                  (default: /home/keith/Projects/GoldenEye-Recomp-rexglue).
-#   --no-container Build the Linux bundle natively instead of in the Ubuntu 24.04
-#                  container. The native build is pinned to this host's glibc and
-#                  will NOT run on Steam Deck or older distros (issue #12).
+#   --no-container Build-only mode: assemble the Linux amd64 bundle natively and stop —
+#                  no version-bump commit, no Android APK, no tag/push, no GitHub release.
+#                  The bundle links against THIS HOST's glibc/libstdc++ (not the release
+#                  container's floor) and will NOT run on Steam Deck or older distros
+#                  (issue #12); local testing only — never publish it.
 set -euo pipefail
 
 # --- args -------------------------------------------------------------------
@@ -31,7 +33,7 @@ while [ $# -gt 0 ]; do
     --allow-dirty) ALLOW_DIRTY=1 ;;
     --sdk) SDK_DIR="$2"; shift ;;
     --no-container) USE_CONTAINER=0 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     v*|[0-9]*) VERSION="$1" ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -50,51 +52,78 @@ DIST="$ROOT/dist"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+# Run a gate script and distinguish its two failure exit codes: 1 = a real finding (ABI
+# regression / unresolved library — the thing the gate exists to catch), 2 = an infra/usage
+# problem (missing objdump/podman, apt-get unreachable, bad args — see the scripts' own
+# usage headers). Lumping both into one "exceeds the ABI floor" message sends you hunting a
+# regression that was really just a network hiccup during the smoke test.
+run_gate() {
+  local desc="$1" finding_msg="$2"; shift 2
+  "$@" && return 0
+  local rc=$?
+  if [ "$rc" -eq 1 ]; then
+    die "$finding_msg"
+  else
+    die "$desc exited $rc (infra/usage error, NOT a real finding — see its output above)"
+  fi
+}
 
 # --- preconditions ----------------------------------------------------------
 step "Preconditions"
-command -v gh >/dev/null   || die "gh CLI not found"
-gh auth status >/dev/null 2>&1 || die "gh not authenticated (gh auth login)"
 if [ "$USE_CONTAINER" -eq 1 ]; then
+  command -v gh >/dev/null   || die "gh CLI not found"
+  gh auth status >/dev/null 2>&1 || die "gh not authenticated (gh auth login)"
   command -v podman >/dev/null || die "podman not found (or pass --no-container)"
 fi
 [ -d "$ROOT/generated" ]   || die "generated/ missing — run 'rexglue codegen' against your XEX first"
-[ -f "android/keystore.properties" ] || die "android/keystore.properties missing — see docs/RELEASING.md (keytool genkeypair)"
-[ -f "android/release.jks" ]         || die "android/release.jks missing — see docs/RELEASING.md"
+if [ "$USE_CONTAINER" -eq 1 ]; then
+  [ -f "android/keystore.properties" ] || die "android/keystore.properties missing — see docs/RELEASING.md (keytool genkeypair)"
+  [ -f "android/release.jks" ]         || die "android/release.jks missing — see docs/RELEASING.md"
+fi
 if [ "$ALLOW_DIRTY" -eq 0 ]; then
   [ -z "$(git status --porcelain)" ] || die "working tree dirty (commit/stash, or pass --allow-dirty)"
 fi
 git rev-parse "$TAG" >/dev/null 2>&1 && die "tag $TAG already exists"
-echo "version=$VNAME tag=$TAG prerelease=$PRERELEASE sdk=$SDK_DIR"
+echo "version=$VNAME tag=$TAG prerelease=$PRERELEASE sdk=$SDK_DIR use_container=$USE_CONTAINER"
 
-# Gradle 8.9 cannot compile build scripts under Java 23+ (the system default here
-# is Java 25). Pin JAVA_HOME to a compatible JDK (8-22) for the gradle step. Prefer
-# Gradle's own auto-provisioned Adoptium toolchains, then common system JDK paths.
-if [ -z "${JAVA_HOME:-}" ] || ! "${JAVA_HOME}/bin/javac" -version 2>&1 | grep -qE '"(1[78]|2[012])\.'; then
-  GJDK=""
-  for cand in \
-    "$HOME"/.gradle/jdks/eclipse_adoptium-21-* \
-    "$HOME"/.gradle/jdks/eclipse_adoptium-17-* \
-    /usr/lib/jvm/java-21-openjdk /usr/lib/jvm/java-17-openjdk; do
-    jc="$(find "$cand" -maxdepth 2 -name javac -type f 2>/dev/null | head -1)" || true
-    if [ -n "$jc" ] && [ -x "$jc" ]; then GJDK="$(dirname "$(dirname "$jc")")"; break; fi
-  done
-  [ -n "$GJDK" ] || die "no Gradle-compatible JDK (8-22) found; default Java is too new. Install java-17/21 or let Android Studio/Gradle provision one (see docs/RELEASING.md)."
-  export JAVA_HOME="$GJDK"
+# The JDK pin below and the Android build/version-bump/shader-seed steps further down all
+# exist solely to support the signed-APK build and the tag/push/publish flow. None of that
+# is needed for a --no-container build-only run, and requiring it would defeat the point of
+# a lightweight local Linux iteration loop (see the --no-container case below).
+if [ "$USE_CONTAINER" -eq 1 ]; then
+  # Gradle 8.9 cannot compile build scripts under Java 23+ (the system default here
+  # is Java 25). Pin JAVA_HOME to a compatible JDK (8-22) for the gradle step. Prefer
+  # Gradle's own auto-provisioned Adoptium toolchains, then common system JDK paths.
+  if [ -z "${JAVA_HOME:-}" ] || ! "${JAVA_HOME}/bin/javac" -version 2>&1 | grep -qE '"(1[78]|2[012])\.'; then
+    GJDK=""
+    for cand in \
+      "$HOME"/.gradle/jdks/eclipse_adoptium-21-* \
+      "$HOME"/.gradle/jdks/eclipse_adoptium-17-* \
+      /usr/lib/jvm/java-21-openjdk /usr/lib/jvm/java-17-openjdk; do
+      jc="$(find "$cand" -maxdepth 2 -name javac -type f 2>/dev/null | head -1)" || true
+      if [ -n "$jc" ] && [ -x "$jc" ]; then GJDK="$(dirname "$(dirname "$jc")")"; break; fi
+    done
+    [ -n "$GJDK" ] || die "no Gradle-compatible JDK (8-22) found; default Java is too new. Install java-17/21 or let Android Studio/Gradle provision one (see docs/RELEASING.md)."
+    export JAVA_HOME="$GJDK"
+  fi
+  echo "JAVA_HOME=$JAVA_HOME ($("$JAVA_HOME/bin/java" -version 2>&1 | head -1))"
 fi
-echo "JAVA_HOME=$JAVA_HOME ($("$JAVA_HOME/bin/java" -version 2>&1 | head -1))"
 
 PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
 
 # --- version bump -----------------------------------------------------------
-step "Bumping versionName -> $VNAME, versionCode++"
-CUR_CODE="$(grep -oE 'versionCode[[:space:]]+[0-9]+' "$GRADLE_PROPS" | grep -oE '[0-9]+')"
-NEW_CODE=$((CUR_CODE + 1))
-sed -i -E "s/versionCode[[:space:]]+[0-9]+/versionCode $NEW_CODE/" "$GRADLE_PROPS"
-sed -i -E "s/versionName[[:space:]]+'[^']*'/versionName '$VNAME'/" "$GRADLE_PROPS"
-grep -E 'versionCode|versionName' "$GRADLE_PROPS"
-git add "$GRADLE_PROPS"
-git commit -q -m "chore(release): $TAG"
+# Skipped entirely in build-only mode: it exists only to stamp a release, and leaving a
+# stray version-bump commit behind after a local build is a trap.
+if [ "$USE_CONTAINER" -eq 1 ]; then
+  step "Bumping versionName -> $VNAME, versionCode++"
+  CUR_CODE="$(grep -oE 'versionCode[[:space:]]+[0-9]+' "$GRADLE_PROPS" | grep -oE '[0-9]+')"
+  NEW_CODE=$((CUR_CODE + 1))
+  sed -i -E "s/versionCode[[:space:]]+[0-9]+/versionCode $NEW_CODE/" "$GRADLE_PROPS"
+  sed -i -E "s/versionName[[:space:]]+'[^']*'/versionName '$VNAME'/" "$GRADLE_PROPS"
+  grep -E 'versionCode|versionName' "$GRADLE_PROPS"
+  git add "$GRADLE_PROPS"
+  git commit -q -m "chore(release): $TAG"
+fi
 
 # Build BEFORE pushing/tagging so a build failure never leaves a dangling tag.
 # The version-bump commit above stays local until the builds succeed; if a build
@@ -102,26 +131,35 @@ git commit -q -m "chore(release): $TAG"
 
 # --- shader seed freshness (warn only) --------------------------------------
 # The bundled first-install shader seed should track real playthrough coverage;
-# refresh with scripts/refresh-shader-seed.sh after playing new content.
-SEED_DIR="android/app/src/main/assets/shader_seed"
-if [ -d "$SEED_DIR" ]; then
-  SEED_COMMIT_TS=$(git log -1 --format=%ct -- "$SEED_DIR" 2>/dev/null || echo "")
-  if [ -n "$SEED_COMMIT_TS" ]; then
-    SEED_AGE_DAYS=$(( ( $(date +%s) - SEED_COMMIT_TS ) / 86400 ))
-    if [ "$SEED_AGE_DAYS" -gt 30 ]; then
-      echo "WARNING: shader seed is ${SEED_AGE_DAYS} days old -- consider scripts/refresh-shader-seed.sh" >&2
+# refresh with scripts/refresh-shader-seed.sh after playing new content. Android-only
+# concern, so it's skipped along with the APK build in --no-container mode.
+if [ "$USE_CONTAINER" -eq 1 ]; then
+  SEED_DIR="android/app/src/main/assets/shader_seed"
+  if [ -d "$SEED_DIR" ]; then
+    SEED_COMMIT_TS=$(git log -1 --format=%ct -- "$SEED_DIR" 2>/dev/null || echo "")
+    if [ -n "$SEED_COMMIT_TS" ]; then
+      SEED_AGE_DAYS=$(( ( $(date +%s) - SEED_COMMIT_TS ) / 86400 ))
+      if [ "$SEED_AGE_DAYS" -gt 30 ]; then
+        echo "WARNING: shader seed is ${SEED_AGE_DAYS} days old -- consider scripts/refresh-shader-seed.sh" >&2
+      fi
     fi
   fi
 fi
 
-# --- build: Android signed release APK -------------------------------------
+# --- prepare dist dir ---------------------------------------------------------
 rm -rf "$DIST"; mkdir -p "$DIST"
-APK_OUT="$DIST/GoldenEye-Recomp-$TAG-android-arm64.apk"
-step "Building signed Android release APK"
-( cd android && ./gradlew :app:assembleRelease -PrexSdkDir="$SDK_DIR" )
-SIGNED_APK="android/app/build/outputs/apk/release/app-release.apk"
-[ -f "$SIGNED_APK" ] || die "expected signed APK at $SIGNED_APK (unsigned build? check keystore.properties)"
-cp "$SIGNED_APK" "$APK_OUT"
+
+# --- build: Android signed release APK -------------------------------------
+# Skipped in build-only mode: it serves no purpose in a Linux-only local build and needs
+# the signing keystore, which build-only runs are not required to have.
+if [ "$USE_CONTAINER" -eq 1 ]; then
+  APK_OUT="$DIST/GoldenEye-Recomp-$TAG-android-arm64.apk"
+  step "Building signed Android release APK"
+  ( cd android && ./gradlew :app:assembleRelease -PrexSdkDir="$SDK_DIR" )
+  SIGNED_APK="android/app/build/outputs/apk/release/app-release.apk"
+  [ -f "$SIGNED_APK" ] || die "expected signed APK at $SIGNED_APK (unsigned build? check keystore.properties)"
+  cp "$SIGNED_APK" "$APK_OUT"
+fi
 
 # --- build: Linux amd64 release bundle -------------------------------------
 # Built in the Ubuntu 24.04 container by default: a native Fedora build inherits this
@@ -132,7 +170,7 @@ if [ "$USE_CONTAINER" -eq 1 ]; then
   GE_BIN="$(find out/build/linux-amd64-container -maxdepth 1 -type f \( -name GoldenEye -o -name ge \) | head -1)"
   SDK_LIB_DIR="$SDK_DIR/out-container/linux-amd64"
 else
-  step "Building Linux amd64 NATIVELY (relwithdebinfo) — NOT portable to older distros"
+  step "Building Linux amd64 NATIVELY (relwithdebinfo) — build-only, NOT portable to older distros"
   cmake --build --preset linux-amd64-relwithdebinfo --target ge
   # The CMake target is `ge` but its OUTPUT_NAME is `GoldenEye`, so the built file
   # is `GoldenEye` (older builds emitted `ge`). Accept either.
@@ -145,11 +183,16 @@ step "Assembling Linux bundle (ge + resolved .so deps)"
 BUNDLE="$DIST/bundle"
 mkdir -p "$BUNDLE"
 cp "$GE_BIN" "$BUNDLE/ge"
-# Copy every dependency ldd resolves out of the SDK out dir (rd/non-rd agnostic).
-LD_LIBRARY_PATH="$SDK_LIB_DIR" ldd "$GE_BIN" \
+# Copy every dependency ldd resolves out of the SDK out dir (rd/non-rd agnostic). Under
+# `pipefail`, grep matching nothing would otherwise kill the script silently (no message)
+# right after a full build — capture the list first and fail loudly, naming the directory,
+# if it comes back empty. This is the exact failure mode the linux-amd64 subdir fix exists
+# to prevent, so it should explain itself if it ever regresses.
+SDK_SO_LIST="$(LD_LIBRARY_PATH="$SDK_LIB_DIR" ldd "$GE_BIN" \
   | awk '/=>/ {print $3}' \
-  | grep -F "$SDK_LIB_DIR/" \
-  | while read -r so; do cp -v "$so" "$BUNDLE/"; done
+  | grep -F "$SDK_LIB_DIR/" || true)"
+[ -n "$SDK_SO_LIST" ] || die "resolved zero SDK libraries under $SDK_LIB_DIR — the bundle would ship with no .so files (check SDK_LIB_DIR and the build output)"
+printf '%s\n' "$SDK_SO_LIST" | while read -r so; do cp -v "$so" "$BUNDLE/"; done
 cat > "$BUNDLE/run.sh" <<'EOS'
 #!/usr/bin/env sh
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -166,18 +209,26 @@ You must supply your own legally-owned GoldenEye 007 game data. No copyrighted
 game assets are included in this build.
 EOS
 
+# Build-only mode stops here — unconditionally, before any of the publish-side effects
+# below (tar/push/tag/gh release). This is a hard `exit 0`, not a warning: there is no
+# code path from here to `tar`/`git push`/`git tag`/`gh release create` when
+# USE_CONTAINER=0, because this branch always returns before reaching them.
+if [ "$USE_CONTAINER" -eq 0 ]; then
+  step "Build-only (--no-container): stopping before the publish steps"
+  echo "Bundle: $BUNDLE"
+  echo "NOTE: this bundle is linked against THIS HOST's glibc/libstdc++, not the release" >&2
+  echo "      container's floor — it will NOT run on Steam Deck or older distros and must" >&2
+  echo "      NOT be published (issue #12). Local testing only." >&2
+  exit 0
+fi
+
 # Verify portability BEFORE the tag is pushed, so a failure never leaves a dangling tag
 # (same reasoning as the build-before-tag ordering above).
-if [ "$USE_CONTAINER" -eq 1 ]; then
-  step "Verifying ABI floor + bundle load"
-  "$ROOT/scripts/check-abi-floor.sh" "$BUNDLE"/ge "$BUNDLE"/*.so \
-    || die "release binaries exceed the ABI floor — see issue #12"
-  "$ROOT/scripts/smoke-test-bundle.sh" "$BUNDLE" \
-    || die "bundle failed to resolve its libraries on stock ubuntu:24.04"
-else
-  echo "WARNING: --no-container build; skipping ABI floor + smoke checks." >&2
-  echo "         Do NOT publish this bundle — it is pinned to this host's glibc." >&2
-fi
+step "Verifying ABI floor + bundle load"
+run_gate "check-abi-floor.sh" "release binaries exceed the ABI floor — see issue #12" \
+  "$ROOT/scripts/check-abi-floor.sh" "$BUNDLE"/ge "$BUNDLE"/*.so
+run_gate "smoke-test-bundle.sh" "bundle failed to resolve its libraries on stock ubuntu:24.04" \
+  "$ROOT/scripts/smoke-test-bundle.sh" "$BUNDLE"
 
 TARBALL="$DIST/GoldenEye-Recomp-$TAG-linux-amd64.tar.gz"
 tar -C "$BUNDLE" -czf "$TARBALL" .

@@ -98,8 +98,15 @@ the floor deliberately — bump `ABI_MAX_GLIBC` / `ABI_MAX_GLIBCXX`, change the 
 
 ### --no-container
 
-`cut-release.sh --no-container` restores the old native build for local iteration. Its
-output is pinned to this host's glibc and **must never be published**; the script skips the
-portability checks and prints a warning when you use it.
+`cut-release.sh --no-container` is a **build-only** mode for local iteration on the Linux
+bundle: it builds `ge` natively, assembles the bundle, prints the bundle path, and stops —
+before the ABI/smoke gates, before `tar`, and before any git push/tag or GitHub release. It
+also skips the version-bump commit and the Android APK build entirely (neither is needed for
+a Linux-only local build, and skipping the APK build means you don't need the signing
+keystore either).
+
+The resulting bundle is linked against **this host's** glibc/libstdc++, not the container's
+floor, so it is not portable and **must never be published** — there is no flag or code path
+that lets a `--no-container` run reach the publish steps.
 
 Design notes: `docs/superpowers/specs/2026-08-04-linux-release-container-design.md`
