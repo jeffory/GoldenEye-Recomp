@@ -25,6 +25,7 @@
 #include "ge_menu.h"
 #include "ge_asset_check.h"
 #include "ge_postfx.h"
+#include "ge_replay.h"
 #include "ge_touchpad.h"
 
 // Relaunch the current executable as a fresh process (implemented in
@@ -169,6 +170,18 @@ class GeApp : public rex::ReXApp {
   // produces a clear error (instead of the guest faulting on the first file it
   // actually needs). Returning false vetoes the guest launch.
   bool OnPreLaunchModule() override {
+    // Install the input record/replay/bench harness before the guest starts
+    // polling gamepad state. quit_requester mirrors the pause menu's on_quit
+    // (TogglePauseMenu(), below) deferred to the UI thread -- this can be
+    // invoked from a guest thread once ge_bench_exit finishes a replay.
+    ge::ReplayInit(user_data_root(), [this] {
+      app_context().CallInUIThreadDeferred([this] {
+        if (runtime() && runtime()->kernel_state()) {
+          runtime()->kernel_state()->TerminateTitle();
+        }
+        app_context().QuitFromUIThread();
+      });
+    });
     return ge::RunStartupAssetCheck(game_data_root(), user_data_root(),
                                     app_context());
   }

@@ -1,0 +1,28 @@
+# GoldenEye XBLA: title -> solo -> Dam -> gameplay.
+# START, A, A reach the mission page; the third A opens the difficulty list,
+# whose cursor starts UNSET -- clamp it to the top with repeated DPAD_UP
+# (deterministic: always lands on Agent), then A confirms and the pre-load
+# BRIEFING appears (input-gated, stage still 90 here!). START on the briefing
+# launches the mission -- THAT is when the stage global (0x82F1E704) flips --
+# then the load runs and gameplay begins directly (no post-load screen).
+# 4-poll holds -- 2-poll presses are too short for the menu debounce.
+wait_polls 900
+press START 4
+wait_polls 300
+press A 4
+wait_polls 300
+press A 4
+wait_polls 300
+press A 4
+wait_polls 300
+press DPAD_UP 4
+wait_polls 60
+press DPAD_UP 4
+wait_polls 60
+press DPAD_UP 4
+wait_polls 60
+press A 4
+wait_polls 300
+press START 4
+wait_flag in_level 1 36000
+wait_polls 120

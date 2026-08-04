@@ -19,6 +19,7 @@ include(generated/rexglue.cmake)
 set(GE_SOURCES
     src/main.cpp
     src/ge_fps.cpp
+    src/ge_replay.cpp      # input record/replay/bench harness + poll-cadence probe
     src/ge_hooks.cpp
     src/ge_gamestate.cpp
     src/ge_menu.cpp
