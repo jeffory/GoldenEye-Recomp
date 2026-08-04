@@ -18,10 +18,13 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <string>
+#include <thread>
 
 #include "ge_dualscreen.h"
 #include "ge_fps.h"
@@ -199,7 +202,18 @@ class GeApp : public rex::ReXApp {
         if (runtime() && runtime()->kernel_state()) {
           runtime()->kernel_state()->TerminateTitle();
         }
-        app_context().QuitFromUIThread();
+        // Mirror ReXApp::OnClosing's hard-exit tail (SDK src/ui/rex_app.cpp)
+        // instead of QuitFromUIThread(): normal subsystem teardown can
+        // deadlock on a host lock still held by a straggler guest thread that
+        // TerminateTitle's cooperative drain deliberately leaves running.
+        // ge_bench_exit exists so an on-device run can quit itself
+        // unattended -- QuitFromUIThread() alone does not guarantee that.
+        if (runtime() && runtime()->graphics_system()) {
+          runtime()->graphics_system()->PersistCaches();
+        }
+        rex::FlushLogging();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::_Exit(0);
       });
     });
     return ge::RunStartupAssetCheck(game_data_root(), user_data_root(),
@@ -220,6 +234,12 @@ class GeApp : public rex::ReXApp {
   static void ApplyCvarOverrides(const std::filesystem::path& file) {
     std::error_code ec;
     if (!std::filesystem::exists(file, ec) || ec) {
+      // Logged (not silent): a wrong path or a failed `adb push` would
+      // otherwise be indistinguishable from "feature not built in", and the
+      // Phase-0 protocol's own recovery instructions tell the operator to
+      // read the resolved path back out of a GECVAR line -- which this early
+      // return would otherwise suppress entirely.
+      REXKRNL_INFO("GECVAR no override file at {} (0 overrides)", file.string());
       return;
     }
     std::ifstream in(file);
