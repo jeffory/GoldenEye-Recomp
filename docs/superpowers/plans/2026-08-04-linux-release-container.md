@@ -380,7 +380,7 @@ left as-is. The Dockerfile retool itself is a separate, later commit.)
 
 **Interfaces:**
 - Consumes: image `goldeneye-linux-release:noble` (Task 3)
-- Produces: `scripts/build-linux-container.sh [--sdk DIR] [--rebuild-image] [-j N]`. On success leaves the binary at `out/build/linux-amd64-container/GoldenEye` and the SDK shared objects in `$SDK_DIR/out-container/`. Both paths are fixed and callers derive them directly; the trailing `GE_BIN=` / `SDK_OUT=` lines it prints are informational only, for humans reading a release log.
+- Produces: `scripts/build-linux-container.sh [--sdk DIR] [--rebuild-image] [--clean] [-j N]`. On success leaves the binary at `out/build/linux-amd64-container/GoldenEye` and the SDK shared objects in `$SDK_DIR/out-container/linux-amd64/`. Both paths are fixed and callers derive them directly; the trailing `GE_BIN=` / `SDK_OUT=` lines it prints are informational only, for humans reading a release log.
 
 - [ ] **Step 1: Write the script**
 
@@ -477,7 +477,7 @@ cat /tmp/native-sdk-before.txt
 - [ ] **Step 3: Run the build**
 
 Run: `scripts/build-linux-container.sh`
-Expected: image reused from Task 3, CMake configures, Ninja builds, final output ends with `GE_BIN=.../out/build/linux-amd64-container/GoldenEye` and `SDK_OUT=.../out-container`. This is a cold full rebuild of SDK + game and will take a while.
+Expected: image reused from Task 3, CMake configures, Ninja builds, final output ends with `GE_BIN=.../out/build/linux-amd64-container/GoldenEye` and `SDK_OUT=.../out-container/linux-amd64`. This is a cold full rebuild of SDK + game and will take a while.
 
 If CMake fails on a missing C++23 library feature, that is the known `libstdc++-13` risk — apply the `libstdc++-13` fallback from Task 3 Step 3 and re-run.
 
@@ -486,7 +486,7 @@ If CMake fails on a missing C++23 library feature, that is the known `libstdc++-
 ```bash
 scripts/check-abi-floor.sh \
   out/build/linux-amd64-container/GoldenEye \
-  ~/Projects/GoldenEye-Recomp-rexglue/out-container/librexruntimerd.so
+  ~/Projects/GoldenEye-Recomp-rexglue/out-container/linux-amd64/librexruntimerd.so
 ```
 
 Expected: `ABI floor OK`. This is the moment the issue-#12 bug is actually fixed — the same command against `dist/bundle/` still fails.
@@ -581,7 +581,7 @@ Expected: FAIL. Ubuntu 24.04's libm/libstdc++ cannot satisfy `GLIBC_2.43`/`GLIBC
 ```bash
 rm -rf /tmp/ge-bundle && mkdir -p /tmp/ge-bundle
 cp out/build/linux-amd64-container/GoldenEye /tmp/ge-bundle/ge
-LD_LIBRARY_PATH=~/Projects/GoldenEye-Recomp-rexglue/out-container \
+LD_LIBRARY_PATH=~/Projects/GoldenEye-Recomp-rexglue/out-container/linux-amd64 \
   ldd out/build/linux-amd64-container/GoldenEye \
   | awk '/=>/ {print $3}' | grep -F "out-container/" \
   | while read -r so; do cp -v "$so" /tmp/ge-bundle/; done
@@ -658,7 +658,7 @@ if [ "$USE_CONTAINER" -eq 1 ]; then
   step "Building Linux amd64 in the release container (glibc 2.39 floor)"
   "$ROOT/scripts/build-linux-container.sh" --sdk "$SDK_DIR"
   GE_BIN="$(find out/build/linux-amd64-container -maxdepth 1 -type f \( -name GoldenEye -o -name ge \) | head -1)"
-  SDK_LIB_DIR="$SDK_DIR/out-container"
+  SDK_LIB_DIR="$SDK_DIR/out-container/linux-amd64"
 else
   step "Building Linux amd64 NATIVELY (relwithdebinfo) — NOT portable to older distros"
   cmake --build --preset linux-amd64-relwithdebinfo --target ge
@@ -778,7 +778,7 @@ Assemble the bundle exactly as `cut-release.sh` does, but stop before tagging:
 scripts/build-linux-container.sh
 rm -rf /tmp/ge-deck && mkdir -p /tmp/ge-deck
 cp out/build/linux-amd64-container/GoldenEye /tmp/ge-deck/ge
-LD_LIBRARY_PATH=~/Projects/GoldenEye-Recomp-rexglue/out-container \
+LD_LIBRARY_PATH=~/Projects/GoldenEye-Recomp-rexglue/out-container/linux-amd64 \
   ldd out/build/linux-amd64-container/GoldenEye \
   | awk '/=>/ {print $3}' | grep -F "out-container/" \
   | while read -r so; do cp -v "$so" /tmp/ge-deck/; done

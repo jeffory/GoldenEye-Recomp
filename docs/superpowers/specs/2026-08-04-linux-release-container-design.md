@@ -107,7 +107,7 @@ Runs the build under **podman** (rootless, and the Fedora-native choice; docker 
 but not required). Usage:
 
 ```
-scripts/build-linux-container.sh [--sdk DIR] [--rebuild-image]
+scripts/build-linux-container.sh [--sdk DIR] [--rebuild-image] [--clean] [-j N]
 ```
 
 Mount layout — the isolation is the substantive part of this script:
@@ -137,7 +137,7 @@ container that `find_library` misses and the existing `-latomic` fallback (line 
 No change needed.
 
 Output: `out/build/linux-amd64-container/GoldenEye` plus
-`$SDK_DIR/out-container/*.so` for the bundle step.
+`$SDK_DIR/out-container/linux-amd64/*.so` for the bundle step.
 
 ### 3. ABI floor gate — `scripts/check-abi-floor.sh`
 
@@ -167,7 +167,7 @@ verifies loading only — it does not launch the game, which needs a GPU and gam
 
 The `step "Building Linux amd64"` block (lines 118-124) calls `build-linux-container.sh`
 instead of `cmake --build --preset linux-amd64-relwithdebinfo`, and the dependency-copy loop
-(lines 131-134) reads from `$SDK_DIR/out-container/` instead of `$SDK_DIR/out/linux-amd64`.
+(lines 131-134) reads from `$SDK_DIR/out-container/linux-amd64/` instead of `$SDK_DIR/out/linux-amd64/`.
 The floor gate and smoke test run after bundle assembly and before the tag is pushed, so a
 failure never leaves a dangling tag — consistent with the script's existing
 build-before-tag ordering (lines 91-93).

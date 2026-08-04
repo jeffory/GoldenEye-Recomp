@@ -109,4 +109,8 @@ GE_BIN="$(find "$ROOT/$BUILD_SUBDIR" -maxdepth 1 -type f \( -name GoldenEye -o -
 
 printf '\n\033[1;32m==> Built\033[0m\n'
 echo "GE_BIN=$GE_BIN"
-echo "SDK_OUT=$SDK_OUT"
+# $SDK_OUT itself is the shadow-mount root (the SDK's out/${REX_PLATFORM} layout still applies
+# inside it), so the .so files actually land one level down, at $SDK_OUT/linux-amd64/. Print
+# that nested path — not the bare mount root — so a caller copying straight from this line
+# doesn't end up with an LD_LIBRARY_PATH/glob that silently matches zero files.
+echo "SDK_OUT=$SDK_OUT/linux-amd64"
