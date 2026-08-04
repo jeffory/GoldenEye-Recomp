@@ -25,7 +25,7 @@ the break is exactly **seven symbols** in two groups:
 | Group | Symbols | Cause |
 |---|---|---|
 | `libm` @ `GLIBC_2.43` | `sqrtf` (in `ge`); `acosf`, `asinf`, `atan2f`, `log10f` (in `librexruntimerd.so`) | glibc 2.43 version-bumped a batch of float math functions; the `@GLIBC_2.2.5` originals still exist everywhere |
-| `libstdc++` @ `GLIBCXX_3.4.35` | `std::__detail::__wait_impl`, `__notify_impl`, `__wait_args::_M_setup_proxy_wait` | GCC 15 moved `std::atomic::wait/notify` out-of-line into libstdc++; the SDK uses it in ~10 files |
+| `libstdc++` @ `GLIBCXX_3.4.35` | `std::__detail::__wait_impl`, `__notify_impl`, `__wait_args::_M_setup_proxy_wait` | GCC 16 moved `std::atomic::wait/notify` out-of-line into libstdc++; the SDK uses it in ~10 files |
 
 `libc.so.6` itself needs only `GLIBC_2.38`, so those seven symbols are the entire barrier.
 
@@ -179,6 +179,18 @@ This confirms the chosen `GLIBC 2.36` / `GLIBCXX 3.4.30` ceiling really sits bel
 and pins down the true floor for future reference. If SteamOS turns out to be *below* 2.36,
 the ceiling drops accordingly and the base image is revisited.
 
+**Measured 2026-08-04 over SSH on the Steam Deck (SteamOS, `deck@192.168.1.6`):**
+`glibc 2.41` (`glibc 2.41+r65+ge7c419a29575-1`), `GLIBCXX_3.4.34`, `CXXABI_1.3.15`, from
+`gcc-libs 15.1.1`. The 2.36 / 3.4.30 ceiling therefore sits five glibc releases and four
+GLIBCXX revisions below the target — confirmed safe, and with room to spare for players on
+non-SteamOS distros.
+
+That measurement also corrects the version attribution above: the Deck runs GCC 15.1's
+libstdc++ and tops out at `GLIBCXX_3.4.34`, and `objdump -T` on it finds **no**
+`__wait_impl` symbol under any version. The out-of-line atomic wait/notify entry points are
+therefore new in **GCC 16**, not merely re-versioned there — which is why a GCC 16 host
+build cannot run on a GCC 15 target no matter how close the versions look.
+
 1. `check-abi-floor.sh` against the **existing** `dist/bundle/{ge,librexruntimerd.so}` must
    FAIL, naming the seven known symbols. This proves the gate detects the real bug.
 2. The same script against a trivial `debian:12`-built binary must PASS.
@@ -197,7 +209,7 @@ the ceiling drops accordingly and the base image is revisited.
 
 - **libstdc++-12 must compile the SDK's C++23.** `<expected>` is the only newer-libstdc++
   header in use (SDK, 2 files) and GCC 12 has it; `std::atomic::wait/notify` is header-inline
-  before GCC 15, so the `GLIBCXX_3.4.35` dependency disappears on its own. Other C++23
+  before GCC 16, so the `GLIBCXX_3.4.35` dependency disappears on its own. Other C++23
   *library* usage that does not need a distinctive header cannot be ruled out until the first
   build runs. Fallback: `libstdc++-13` from bookworm-backports, raising the floor to
   `GLIBCXX_3.4.32` — still well under the 3.4.35 that broke us.
