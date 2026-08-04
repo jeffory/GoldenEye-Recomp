@@ -59,7 +59,8 @@ The script bumps `versionName`/`versionCode`, commits, pushes both repos + an an
 tag, builds the **signed APK** and the **Linux amd64 bundle**, generates notes (changelog +
 pinned game/SDK SHAs), and publishes the GitHub release with both assets attached.
 
-Flags: `--stable` (full release), `--allow-dirty`, `--sdk DIR` (SDK checkout path).
+Flags: `--stable` (full release), `--allow-dirty`, `--sdk DIR` (SDK checkout path),
+`--no-container` (see below).
 
 ## Verify
 
@@ -67,3 +68,38 @@ Flags: `--stable` (full release), `--allow-dirty`, `--sdk DIR` (SDK checkout pat
 apksigner verify --print-certs dist/GoldenEye-Recomp-v1.3.0-android.1-android-arm64.apk
 gh release view v1.3.0-android.1
 ```
+
+## Linux builds and the ABI floor
+
+Linux release bundles are built inside an Ubuntu 24.04 container, not on the host. A native
+Fedora build links against this workstation's glibc 2.43 / GLIBCXX_3.4.35 and will not load
+on a Steam Deck or any older distro — that was issue #12, where v1.6.0 failed with
+`version 'GLIBC_2.43' not found`. The container pins the floor at **glibc 2.39 /
+GLIBCXX_3.4.33**, below SteamOS and every currently-supported distro.
+
+`cut-release.sh` does this automatically. Two checks gate the release, both before the tag
+is pushed:
+
+- `scripts/check-abi-floor.sh` — fails if any shipped binary needs a symbol version above
+  the floor.
+- `scripts/smoke-test-bundle.sh` — fails if the bundle cannot resolve its libraries inside
+  a stock `ubuntu:24.04` runtime.
+
+### If the floor gate fails
+
+New code (usually in the SDK) pulled in a symbol that only exists in a newer glibc or
+libstdc++. The failure output names the exact symbols. Either avoid the construct, or raise
+the floor deliberately — bump `ABI_MAX_GLIBC` / `ABI_MAX_GLIBCXX`, change the base image in
+`docker/linux-release.Dockerfile`, and re-verify on a real Steam Deck before publishing.
+
+### Rebuilding the image
+
+    scripts/build-linux-container.sh --rebuild-image
+
+### --no-container
+
+`cut-release.sh --no-container` restores the old native build for local iteration. Its
+output is pinned to this host's glibc and **must never be published**; the script skips the
+portability checks and prints a warning when you use it.
+
+Design notes: `docs/superpowers/specs/2026-08-04-linux-release-container-design.md`

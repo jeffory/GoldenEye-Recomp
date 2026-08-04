@@ -6,7 +6,7 @@
 # your own GoldenEye 007 XEX), so releases are built locally and uploaded here.
 #
 # Usage:
-#   scripts/cut-release.sh v1.3.0-android.1 [--stable] [--allow-dirty] [--sdk DIR]
+#   scripts/cut-release.sh v1.3.0-android.1 [--stable] [--allow-dirty] [--sdk DIR] [--no-container]
 #
 #   <version>      Required. Tag/name, e.g. v1.3.0-android.1 (leading 'v' optional
 #                  in versionName, kept in the git tag).
@@ -14,6 +14,9 @@
 #   --allow-dirty  Skip the clean-working-tree check.
 #   --sdk DIR      Path to the ReXGlue SDK checkout
 #                  (default: /home/keith/Projects/GoldenEye-Recomp-rexglue).
+#   --no-container Build the Linux bundle natively instead of in the Ubuntu 24.04
+#                  container. The native build is pinned to this host's glibc and
+#                  will NOT run on Steam Deck or older distros (issue #12).
 set -euo pipefail
 
 # --- args -------------------------------------------------------------------
@@ -21,11 +24,13 @@ VERSION=""
 PRERELEASE=1
 ALLOW_DIRTY=0
 SDK_DIR="/home/keith/Projects/GoldenEye-Recomp-rexglue"
+USE_CONTAINER=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --stable) PRERELEASE=0 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
     --sdk) SDK_DIR="$2"; shift ;;
+    --no-container) USE_CONTAINER=0 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     v*|[0-9]*) VERSION="$1" ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -50,6 +55,9 @@ die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 step "Preconditions"
 command -v gh >/dev/null   || die "gh CLI not found"
 gh auth status >/dev/null 2>&1 || die "gh not authenticated (gh auth login)"
+if [ "$USE_CONTAINER" -eq 1 ]; then
+  command -v podman >/dev/null || die "podman not found (or pass --no-container)"
+fi
 [ -d "$ROOT/generated" ]   || die "generated/ missing — run 'rexglue codegen' against your XEX first"
 [ -f "android/keystore.properties" ] || die "android/keystore.properties missing — see docs/RELEASING.md (keytool genkeypair)"
 [ -f "android/release.jks" ]         || die "android/release.jks missing — see docs/RELEASING.md"
@@ -116,21 +124,31 @@ SIGNED_APK="android/app/build/outputs/apk/release/app-release.apk"
 cp "$SIGNED_APK" "$APK_OUT"
 
 # --- build: Linux amd64 release bundle -------------------------------------
-step "Building Linux amd64 (ge, relwithdebinfo — keeps symbols for crash diagnosis)"
-cmake --build --preset linux-amd64-relwithdebinfo --target ge
-# The CMake target is `ge` but its OUTPUT_NAME is `GoldenEye`, so the built file
-# is `GoldenEye` (older builds emitted `ge`). Accept either.
-GE_BIN="$(find out/build/linux-amd64-relwithdebinfo -maxdepth 1 -type f \( -name GoldenEye -o -name ge \) | head -1)"
-[ -n "$GE_BIN" ] && [ -f "$GE_BIN" ] || die "GoldenEye/ge binary not found under out/build/linux-amd64-relwithdebinfo"
+# Built in the Ubuntu 24.04 container by default: a native Fedora build inherits this
+# host's glibc 2.43 / GLIBCXX_3.4.35 floor and will not load on a Steam Deck (#12).
+if [ "$USE_CONTAINER" -eq 1 ]; then
+  step "Building Linux amd64 in the release container (glibc 2.39 floor)"
+  "$ROOT/scripts/build-linux-container.sh" --sdk "$SDK_DIR"
+  GE_BIN="$(find out/build/linux-amd64-container -maxdepth 1 -type f \( -name GoldenEye -o -name ge \) | head -1)"
+  SDK_LIB_DIR="$SDK_DIR/out-container/linux-amd64"
+else
+  step "Building Linux amd64 NATIVELY (relwithdebinfo) — NOT portable to older distros"
+  cmake --build --preset linux-amd64-relwithdebinfo --target ge
+  # The CMake target is `ge` but its OUTPUT_NAME is `GoldenEye`, so the built file
+  # is `GoldenEye` (older builds emitted `ge`). Accept either.
+  GE_BIN="$(find out/build/linux-amd64-relwithdebinfo -maxdepth 1 -type f \( -name GoldenEye -o -name ge \) | head -1)"
+  SDK_LIB_DIR="$SDK_DIR/out/linux-amd64"
+fi
+[ -n "$GE_BIN" ] && [ -f "$GE_BIN" ] || die "GoldenEye/ge binary not found"
 
 step "Assembling Linux bundle (ge + resolved .so deps)"
 BUNDLE="$DIST/bundle"
 mkdir -p "$BUNDLE"
 cp "$GE_BIN" "$BUNDLE/ge"
 # Copy every dependency ldd resolves out of the SDK out dir (rd/non-rd agnostic).
-LD_LIBRARY_PATH="$SDK_DIR/out/linux-amd64" ldd "$GE_BIN" \
+LD_LIBRARY_PATH="$SDK_LIB_DIR" ldd "$GE_BIN" \
   | awk '/=>/ {print $3}' \
-  | grep -F "$SDK_DIR/out/linux-amd64/" \
+  | grep -F "$SDK_LIB_DIR/" \
   | while read -r so; do cp -v "$so" "$BUNDLE/"; done
 cat > "$BUNDLE/run.sh" <<'EOS'
 #!/usr/bin/env sh
@@ -147,6 +165,20 @@ Run:   ./run.sh                          (expects game data in ./assets)
 You must supply your own legally-owned GoldenEye 007 game data. No copyrighted
 game assets are included in this build.
 EOS
+
+# Verify portability BEFORE the tag is pushed, so a failure never leaves a dangling tag
+# (same reasoning as the build-before-tag ordering above).
+if [ "$USE_CONTAINER" -eq 1 ]; then
+  step "Verifying ABI floor + bundle load"
+  "$ROOT/scripts/check-abi-floor.sh" "$BUNDLE"/ge "$BUNDLE"/*.so \
+    || die "release binaries exceed the ABI floor — see issue #12"
+  "$ROOT/scripts/smoke-test-bundle.sh" "$BUNDLE" \
+    || die "bundle failed to resolve its libraries on stock ubuntu:24.04"
+else
+  echo "WARNING: --no-container build; skipping ABI floor + smoke checks." >&2
+  echo "         Do NOT publish this bundle — it is pinned to this host's glibc." >&2
+fi
+
 TARBALL="$DIST/GoldenEye-Recomp-$TAG-linux-amd64.tar.gz"
 tar -C "$BUNDLE" -czf "$TARBALL" .
 
