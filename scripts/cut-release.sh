@@ -61,10 +61,14 @@ run_gate() {
   local desc="$1" finding_msg="$2"; shift 2
   "$@" && return 0
   local rc=$?
+  # Both call sites run only after the version-bump commit above (USE_CONTAINER=1
+  # is required to reach here), so on either failure path the operator is left
+  # holding that local commit — tell them how to back it out.
+  local recover="(a local version-bump commit exists — recover with: git reset --hard HEAD~1)"
   if [ "$rc" -eq 1 ]; then
-    die "$finding_msg"
+    die "$finding_msg $recover"
   else
-    die "$desc exited $rc (infra/usage error, NOT a real finding — see its output above)"
+    die "$desc exited $rc (infra/usage error, NOT a real finding — see its output above) $recover"
   fi
 }
 
@@ -147,7 +151,17 @@ if [ "$USE_CONTAINER" -eq 1 ]; then
 fi
 
 # --- prepare dist dir ---------------------------------------------------------
-rm -rf "$DIST"; mkdir -p "$DIST"
+if [ "$USE_CONTAINER" -eq 1 ]; then
+  # Full release: wipe dist/ so no stale artifact from a previous run can leak into
+  # this release's upload.
+  rm -rf "$DIST"; mkdir -p "$DIST"
+else
+  # Build-only mode: dist/ may hold a previous real release's APK/tarball/notes —
+  # do not touch those. Only clear the bundle subdirectory this run is about to
+  # rebuild.
+  mkdir -p "$DIST"
+  rm -rf "$DIST/bundle"
+fi
 
 # --- build: Android signed release APK -------------------------------------
 # Skipped in build-only mode: it serves no purpose in a Linux-only local build and needs

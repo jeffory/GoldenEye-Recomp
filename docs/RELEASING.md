@@ -96,6 +96,15 @@ the floor deliberately — bump `ABI_MAX_GLIBC` / `ABI_MAX_GLIBCXX`, change the 
 
     scripts/build-linux-container.sh --rebuild-image
 
+### SDK-side build output
+
+Container builds write their SDK artifacts to `$SDK_DIR/out-container/` (separate from the
+native `out/linux-amd64` used by `--no-container`), so this directory shows up as untracked
+in the SDK checkout's `git status` — that's expected, not a sign of a stray build; the SDK
+repo's `.gitignore` doesn't cover it (its `[Oo]ut/` pattern doesn't match `out-container/`),
+so don't `git clean` it away casually or you'll just force a full rebuild. `--clean` or a
+toolchain change will regenerate it either way.
+
 ### --no-container
 
 `cut-release.sh --no-container` is a **build-only** mode for local iteration on the Linux
