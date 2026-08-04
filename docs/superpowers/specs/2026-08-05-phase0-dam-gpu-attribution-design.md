@@ -93,10 +93,20 @@ Android reads no config file and takes no CLI. Cvars are hardcoded `SetFlagByNam
 `GeApp::OnConfigurePaths` (`src/ge_app.h:63-106`), and `render_target_path_vulkan` is init-only. A
 three-config A/B would therefore cost three rebuild-and-install cycles per repetition.
 
-**Required:** read cvar overrides from a file under the app's external files directory during
-`OnConfigurePaths`, applied after the existing hardcoded defaults so it can override them. `adb push`
-then swaps configs between runs. This is small, self-contained, and removes the rebuild tax from
-every future on-device experiment, not just this one.
+**Required:** read cvar overrides from a file under the app's user-data directory, applied after the
+existing hardcoded defaults so it can override them. `adb push` then swaps configs between runs. This
+is small, self-contained, and removes the rebuild tax from every future on-device experiment, not
+just this one.
+
+**Call site — `OnPostInitLogging()`, not `OnConfigurePaths()`.** This was found during
+implementation: `OnConfigurePaths` runs *before* `rex::InitLogging()` (SDK `src/ui/rex_app.cpp:132`
+vs `:158`), so every `GECVAR` line logged from there goes to a stdout-only early sink that
+`InitLogging` later discards — the overrides would still apply, but the audit trail would never reach
+`--log_file` or Android's `ge.log`, defeating the whole point of a pushable config on a device
+reached only over `adb`. `OnPostInitLogging` (`:164`) runs after logging is real and still well
+before `SetupPresentation` and the actual `render_target_path_vulkan` reader
+(`VulkanRenderTargetCache::Initialize`), so init-only cvars are still set in time. It also runs after
+`LoadConfig`, so the override beats a stale `ge.toml` as well as the hardcoded defaults.
 
 ### 4.3 perf_report.py parses neither GEBENCH nor the EDRAM lines
 
