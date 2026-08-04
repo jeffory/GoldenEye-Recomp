@@ -238,11 +238,16 @@ fi
 
 # Verify portability BEFORE the tag is pushed, so a failure never leaves a dangling tag
 # (same reasoning as the build-before-tag ordering above).
-step "Verifying ABI floor + bundle load"
+step "Verifying ABI floor + bundle load + build parity"
 run_gate "check-abi-floor.sh" "release binaries exceed the ABI floor — see issue #12" \
   "$ROOT/scripts/check-abi-floor.sh" "$BUNDLE"/ge "$BUNDLE"/*.so
 run_gate "smoke-test-bundle.sh" "bundle failed to resolve its libraries on stock ubuntu:24.04" \
   "$ROOT/scripts/smoke-test-bundle.sh" "$BUNDLE"
+# Container builds silently drop SDL3 backends (audio, udev) whose -dev packages are missing
+# from the build image — a distinct failure mode from the ABI gate above, and the one that
+# shipped a boot-deadlocking, audio-less build once already (see docker/linux-release.Dockerfile).
+run_gate "check-build-parity.sh" "release build is missing capabilities the native build has — see docker/linux-release.Dockerfile" \
+  "$ROOT/scripts/check-build-parity.sh" "$SDK_LIB_DIR/librexruntimerd.so"
 
 TARBALL="$DIST/GoldenEye-Recomp-$TAG-linux-amd64.tar.gz"
 tar -C "$BUNDLE" -czf "$TARBALL" .

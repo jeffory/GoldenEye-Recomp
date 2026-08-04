@@ -20,9 +20,23 @@ ARG LLVM_VERSION=19
 ARG CMAKE_VERSION=3.31.6
 ENV DEBIAN_FRONTEND=noninteractive
 
-# libgtk-3-dev, libx11-xcb-dev and libxi-dev are the external deps the build needs: the
-# SDK's src/ui/CMakeLists.txt does pkg_check_modules(... REQUIRED gtk+-3.0 / x11-xcb / xi)
-# for the GTK window, the XCB surface handle, and XInput2 raw mouse motion respectively.
+# This list is a *capability* contract, not just a link-time one — get it wrong and the
+# build still succeeds. SDL3 is vendored and its CMake auto-detects optional backends
+# (audio, input hotplug, ...) at configure time from whatever -dev packages/pkg-config
+# modules happen to be on the image, and it silently compiles out anything it can't find —
+# no error, no warning, just a smaller binary. That is exactly how this image shipped a
+# regression once already: it had libgtk-3-dev/libx11-xcb-dev/libxi-dev (for the SDK's own
+# src/ui/CMakeLists.txt pkg_check_modules(... REQUIRED gtk+-3.0 / x11-xcb / xi), for the GTK
+# window, XCB surface handle, and XInput2 raw mouse motion) but nothing for SDL3's audio or
+# udev backends, so the container-built librexruntimerd.so came out with no ALSA_bootstrap /
+# PULSEAUDIO_bootstrap symbols and no libpulse.so.0 / libasound.so.2 / libudev.so dlopen
+# sonames — SDL_InitSubSystem(SDL_INIT_AUDIO) has nothing to bind to, and the guest's audio
+# registration fails, deadlocking boot with no window (confirmed on a Steam Deck; only
+# forcing SDL_AUDIODRIVER=dummy unblocks it). libpulse-dev, libasound2-dev and libudev-dev
+# restore parity with the native Fedora build: PulseAudio + ALSA audio backends and udev
+# (gamepad hotplug detection — matters a lot on a handheld). scripts/check-build-parity.sh
+# gates the built .so for these capabilities so this can't silently regress again.
+#
 # SDL3, Vulkan-Headers, volk, FFmpeg, glslang, SPIRV-Tools and imgui are all vendored
 # submodules, and Vulkan itself is loaded through volk at runtime.
 #
@@ -33,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates wget gnupg \
       ninja-build pkg-config python3 git file binutils \
       g++-13 libstdc++-13-dev libgtk-3-dev libx11-xcb-dev libxi-dev \
+      libpulse-dev libasound2-dev libudev-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu 24.04's stock clang cannot do -std=c++23 the way the project needs; pull clang-19
