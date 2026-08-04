@@ -119,9 +119,15 @@ and keeps Phase 0 free of SDK changes.
 - **Capture:** `ge.log` per run — GEBENCH, GEFPS, GESHOWN, GESPIKE, EDRAM round-trip lines, with
   `vulkan_edram_roundtrip_stats=true` and `ge_gpu_timestamps=true`.
 - **Analysis:** `scripts/perf_report.py`, extended per §4.3.
-- **Verification:** release-build confirmation before trusting any on-device result — debug and
-  release APKs diverge on SELinux-gated behavior (see `android-release-vs-debug-selinux-ptrace`
-  memory; that difference silently broke a shipped feature once already).
+- **Build config: RelWithDebInfo, not Release.** Perf counters are compile-gated on
+  `REXGLUE_ENABLE_PERF_COUNTERS`, which the SDK defines for every config *except* Release
+  (`CMakeLists.txt:33`). In a Release build every `PROFILE_*` macro expands to nothing and
+  `kGpuFrameUs` / `kDrawCalls` read zero — the measurement is impossible there by construction.
+  RelWithDebInfo is optimized (`-O2`), so the timings remain representative. Android's Gradle debug
+  variant maps to CMake RelWithDebInfo, so `:app:installDebug` is the correct measurement build.
+  The separate "verify features on a release APK" rule (see `android-release-vs-debug-selinux-ptrace`
+  memory) governs *shipped behavior*, not this diagnostic run — but any fix that later comes out of
+  this work is still subject to it.
 
 ## 6. Risks
 
