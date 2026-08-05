@@ -662,13 +662,46 @@ This plan originally called for grepping `render_target_cache.cpp:355-395` for a
 
 The reliable signal is upstream of path selection: the Vulkan device bring-up log (`"Vulkan device properties and enabled features:"`, SDK `vulkan_device.cpp:543`) unconditionally lists every *supported* feature bit at device-creation time, before `render_target_path_vulkan` is even read. `fsi_path_supported` requires (`render_target_cache.cpp:258-263`) `fragmentShaderSampleInterlock` or `fragmentShaderPixelInterlock`, plus `fragmentStoresAndAtomics` and `sampleRateShading` (each logged as a bare `* name` line only when supported — confirmed from the `XE_UI_VULKAN_FEATURE_2` macro, which gates the log line on the feature being true) and `standardSampleLocations: 1` (a limit, always logged with its value) — all inside that one block.
 
+Use **two independent signals**. Do not use a line-window (`grep -A40`) to scope the feature search: the
+feature lines are emitted at offsets of roughly +36 to +71 lines from that header, so any fixed window
+silently truncates the list and makes a supported device look unsupported. These strings appear
+nowhere else in the log, so grep the file whole.
+
 ```bash
 run_config fsi "render_target_path_vulkan=fsi\n" probe
-grep -A40 "Vulkan device properties and enabled features" phase0-fsi-repprobe.log | \
-  grep -E "fragmentShaderSampleInterlock|fragmentShaderPixelInterlock|fragmentStoresAndAtomics|sampleRateShading|standardSampleLocations"
+L=phase0-fsi-repprobe.log
+
+# Signal 1 — necessary condition: does the device expose the features fsi_path_supported requires?
+grep -E "fragmentShaderSampleInterlock|fragmentShaderPixelInterlock|fragmentStoresAndAtomics|sampleRateShading|standardSampleLocations" "$L"
+
+# Signal 2 — behavioral confirmation: did fsi ACTUALLY take effect?
+grep -c "EDRAM round-trips" "$L"
 ```
 
-Expected: `fragmentShaderSampleInterlock` or `fragmentShaderPixelInterlock` present, `fragmentStoresAndAtomics` present, `sampleRateShading` present, `standardSampleLocations: 1`. If any is missing, `fsi` cannot be selected on this device — stop here. Do not run the `fbo`/`fsi` legs of the matrix; record the verdict as **inconclusive** per spec §2. (The `default`/`scale2` runs in Step 5 still validate the baseline decomposition independent of this — keep those — but do not substitute EDRAM counts or any other signal for the void primary discriminator.)
+**Signal 1 (necessary):** expect `fragmentShaderSampleInterlock` or `fragmentShaderPixelInterlock`,
+plus `fragmentStoresAndAtomics`, `sampleRateShading`, and `standardSampleLocations: 1`. Each feature
+is logged as a bare `* name` line only when supported (the `XE_UI_VULKAN_FEATURE_2` macro gates the
+line on the bit being true), so absence means unsupported.
+
+**Signal 2 (sufficient, and the one that actually proves it):** `g_edram_roundtrip_stats` is only
+reachable from the host-render-targets path — its two call sites are inside
+`case Path::kHostRenderTargets:` (`render_target_cache.cpp:1652,1674`) and inside
+`PerformTransfersAndResolveClears`, which opens with
+`assert_true(GetPath() == Path::kHostRenderTargets)` (`:4829,4835`). So with
+`vulkan_edram_roundtrip_stats=true` and `render_target_path_vulkan=fsi`, **any** `EDRAM round-trips`
+line is proof that `fsi` did *not* take effect and the run silently fell back to `fbo`. A count of 0
+during real gameplay, with Signal 1 satisfied, means `fsi` is genuinely active.
+
+Read the two together: Signal 1 alone is necessary but not sufficient (the downgrade at
+`render_target_cache.cpp:291-293` is silent), and Signal 2 alone could read 0 on a run that never
+rendered enough to trigger a round-trip — which is why the probe replays actual gameplay rather than
+sitting at the menu.
+
+If `fsi` is unavailable — Signal 1 incomplete, or Signal 2 non-zero — stop here. Do not run the
+`fbo`/`fsi` legs of the matrix; record the verdict as **inconclusive** per spec §2. (The
+`default`/`scale2` runs in Step 5 still validate the baseline decomposition independent of this —
+keep those — but do not substitute EDRAM counts or any other signal for the void primary
+discriminator.)
 
 - [ ] **Step 5: Run the protocol, interleaved**
 
