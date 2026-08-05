@@ -74,7 +74,7 @@ The branch ships a record→replay loop-back self-test. This is the repo's estab
 
 ```bash
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets \
   --ge_replay_selftest=true --log_level=info 2>&1 | grep -i "selftest"
 ```
 
@@ -210,7 +210,7 @@ A zero `gpu_med_ms` means either GPU timestamps are off or the build lacks perf 
 
 ```bash
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets \
   --ge_replay_macro=bench/dam.macro --ge_replay_play=bench/dam-walk.gerp \
   --ge_gpu_timestamps=true --ge_bench_exit=true --log_level=info \
   --log_file=/tmp/claude-1000/-home-keith-Projects-GoldenEye-Recomp/bef81402-f292-48e5-8003-ea1a62aef9f9/scratchpad/ge-task2.log
@@ -349,7 +349,7 @@ Expected: success. A compile error about `paths.user_data_root` being unpopulate
 ```bash
 SCRATCH=/tmp/claude-1000/-home-keith-Projects-GoldenEye-Recomp/bef81402-f292-48e5-8003-ea1a62aef9f9/scratchpad
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets --log_level=info \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets --log_level=info \
   --log_file=$SCRATCH/ge-task3-nofile.log &
 sleep 25 && kill %1 2>/dev/null
 grep "GECVAR" $SCRATCH/ge-task3-nofile.log
@@ -362,7 +362,7 @@ Then create an override file at the recorded path and confirm it applies:
 ```bash
 printf '# phase-0 test\nge_fps_log=true\nrender_target_path_vulkan=fbo\n' > <recorded-path>/ge_cvars.txt
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets --log_level=info \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets --log_level=info \
   --log_file=$SCRATCH/ge-task3-withfile.log &
 sleep 25 && kill %1 2>/dev/null
 grep "GECVAR\|render target" $SCRATCH/ge-task3-withfile.log
@@ -375,7 +375,7 @@ Expected: two `GECVAR override applied` lines, `GECVAR applied 2 override(s)`, a
 ```bash
 printf 'garbage line with no equals\n=missingname\nnot_a_real_cvar=7\n\n# comment only\n' > <recorded-path>/ge_cvars.txt
 LD_LIBRARY_PATH=../GoldenEye-Recomp-rexglue/out/linux-amd64 \
-  ./out/linux-amd64/ge --game_data_root=$PWD/assets --log_level=info \
+  ./out/build/linux-amd64-relwithdebinfo/GoldenEye --game_data_root=$PWD/assets --log_level=info \
   --log_file=$SCRATCH/ge-task3-malformed.log &
 sleep 25 && kill %1 2>/dev/null
 grep "GECVAR" $SCRATCH/ge-task3-malformed.log
@@ -596,7 +596,8 @@ Everything before this was tooling. This task produces the actual Phase-0 delive
 
 **Files:**
 - Create: `docs/superpowers/reports/2026-08-05-phase0-dam-verdict.md`
-- Create (transient, on device): `/sdcard/Android/data/com.sunjaycy.goldeneye/files/ge_cvars.txt`
+- Create (transient, on device): `/sdcard/Android/data/com.sunjaycy.goldeneye/files/user/ge_cvars.txt`
+- Push (transient, on device, once): `bench/dam-walk.gerp` → `.../files/user/ge_replay.bin`, `bench/dam.macro` → `.../files/user/ge_replay.macro`
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–4
@@ -613,8 +614,11 @@ The Gradle debug variant maps to CMake RelWithDebInfo, so perf counters are comp
 
 - [ ] **Step 2: Confirm the override file works on device before spending any run time**
 
+`user_data_root` is `<ext>/user`, NOT `<ext>` (SDK `windowed_app_main_android.cpp:63` passes `--user_data_root=<ext>/user`; `GeApp::OnConfigurePaths` never rewrites it, and `ge_app.h`'s `OnPostInitLogging` reads `user_data_root() / "ge_cvars.txt"`) — so the override file goes under `.../files/user/`. `ge.log` itself stays directly under `.../files/`: its path is set separately (`--log_file=<ext>/ge.log`), unaffected by this.
+
 ```bash
-adb shell 'printf "ge_fps_log=true\n" > /sdcard/Android/data/com.sunjaycy.goldeneye/files/ge_cvars.txt'
+adb shell 'mkdir -p /sdcard/Android/data/com.sunjaycy.goldeneye/files/user'
+adb shell 'printf "ge_fps_log=true\n" > /sdcard/Android/data/com.sunjaycy.goldeneye/files/user/ge_cvars.txt'
 adb shell am force-stop com.sunjaycy.goldeneye
 adb shell monkey -p com.sunjaycy.goldeneye -c android.intent.category.LAUNCHER 1
 sleep 45
@@ -623,15 +627,22 @@ adb shell 'grep GECVAR /sdcard/Android/data/com.sunjaycy.goldeneye/files/ge.log'
 
 Expected: `GECVAR override applied: ge_fps_log=true` and `GECVAR applied 1 override(s)`.
 
-If the file is not found, the path `paths.user_data_root` resolves to on Android differs from the log directory — read the path out of the `GECVAR applied 0 override(s) from <path>` line and use that instead. Do not proceed until an override demonstrably applies; the entire protocol depends on it.
+If the file is not found, read the resolved path out of the `GECVAR no override file at <path> (0 overrides)` line (a fix-wave review addition; see `src/ge_app.h`'s `ApplyCvarOverrides`) rather than guessing — that is ground truth for wherever `user_data_root()` actually resolves to on this device. Do not proceed until an override demonstrably applies; the entire protocol depends on it.
 
-- [ ] **Step 3: Establish the run recipe**
+- [ ] **Step 3: Push the replay assets and establish the run recipe**
+
+`bench/` is not packaged in the APK (nothing in `android/app/build.gradle` references it), so `--ge_replay_play=bench/dam-walk.gerp` cannot resolve on device. `ReplayInit`'s fallback (`src/ge_replay.cpp:738-749`) covers exactly this: when `ge_replay_play`/`ge_replay_macro` are EMPTY it looks for well-known files `ge_replay.bin` / `ge_replay.macro` under `user_data_root`. Push the two benchmark assets there ONCE, under those names, and leave both cvars unset in every `run_config` call below (do not put `ge_replay_play=`/`ge_replay_macro=` lines in the pushed `ge_cvars.txt`).
+
+```bash
+adb push bench/dam-walk.gerp /sdcard/Android/data/com.sunjaycy.goldeneye/files/user/ge_replay.bin
+adb push bench/dam.macro /sdcard/Android/data/com.sunjaycy.goldeneye/files/user/ge_replay.macro
+```
 
 One run = push a config, force-stop, launch, wait for the replay to finish and `ge_bench_exit` to quit, pull `ge.log` (it truncates per run, so pull before the next launch).
 
 ```bash
 run_config() {  # $1 = config name, $2 = extra cvar lines, $3 = rep number
-  adb shell "printf 'ge_fps_log=true\nge_spike_log=true\nge_gpu_timestamps=true\nvulkan_edram_roundtrip_stats=true\nge_replay_macro=bench/dam.macro\nge_replay_play=bench/dam-walk.gerp\nge_bench_exit=true\n$2' > /sdcard/Android/data/com.sunjaycy.goldeneye/files/ge_cvars.txt"
+  adb shell "printf 'ge_fps_log=true\nge_spike_log=true\nge_gpu_timestamps=true\nvulkan_edram_roundtrip_stats=true\nge_bench_exit=true\n$2' > /sdcard/Android/data/com.sunjaycy.goldeneye/files/user/ge_cvars.txt"
   adb shell am force-stop com.sunjaycy.goldeneye
   adb shell monkey -p com.sunjaycy.goldeneye -c android.intent.category.LAUNCHER 1
   # Wait for the app to exit on its own (ge_bench_exit). Poll rather than sleep.
@@ -643,11 +654,58 @@ run_config() {  # $1 = config name, $2 = extra cvar lines, $3 = rep number
 }
 ```
 
-Note: `bench/dam-walk.gerp` and `bench/dam.macro` must be reachable on device. If the replay does not start, check whether the APK packages `bench/` — if it does not, push the two files to the app's files directory and point the cvars at absolute paths there.
+- [ ] **Step 4: Probe `fsi` FIRST — before spending the 90-minute matrix**
 
-- [ ] **Step 4: Run the protocol, interleaved**
+Do this before Step 5, not after. The full 3×3 matrix costs on the order of 90 minutes; if `fsi` is unavailable on this Adreno the primary discriminator is void per spec §2, and running the whole matrix first would waste most of that time on a verdict already known to be inconclusive. One short run settles it up front.
 
-Run order is interleaved by design: paint time is documented degrading 4.8→36ms over minutes, so running all of one config then the next would confound config with device temperature.
+This plan originally called for grepping `render_target_cache.cpp:355-395` for a fallback WARN. Verified against the actual SDK source: that WARN fires only in the *opposite* direction — switching FROM host render targets TO `fsi` because 16-bit render-target formats are unsupported (a `fbo`/`any` concern). The transition this probe actually needs to detect — an explicit `fsi` request silently downgrading to `fbo` because `fsi_path_supported` is false (`render_target_cache.cpp:264-293`) — has **no log line at all**; `path_` is just reassigned with zero diagnostic trace. Grepping for that WARN would therefore never fire and prove nothing either way.
+
+The reliable signal is upstream of path selection: the Vulkan device bring-up log (`"Vulkan device properties and enabled features:"`, SDK `vulkan_device.cpp:543`) unconditionally lists every *supported* feature bit at device-creation time, before `render_target_path_vulkan` is even read. `fsi_path_supported` requires (`render_target_cache.cpp:258-263`) `fragmentShaderSampleInterlock` or `fragmentShaderPixelInterlock`, plus `fragmentStoresAndAtomics` and `sampleRateShading` (each logged as a bare `* name` line only when supported — confirmed from the `XE_UI_VULKAN_FEATURE_2` macro, which gates the log line on the feature being true) and `standardSampleLocations: 1` (a limit, always logged with its value) — all inside that one block.
+
+Use **two independent signals**. Do not use a line-window (`grep -A40`) to scope the feature search: the
+feature lines are emitted at offsets of roughly +36 to +71 lines from that header, so any fixed window
+silently truncates the list and makes a supported device look unsupported. These strings appear
+nowhere else in the log, so grep the file whole.
+
+```bash
+run_config fsi "render_target_path_vulkan=fsi\n" probe
+L=phase0-fsi-repprobe.log
+
+# Signal 1 — necessary condition: does the device expose the features fsi_path_supported requires?
+grep -E "fragmentShaderSampleInterlock|fragmentShaderPixelInterlock|fragmentStoresAndAtomics|sampleRateShading|standardSampleLocations" "$L"
+
+# Signal 2 — behavioral confirmation: did fsi ACTUALLY take effect?
+grep -c "EDRAM round-trips" "$L"
+```
+
+**Signal 1 (necessary):** expect `fragmentShaderSampleInterlock` or `fragmentShaderPixelInterlock`,
+plus `fragmentStoresAndAtomics`, `sampleRateShading`, and `standardSampleLocations: 1`. Each feature
+is logged as a bare `* name` line only when supported (the `XE_UI_VULKAN_FEATURE_2` macro gates the
+line on the bit being true), so absence means unsupported.
+
+**Signal 2 (sufficient, and the one that actually proves it):** `g_edram_roundtrip_stats` is only
+reachable from the host-render-targets path — its two call sites are inside
+`case Path::kHostRenderTargets:` (`render_target_cache.cpp:1652,1674`) and inside
+`PerformTransfersAndResolveClears`, which opens with
+`assert_true(GetPath() == Path::kHostRenderTargets)` (`:4829,4835`). So with
+`vulkan_edram_roundtrip_stats=true` and `render_target_path_vulkan=fsi`, **any** `EDRAM round-trips`
+line is proof that `fsi` did *not* take effect and the run silently fell back to `fbo`. A count of 0
+during real gameplay, with Signal 1 satisfied, means `fsi` is genuinely active.
+
+Read the two together: Signal 1 alone is necessary but not sufficient (the downgrade at
+`render_target_cache.cpp:291-293` is silent), and Signal 2 alone could read 0 on a run that never
+rendered enough to trigger a round-trip — which is why the probe replays actual gameplay rather than
+sitting at the menu.
+
+If `fsi` is unavailable — Signal 1 incomplete, or Signal 2 non-zero — stop here. Do not run the
+`fbo`/`fsi` legs of the matrix; record the verdict as **inconclusive** per spec §2. (The
+`default`/`scale2` runs in Step 5 still validate the baseline decomposition independent of this —
+keep those — but do not substitute EDRAM counts or any other signal for the void primary
+discriminator.)
+
+- [ ] **Step 5: Run the protocol, interleaved**
+
+Only proceed here if Step 4 confirmed `fsi` is supported. Run order is interleaved by design: paint time is documented degrading 4.8→36ms over minutes, so running all of one config then the next would confound config with device temperature.
 
 ```bash
 for rep in 1 2 3; do
@@ -659,16 +717,6 @@ run_config scale2 "resolution_scale=2\n" 1
 ```
 
 Between reps, let the device idle a few minutes to shed heat. Record the wall-clock start time of each run.
-
-- [ ] **Step 5: Check whether `fsi` was actually selected**
-
-The path auto-falls back and logs the reason if the device cannot support it. If `fsi` silently became `fbo`, the primary discriminator is void.
-
-```bash
-grep -i "fragment shader interlock\|render target path\|switching to" phase0-fsi-rep1.log
-```
-
-Expected: confirmation the FSI path is active. If it fell back, the verdict is **inconclusive** per the spec — record which, and do not substitute a different discriminator.
 
 - [ ] **Step 6: Analyze**
 

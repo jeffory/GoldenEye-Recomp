@@ -8,6 +8,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/logging/macros.h>
 #include <rex/perf/counter.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
@@ -17,14 +18,20 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
+#include <thread>
 
 #include "ge_dualscreen.h"
 #include "ge_fps.h"
 #include "ge_menu.h"
 #include "ge_asset_check.h"
 #include "ge_postfx.h"
+#include "ge_replay.h"
 #include "ge_touchpad.h"
 
 // Relaunch the current executable as a fresh process (implemented in
@@ -115,6 +122,23 @@ class GeApp : public rex::ReXApp {
     // it is never written here (writing default==default is a no-op anyway).
   }
 
+  // Runs right after rex::InitLogging(), still early in SetupEnvironment --
+  // well before SetupPresentation touches init-only cvars like
+  // render_target_path_vulkan. Deliberately NOT called from the end of
+  // OnConfigurePaths above: that runs *before* rex::InitLogging() (see
+  // ReXApp::SetupEnvironment), so any REXKRNL_* logging done from there is
+  // silently served by a lazily-created early stdout-only logger and never
+  // reaches --log_file / ge.log -- verified empirically (the GECVAR lines
+  // showed up on stdout but never in the log file) before moving the call
+  // here. user_data_root() is used instead of a PathConfig& (this hook takes
+  // none) -- it is populated from the same path_config right after
+  // OnConfigurePaths returns, so it holds the identical value.
+  void OnPostInitLogging() override {
+    // Last, so a pushed file can override every default set in
+    // OnConfigurePaths above. See ApplyCvarOverrides for why this exists.
+    ApplyCvarOverrides(user_data_root() / "ge_cvars.txt");
+  }
+
   // Register the ESC pause-menu keybind and (conditionally) the overlay
   // dialogs once the ImGui drawer exists.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
@@ -169,11 +193,97 @@ class GeApp : public rex::ReXApp {
   // produces a clear error (instead of the guest faulting on the first file it
   // actually needs). Returning false vetoes the guest launch.
   bool OnPreLaunchModule() override {
+    // Install the input record/replay/bench harness before the guest starts
+    // polling gamepad state. quit_requester mirrors the pause menu's on_quit
+    // (TogglePauseMenu(), below) deferred to the UI thread -- this can be
+    // invoked from a guest thread once ge_bench_exit finishes a replay.
+    ge::ReplayInit(user_data_root(), [this] {
+      app_context().CallInUIThreadDeferred([this] {
+        if (runtime() && runtime()->kernel_state()) {
+          runtime()->kernel_state()->TerminateTitle();
+        }
+        // Mirror ReXApp::OnClosing's hard-exit tail (SDK src/ui/rex_app.cpp)
+        // instead of QuitFromUIThread(): normal subsystem teardown can
+        // deadlock on a host lock still held by a straggler guest thread that
+        // TerminateTitle's cooperative drain deliberately leaves running.
+        // ge_bench_exit exists so an on-device run can quit itself
+        // unattended -- QuitFromUIThread() alone does not guarantee that.
+        if (runtime() && runtime()->graphics_system()) {
+          runtime()->graphics_system()->PersistCaches();
+        }
+        rex::FlushLogging();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::_Exit(0);
+      });
+    });
     return ge::RunStartupAssetCheck(game_data_root(), user_data_root(),
                                     app_context());
   }
 
  private:
+  // Apply "name=value" cvar overrides from a text file, if one exists.
+  //
+  // Android reads no config file and takes no CLI, so cvars are otherwise
+  // hardcoded in OnConfigurePaths below -- and init-only cvars like
+  // render_target_path_vulkan then cost a full rebuild + reinstall to change.
+  // This lets `adb push` swap a config between runs instead. Applied last so it
+  // beats the hardcoded defaults; on desktop, CLI flags still win as usual.
+  //
+  // Format: one name=value per line. '#' starts a comment. Blank lines and
+  // lines without '=' are skipped. Unknown cvar names are logged and ignored.
+  static void ApplyCvarOverrides(const std::filesystem::path& file) {
+    std::error_code ec;
+    if (!std::filesystem::exists(file, ec) || ec) {
+      // Logged (not silent): a wrong path or a failed `adb push` would
+      // otherwise be indistinguishable from "feature not built in", and the
+      // Phase-0 protocol's own recovery instructions tell the operator to
+      // read the resolved path back out of a GECVAR line -- which this early
+      // return would otherwise suppress entirely.
+      REXKRNL_INFO("GECVAR no override file at {} (0 overrides)", file.string());
+      return;
+    }
+    std::ifstream in(file);
+    if (!in) {
+      REXKRNL_WARN("GECVAR override file exists but could not be opened: {}", file.string());
+      return;
+    }
+    auto trim = [](std::string& s) {
+      const char* ws = " \t\r\n";
+      const auto b = s.find_first_not_of(ws);
+      if (b == std::string::npos) {
+        s.clear();
+        return;
+      }
+      s = s.substr(b, s.find_last_not_of(ws) - b + 1);
+    };
+    std::string line;
+    int applied = 0;
+    while (std::getline(in, line)) {
+      const auto hash = line.find('#');
+      if (hash != std::string::npos) {
+        line.erase(hash);
+      }
+      const auto eq = line.find('=');
+      if (eq == std::string::npos) {
+        continue;
+      }
+      std::string name = line.substr(0, eq);
+      std::string value = line.substr(eq + 1);
+      trim(name);
+      trim(value);
+      if (name.empty()) {
+        continue;
+      }
+      if (rex::cvar::SetFlagByName(name, value)) {
+        REXKRNL_INFO("GECVAR override applied: {}={}", name, value);
+        ++applied;
+      } else {
+        REXKRNL_WARN("GECVAR override rejected (unknown cvar or bad value): {}={}", name, value);
+      }
+    }
+    REXKRNL_INFO("GECVAR applied {} override(s) from {}", applied, file.string());
+  }
+
   // Create/destroy the passive overlays to match their cvars. An ImGuiDialog's
   // existence is what registers the ImGui drawer with the presenter, and ANY
   // registered UI drawer forces presents onto the UI thread
