@@ -75,7 +75,11 @@ public class GoldenEyeActivity extends NativeActivity {
     // A healthy boot creates its swapchain ~2s after launch and reaches a live
     // render (rendered#65) within ~5s; this window leaves a wide margin (incl. a
     // cold shader cache on first run) while keeping failed-boot retries quick.
-    private static final int BOOT_WATCHDOG_MS = 16000;
+    // 45s, not 16s: on an Ayn Thor a cold boot spends ~10s in Vulkan pipeline
+    // creation alone (211 pipelines) and first render lands around 25s. The old
+    // 16s budget killed every attempt, burned all MAX_BOOT_ATTEMPTS and left the
+    // app dead, even though the guest was booting normally.
+    private static final int BOOT_WATCHDOG_MS = 45000;
     private static final int POLL_MS = 2000;
     private static final int MAX_BOOT_ATTEMPTS = 10;
     private static final String ATTEMPT_EXTRA = "ge_boot_attempt";
