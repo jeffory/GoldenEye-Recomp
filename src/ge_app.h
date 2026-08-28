@@ -31,6 +31,7 @@
 #include "ge_menu.h"
 #include "ge_asset_check.h"
 #include "ge_postfx.h"
+#include "ge_input_map.h"
 #include "ge_replay.h"
 #include "ge_touchpad.h"
 
@@ -172,6 +173,14 @@ class GeApp : public rex::ReXApp {
     if (window()) window()->SetTitle("GoldenEye");
     rex::ui::RegisterBind("bind_pause_menu", "Escape", "Pause menu",
                           [this] { TogglePauseMenu(); });
+    // Controller route into the same menu. This is the only way in on Android:
+    // there is no keyboard for the ESC bind above, and the platform layer
+    // routes every input event to the gamepad driver, so touch never reaches
+    // ImGui either. Fires on the guest input thread -- hop to the UI thread,
+    // where the dialog list lives.
+    ge::inputmap::SetMenuChordCallback([this] {
+      app_context().CallInUIThreadDeferred([this] { TogglePauseMenu(); });
+    });
     ge::InitMouseLook();  // attach the cross-platform mouse/keyboard look listener
     drawer_ = drawer;
     UpdateOverlayRegistration();  // overlays exist only while their cvar is on
@@ -197,6 +206,8 @@ class GeApp : public rex::ReXApp {
 
   // Tear down the menu, overlay and keybind before the drawer is destroyed.
   void OnShutdown() override {
+    ge::inputmap::SetMenuChordCallback(nullptr);
+    ge::inputmap::SetGuestInputSuppressed(false);
     rex::ui::UnregisterBind("bind_pause_menu");
     rex::ui::UnregisterBind("bind_fps_reset");
     fps_overlay_.reset();
@@ -217,6 +228,10 @@ class GeApp : public rex::ReXApp {
   // produces a clear error (instead of the guest faulting on the first file it
   // actually needs). Returning false vetoes the guest launch.
   bool OnPreLaunchModule() override {
+    // Compile the gamepad remap before the first poll: ReplayOnGetState applies
+    // it, so it has to be live by the time that override is armed below.
+    ge::inputmap::Init();
+
     // Install the input record/replay/bench harness before the guest starts
     // polling gamepad state. quit_requester mirrors the pause menu's on_quit
     // (TogglePauseMenu(), below) deferred to the UI thread -- this can be
@@ -377,6 +392,10 @@ class GeApp : public rex::ReXApp {
 
   // ESC handler: open or close the menu. The game keeps running underneath.
   void TogglePauseMenu() {
+    // Logged because on Android the controller chord is the only way in, and a
+    // silent no-op here is indistinguishable from the chord never firing.
+    REXKRNL_INFO("GEMENU toggle: {} (drawer={})", menu_ ? "closing" : "opening",
+                 imgui_drawer() ? "yes" : "null");
     if (menu_) {
       menu_->RequestClose();  // on_closed clears menu_
       return;
@@ -385,6 +404,7 @@ class GeApp : public rex::ReXApp {
     cb.on_closed = [this] {
       menu_ = nullptr;
       ge::SetMouselookSuppressed(false);  // re-enable mouse-look on menu close
+      ge::inputmap::SetGuestInputSuppressed(false);
     };
     cb.on_quit = [this] {
       if (runtime() && runtime()->kernel_state()) {
@@ -437,6 +457,9 @@ class GeApp : public rex::ReXApp {
       });
     };
     ge::SetMouselookSuppressed(true);  // freeze mouse-look + free the cursor while the menu is up
+    // The menu is driven with the same controller the game is reading, so the
+    // game must stop seeing it -- otherwise navigating the menu also plays.
+    ge::inputmap::SetGuestInputSuppressed(true);
     menu_ = new GeMenuDialog(imgui_drawer(), std::move(cb));
   }
 

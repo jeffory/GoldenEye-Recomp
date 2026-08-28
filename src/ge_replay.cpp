@@ -44,6 +44,7 @@
 #include <rex/input/input_system.h>
 
 #include "ge_hooks.h"
+#include "ge_input_map.h"
 
 REXCVAR_DEFINE_STRING(ge_replay_record, "", "GE",
                       "Record guest gamepad input to this file (starts at level entry)");
@@ -639,6 +640,18 @@ void ProbeOnPoll() {
 }
 
 bool ReplayOnGetState(uint32_t user_index, rex::input::X_INPUT_STATE* state) {
+  // Controller remap, ahead of everything else in this function and ahead of
+  // the user_index gate (every connected pad gets the same layout). From here
+  // down -- recorder, player, and the guest itself -- input is in guest-button
+  // space. ge_input_map.h explains why this is the only correct place for it;
+  // in short, the synthetic input ge_inject_keyboard ORs into GE_PAD0 later
+  // (touch overlay, ge_key_* binds, the weapon walker's BTN_Y) is already
+  // guest-space and must not be remapped again.
+  //
+  // InputSystem::GetState keeps whatever this writes into `state` regardless of
+  // the value returned, so mutating and then returning false is intentional.
+  ge::inputmap::ApplyLive(user_index, state->gamepad);
+
   if (user_index != 0) {
     return false;
   }

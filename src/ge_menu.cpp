@@ -167,7 +167,16 @@ int ImGuiKeyToVk(ImGuiKey k) {
 GeMenuDialog::GeMenuDialog(rex::ui::ImGuiDrawer* drawer, Callbacks callbacks)
     : rex::ui::ImGuiDialog(drawer), callbacks_(std::move(callbacks)) {}
 
-GeMenuDialog::~GeMenuDialog() = default;
+GeMenuDialog::~GeMenuDialog() {
+  // Hand the nav flags back exactly as found: nothing else in the app feeds
+  // gamepad keys, so leaving NavEnableGamepad on would strand a nav highlight
+  // with no way to move it.
+  if (pad_nav_enabled_ && ImGui::GetCurrentContext()) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+    io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+  }
+}
 
 void GeMenuDialog::RequestClose() { Close(); }
 
@@ -185,13 +194,18 @@ void GeMenuDialog::OnDraw(ImGuiIO& io) {
 
   const ImVec2 disp = io.DisplaySize;
 
-  // --- Centered portrait panel (folder body + right-edge tab strip) ---
-  const float folder_h = std::floor(disp.y * 0.82f);
-  const float folder_w = std::floor(folder_h * 0.72f);  // portrait: taller than wide
-  tab_w_ = std::floor(folder_w * 0.13f);
-  const float total_w = folder_w + tab_w_;
-  const ImVec2 origin(std::floor((disp.x - total_w) * 0.5f),
-                      std::floor((disp.y - folder_h) * 0.5f));
+  // --- Full-screen panel (folder body + right-edge tab strip) ---
+  // Fills the display rather than sitting as a small portrait folder in the
+  // middle: on a handheld the old panel left most of the screen unusable and
+  // made every control a small touch target.
+  const float margin = std::floor(std::min(disp.x, disp.y) * 0.025f);
+  const float total_w = std::floor(disp.x - margin * 2.0f);
+  const float folder_h = std::floor(disp.y - margin * 2.0f);
+  // Keep the tab strip a readable, thumb-sized column without letting it grow
+  // with the (now much wider) panel.
+  tab_w_ = std::floor(std::min(total_w * 0.085f, folder_h * 0.16f));
+  const float folder_w = total_w - tab_w_;
+  const ImVec2 origin(margin, margin);
   f0_ = origin;
   f1_ = ImVec2(origin.x + folder_w, origin.y + folder_h);
 
@@ -201,19 +215,82 @@ void GeMenuDialog::OnDraw(ImGuiIO& io) {
   ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
                            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground |
-                           ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav;
+                           ImGuiWindowFlags_NoBringToFrontOnFocus;
+  // NB: no ImGuiWindowFlags_NoNav -- gamepad nav is how this menu is driven
+  // on a handheld. Keyboard nav stays off (NavEnableKeyboard is never set),
+  // so desktop behaviour is unchanged.
   if (!ImGui::Begin("##ge_pause_menu", nullptr, flags)) {
     ImGui::End();
     ImGui::PopStyleVar();
     return;
   }
 
+  DrawPadInput(io);
   DrawFolder(io);
   DrawTabs(io);
   DrawContent(io);
 
   ImGui::End();
   ImGui::PopStyleVar();
+}
+
+// Reads the physical pad (pre-remap, published by ge::inputmap) and turns it
+// into menu input: ImGui nav keys for the widgets, bumpers for the tab strip
+// (which is hand-drawn art, not ImGui widgets, so nav can never reach it), and
+// B to close. While a rebind capture is armed the ImGui feed is cut, so the
+// button being bound cannot also press whatever the cursor is sitting on.
+void GeMenuDialog::DrawPadInput(ImGuiIO& io) {
+  using ge::inputmap::Source;
+
+  if (!pad_nav_enabled_) {
+    pad_nav_enabled_ = true;
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+  }
+
+  const ge::inputmap::Snapshot pad = ge::inputmap::LastPhysical();
+
+  // Edge-detect a deliberate press: held now, not held on the previous poll.
+  // A single sample is not enough -- the press that opened this menu, or that
+  // armed a capture, is still down on the frame after.
+  const ge::inputmap::Source held = ge::inputmap::HeldSource(pad);
+  const ge::inputmap::Source held_before = ge::inputmap::HeldSource(pad_prev_);
+  pad_pressed_ = (held != Source::kNone && held != held_before) ? held : Source::kNone;
+
+  auto down = [&pad](uint16_t bit) { return (pad.buttons & bit) != 0; };
+  const bool capturing = (pad_rebinding_ >= 0);
+
+  if (!capturing) {
+    // Only the nav keys are fed. The bumpers are handled below instead of
+    // being passed through as GamepadL1/R1, which ImGui would spend on
+    // window focus cycling.
+    io.AddKeyEvent(ImGuiKey_GamepadDpadUp, down(rex::input::X_INPUT_GAMEPAD_DPAD_UP));
+    io.AddKeyEvent(ImGuiKey_GamepadDpadDown, down(rex::input::X_INPUT_GAMEPAD_DPAD_DOWN));
+    io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, down(rex::input::X_INPUT_GAMEPAD_DPAD_LEFT));
+    io.AddKeyEvent(ImGuiKey_GamepadDpadRight, down(rex::input::X_INPUT_GAMEPAD_DPAD_RIGHT));
+    io.AddKeyEvent(ImGuiKey_GamepadFaceDown, down(rex::input::X_INPUT_GAMEPAD_A));
+    io.AddKeyEvent(ImGuiKey_GamepadFaceRight, down(rex::input::X_INPUT_GAMEPAD_B));
+
+    // Bumpers page through the tabs.
+    if (pad_pressed_ == Source::kLB)
+      selected_tab_ = (selected_tab_ + kTabCount - 1) % kTabCount;
+    else if (pad_pressed_ == Source::kRB)
+      selected_tab_ = (selected_tab_ + 1) % kTabCount;
+
+    // B closes -- but not while a widget is mid-edit, where ImGui is already
+    // using it to cancel that edit.
+    if (pad_pressed_ == Source::kB && !ImGui::IsAnyItemActive()) RequestClose();
+  } else {
+    // Release every nav key while capturing, so a key does not stay latched
+    // down across the capture.
+    for (ImGuiKey key : {ImGuiKey_GamepadDpadUp, ImGuiKey_GamepadDpadDown,
+                         ImGuiKey_GamepadDpadLeft, ImGuiKey_GamepadDpadRight,
+                         ImGuiKey_GamepadFaceDown, ImGuiKey_GamepadFaceRight}) {
+      io.AddKeyEvent(key, false);
+    }
+  }
+
+  pad_prev_ = pad;
 }
 
 void GeMenuDialog::DrawFolder(ImGuiIO& /*io*/) {
@@ -772,6 +849,70 @@ void GeMenuDialog::DrawContent(ImGuiIO& /*io*/) {
           }
         }
       }
+
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::Spacing();
+
+      // --- Controller remap (ge_input_map) -------------------------------
+      // Each row names a control the *game* sees and shows which physical
+      // button currently drives it, so "Right Trigger <- RB" reads as "the
+      // game's trigger fires when I press RB". Labels stay in Xbox terms
+      // rather than actions ("Fire") because GoldenEye's own Controls menu
+      // decides which action each Xbox button performs.
+      ImGui::TextColored(ImColor(kTitle), "REBIND CONTROLLER");
+      ImGui::TextColored(ImColor(kInkDim),
+                         "(pick a control, then press the button you want for it -- the two swap)");
+      ImGui::Spacing();
+
+      for (size_t i = 0; i < ge::inputmap::kDestCount; ++i) {
+        const auto dest = static_cast<ge::inputmap::Dest>(i);
+        const char* cvar = ge::inputmap::DestCvar(dest);
+        const bool capturing = (pad_rebinding_ == static_cast<int>(i));
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(ge::inputmap::DestLabel(dest));
+        ImGui::SameLine(label_x);
+
+        std::string cur = capturing ? "press a button..." : rex::cvar::GetFlagByName(cvar);
+        if (cur.empty()) cur = "(unbound)";
+        ImGui::PushID(static_cast<int>(i) + 0x9AD0);
+        if (ImGui::Button(cur.c_str(), ImVec2(btn_w, 0))) {
+          pad_rebinding_ = static_cast<int>(i);
+          // Whatever is held right now (the A press that armed this) is not a
+          // binding; DrawPadInput only reports 0->1 transitions, so the next
+          // genuine press is what lands.
+          pad_pressed_ = ge::inputmap::Source::kNone;
+        }
+        ImGui::PopID();
+      }
+
+      // Complete a pending capture. Any button binds, including the one
+      // already assigned -- there is no pad-driven cancel because every
+      // button has to stay bindable. Escape backs out on desktop, and the
+      // reset below is the way out on a handheld.
+      if (pad_rebinding_ >= 0) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+          pad_rebinding_ = -1;
+        } else if (pad_pressed_ != ge::inputmap::Source::kNone) {
+          const auto dest = static_cast<ge::inputmap::Dest>(pad_rebinding_);
+          // Assign, not a bare cvar write: it swaps the button out of its old
+          // role so one press cannot drive two guest controls.
+          ge::inputmap::Assign(dest, pad_pressed_);
+          if (callbacks_.persist_config) callbacks_.persist_config();
+          pad_rebinding_ = -1;
+        }
+      }
+
+      ImGui::Spacing();
+      if (ImGui::Button("Reset controller to defaults", ImVec2(btn_w * 1.6f, 0))) {
+        for (size_t i = 0; i < ge::inputmap::kDestCount; ++i) {
+          rex::cvar::ResetToDefault(ge::inputmap::DestCvar(static_cast<ge::inputmap::Dest>(i)));
+        }
+        pad_rebinding_ = -1;
+        if (callbacks_.persist_config) callbacks_.persist_config();
+      }
+      ImGui::TextColored(ImColor(kInkDim), "(this menu: bumpers change tab, B closes)");
       break;
     }
     case 3: {  // ONLINE

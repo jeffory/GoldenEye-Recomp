@@ -10,6 +10,8 @@
 
 #include <rex/ui/imgui_dialog.h>
 
+#include "ge_input_map.h"
+
 #include <imgui.h>
 
 #include <functional>
@@ -80,6 +82,16 @@ class GeMenuDialog : public rex::ui::ImGuiDialog {
   // and a one-frame guard so the click that starts a rebind isn't itself bound.
   const char* rebinding_cvar_ = nullptr;
   int rebind_skip_ = 0;
+
+  // Controller driving (DrawPadInput). On a handheld this menu has no other
+  // input device: there is no keyboard for ESC and Android never routes touch
+  // to ImGui, so the pad has to open it, move through it, and rebind itself.
+  void DrawPadInput(ImGuiIO& io);
+  ge::inputmap::Snapshot pad_prev_{};              // previous poll, for edge detection
+  ge::inputmap::Source pad_pressed_ =              // newly pressed this frame
+      ge::inputmap::Source::kNone;
+  int pad_rebinding_ = -1;                         // Dest index being captured, -1 = none
+  bool pad_nav_enabled_ = false;                   // did we set the ImGui nav flags?
 
   // Placeholder audio state (engine wiring comes later).
   float vol_master_ = 0.80f;
