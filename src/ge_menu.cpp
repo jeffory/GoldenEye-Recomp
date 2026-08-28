@@ -25,10 +25,19 @@
 namespace {
 
 // --- Small cvar accessors (the menu reads/writes settings by name) ---
+// Float cvars go through the SDK's locale-independent helpers. std::atof /
+// std::to_string follow LC_NUMERIC, which gtk_init_check() switches to the
+// user's locale at startup -- on a comma-decimal locale every slider here
+// silently did nothing and corrupted ge.toml on save (see rex::cvar::
+// FormatDouble).
 float GetCvarF(const char* name) {
-  return static_cast<float>(std::atof(rex::cvar::GetFlagByName(name).c_str()));
+  double out = 0.0;
+  rex::cvar::ParseDouble(rex::cvar::GetFlagByName(name), out);
+  return static_cast<float>(out);
 }
-void SetCvarF(const char* name, float v) { rex::cvar::SetFlagByName(name, std::to_string(v)); }
+void SetCvarF(const char* name, float v) {
+  rex::cvar::SetFlagByName(name, rex::cvar::FormatDouble(v));
+}
 bool GetCvarB(const char* name) { return rex::cvar::GetFlagByName(name) == "true"; }
 void SetCvarB(const char* name, bool v) { rex::cvar::SetFlagByName(name, v ? "true" : "false"); }
 

@@ -69,13 +69,19 @@ jstring NativeTouchControlsMode(JNIEnv* env, jobject /*thiz*/) {
 jstring NativeTouchLookMode(JNIEnv* env, jobject /*thiz*/) {
   return CvarString(env, "ge_touch_look_mode");
 }
+// std::atof follows LC_NUMERIC; use the SDK's C-locale parser so these keep
+// working whoever sets the process locale (see rex::cvar::FormatDouble).
+jfloat CvarFloat(const char* name, float fallback) {
+  double out = 0.0;
+  if (!rex::cvar::ParseDouble(rex::cvar::GetFlagByName(name), out)) return fallback;
+  return static_cast<jfloat>(out);
+}
+
 jfloat NativeTouchLookSens(JNIEnv* /*env*/, jobject /*thiz*/) {
-  const std::string v = rex::cvar::GetFlagByName("ge_touch_look_sens");
-  return v.empty() ? 1.0f : static_cast<jfloat>(std::atof(v.c_str()));
+  return CvarFloat("ge_touch_look_sens", 1.0f);
 }
 jfloat NativeTouchOpacity(JNIEnv* /*env*/, jobject /*thiz*/) {
-  const std::string v = rex::cvar::GetFlagByName("ge_touch_opacity");
-  return v.empty() ? 0.5f : static_cast<jfloat>(std::atof(v.c_str()));
+  return CvarFloat("ge_touch_opacity", 0.5f);
 }
 
 // --- Weapon grid (optional in-overlay menu) -------------------------------

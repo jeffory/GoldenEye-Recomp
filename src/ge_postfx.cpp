@@ -65,7 +65,9 @@ const Preset kPresets[] = {
 };
 constexpr int kPresetCount = static_cast<int>(sizeof(kPresets) / sizeof(kPresets[0]));
 
-void SetD(const char* name, float v) { rex::cvar::SetFlagByName(name, std::to_string(v)); }
+// Locale-independent (see rex::cvar::FormatDouble) -- std::to_string would
+// write "0,500000" once GTK has set a comma-decimal LC_NUMERIC.
+void SetD(const char* name, float v) { rex::cvar::SetFlagByName(name, rex::cvar::FormatDouble(v)); }
 
 }  // namespace
 
