@@ -36,15 +36,116 @@ the game runs as a real native executable.
 
 Grab the latest prebuilt release from the **[Releases](../../releases)** page
 (**Windows x64**, **Linux x86-64**, and an experimental **Android arm64-v8a**
-APK are attached), then drop your own GoldenEye 007 game files into the `assets/`
-folder next to the binary. Run `ge.exe` on Windows or `./ge` on Linux; on Android
-install the (debug-signed) APK.
+APK are attached), then supply your own GoldenEye 007 game files —
+see **[Game files: what to supply and where](#game-files-what-to-supply-and-where)**.
+Run `ge.exe` on Windows or `./run.sh` on Linux; on Android install the
+(debug-signed) APK.
 
 - 🎮 **Want to play online?** Someone needs to run a server. Download it here →
   **[GoldenEye-Recomp-Server](https://github.com/SunJaycy/GoldenEye-Recomp-Server)**
 - 🛠️ **Want to modify the engine / recompiler?** It's built on a modified ReXGlue
   SDK (with the Linux + Android port) →
   **[GoldenEye-Recomp-rexglue](https://github.com/jeffory/GoldenEye-Recomp-rexglue)**
+
+## Game files: what to supply and where
+
+Neither this repository nor any release contains game data. You supply your own
+**GoldenEye 007 (Xbox 360 / XBLA)** dump. The port reads it from a single folder
+— the **game data root** — and expects the dump's original layout, unchanged:
+
+```
+<game data root>/
+├── default.xex                          ← the executable the recomp was built from
+├── music.xgs   music.xsb   music.xwb    ← XACT music banks
+├── sfx.xgs     sfx.xsb     sfx.xwb      ← XACT sound banks
+└── files/
+    ├── loc/        english/…
+    ├── misc/
+    ├── new/        background, char, gun, head, prop, skydome, texture
+    ├── original/   background, char, gun, head, prop
+    └── texture/
+```
+
+That's **1,800 required files, ~700 MB**. If your dump unpacked into a folder
+named something like `GoldenEye 007 XBLA`, copy the **contents** of that folder
+into the game data root — not the folder itself. Don't rename or flatten
+anything; the guest looks these paths up by name (case-insensitively).
+
+### Windows and Linux
+
+The game data root defaults to an **`assets/` folder next to the executable**:
+
+```
+GoldenEye-Recomp/
+├── ge.exe                 (Windows)
+├── ge  run.sh  *.so       (Linux release bundle)
+└── assets/
+    ├── default.xex
+    ├── music.xwb   sfx.xwb   …
+    └── files/…
+```
+
+To keep the dump elsewhere, point the game at it instead:
+
+```sh
+./ge --game_data_root=/path/to/goldeneye-xbla        # any platform
+ge.exe --game_data_root=D:\Games\goldeneye-xbla      # Windows
+GE_GAME_DATA=/path/to/goldeneye-xbla ./run.sh        # Linux release bundle
+```
+
+### Android
+
+No PC required. The app asks where your dump is the first time it runs:
+
+1. Copy the dump anywhere on the device with any file manager — e.g. an
+   `Internal storage/GoldenEye` folder. It does **not** have to go into
+   `Android/data`.
+2. Launch **GoldenEye 007**, tap **Select game folder**, and grant
+   **All files access** when Android asks for it.
+3. Pick the folder that holds `default.xex`. (Picking its parent works too, as
+   long as only one folder inside looks like a dump.)
+
+The dump is then read **in place** — nothing is copied, so leave the folder
+where it is and keep the ~700 MB free rather than spending it twice. Your
+choice is remembered in
+`Android/data/com.sunjaycy.goldeneye/files/user/ge_game_path.txt`; delete that
+file, or move the folder, to be asked again.
+
+> [!NOTE]
+> The **All files access** permission (`MANAGE_EXTERNAL_STORAGE`) is needed
+> because the game reads the dump with ordinary file calls from native code,
+> which the folder picker's own temporary access doesn't cover. It is only ever
+> used to read the folder you selected.
+
+**Prefer to use a PC?** Stage the dump in the app's own external data directory
+instead — that needs no permission at all, and the app uses it automatically
+whenever no folder has been picked:
+
+```sh
+adb push <dump>/. /sdcard/Android/data/com.sunjaycy.goldeneye/files/
+```
+
+```
+/sdcard/Android/data/com.sunjaycy.goldeneye/files/
+├── default.xex
+├── music.xwb   sfx.xwb   …
+└── files/…              ← yes: a "files" folder inside "files"
+```
+
+### If files are missing
+
+The port verifies the whole manifest before it boots, so a bad install fails
+with a list instead of a crash somewhere in the game:
+
+- **Desktop** — an error dialog naming the first few missing files.
+- **Android** — the loading screen turns into an error screen naming them, and
+  reopening the app returns you to the folder picker so you can select a
+  complete dump.
+
+The complete list is written to `ge_missing_files.txt` in the user data folder
+(`Android/data/com.sunjaycy.goldeneye/files/user/` on Android). If you're
+deliberately running a non-canonical dump, `--no-ge_fatal_on_missing_file`
+downgrades the check to a warning and launches anyway.
 
 ## Playing online
 
@@ -91,7 +192,9 @@ you need the recompiler toolchain and your own copy of the game.
   checkout that provides the `rexglue` CLI + runtime. The build points at it via
   `-DREXSDK_DIR=/path/to/GoldenEye-Recomp-rexglue`.
 - **CMake 3.25+**, a **C++23 Clang** toolchain, and **Python 3** (used by codegen).
-- Your own **GoldenEye 007 XBLA game files**, placed in `assets/`.
+- Your own **GoldenEye 007 XBLA game files**, placed in `assets/`
+  ([layout](#game-files-what-to-supply-and-where)). Codegen reads
+  `assets/default.xex` from there.
 
 Every build starts with the same codegen step, run once from the repo root. It
 turns *your* game copy into recompiled C++ under `generated/`:
