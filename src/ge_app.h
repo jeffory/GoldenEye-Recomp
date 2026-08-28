@@ -111,6 +111,24 @@ class GeApp : public rex::ReXApp {
     // applied before the gate and are unaffected. Re-enable here once the port
     // has had a Thor pass (or gate it on real mouse motion instead).
     rex::cvar::SetFlagByName("ge_mouselook_enable", "false");
+    // Game data root chosen on-device by GameSetupActivity (issue #16).
+    //
+    // Android 11+ stops ordinary file managers writing into
+    // Android/data/<pkg>/files, so staging the ~700 MB dump there needs a PC
+    // (adb push) or root. Instead the Java setup activity takes "All files
+    // access" (MANAGE_EXTERNAL_STORAGE) plus a folder picker and records the
+    // chosen directory here; we point the guest VFS straight at it, so the dump
+    // is read in place with no second copy.
+    //
+    // Only game_data_root moves. log_file / cache_path / user_data_root are
+    // separate cvars set by android_main and must stay in app-private storage
+    // (they have to be writable, and the chosen folder may not be).
+    //
+    // No logging in this function: it runs before rex::InitLogging(), so
+    // REXKRNL_* here is swallowed by the early stdout-only logger and never
+    // reaches ge.log (see OnPostInitLogging). The outcome is stashed and logged
+    // there instead.
+    android_game_root_note_ = ApplyChosenGameRoot(paths);
 #endif
     // NOTE: fullscreen is NOT forced here. Its default is set to true at the
     // framework level (window.cpp) instead. That makes "windowed" the
@@ -134,6 +152,12 @@ class GeApp : public rex::ReXApp {
   // none) -- it is populated from the same path_config right after
   // OnConfigurePaths returns, so it holds the identical value.
   void OnPostInitLogging() override {
+#if defined(__ANDROID__)
+    // Deferred from OnConfigurePaths (which runs before logging exists).
+    if (!android_game_root_note_.empty()) {
+      REXKRNL_INFO("GEGAMEROOT {}", android_game_root_note_);
+    }
+#endif
     // Last, so a pushed file can override every default set in
     // OnConfigurePaths above. See ApplyCvarOverrides for why this exists.
     ApplyCvarOverrides(user_data_root() / "ge_cvars.txt");
@@ -221,6 +245,56 @@ class GeApp : public rex::ReXApp {
   }
 
  private:
+#if defined(__ANDROID__)
+  // Point paths.game_data_root at the folder GameSetupActivity recorded in
+  // <user_data_root>/ge_game_path.txt (one line, an absolute host path).
+  //
+  // Returns a short human-readable note describing what happened, for
+  // OnPostInitLogging to emit -- this runs before logging is initialised.
+  //
+  // Absent file / unreadable folder => leave the default (the app's external
+  // files dir) alone, so installs staged there by adb keep booting untouched
+  // and a stale entry degrades to the old behaviour instead of a hard failure.
+  static std::string ApplyChosenGameRoot(rex::PathConfig& paths) {
+    if (paths.user_data_root.empty()) {
+      return "no user_data_root; keeping default game data root";
+    }
+    const auto file = paths.user_data_root / "ge_game_path.txt";
+    std::error_code ec;
+    if (!std::filesystem::exists(file, ec) || ec) {
+      return "no " + file.string() + "; using default " + paths.game_data_root.string();
+    }
+    std::ifstream in(file);
+    if (!in) {
+      return "could not open " + file.string() + "; using default " +
+             paths.game_data_root.string();
+    }
+    std::string chosen;
+    std::getline(in, chosen);
+    // Trim whitespace/newlines a text editor or `adb push` may have left.
+    const char* ws = " \t\r\n";
+    const auto b = chosen.find_first_not_of(ws);
+    if (b == std::string::npos) {
+      return "empty " + file.string() + "; using default " + paths.game_data_root.string();
+    }
+    chosen = chosen.substr(b, chosen.find_last_not_of(ws) - b + 1);
+
+    // Must be a readable directory NOW. Storage the picker could reach can
+    // disappear (SD card pulled, permission revoked in Settings); falling back
+    // keeps the boot path identical to a fresh install, and the startup asset
+    // check then produces the normal "missing files" screen.
+    if (!std::filesystem::is_directory(chosen, ec) || ec) {
+      return "chosen game data root is not a readable directory: " + chosen +
+             "; using default " + paths.game_data_root.string();
+    }
+    paths.game_data_root = chosen;
+    return "using chosen game data root " + chosen;
+  }
+
+  // Outcome of the above, logged from OnPostInitLogging.
+  std::string android_game_root_note_;
+#endif
+
   // Apply "name=value" cvar overrides from a text file, if one exists.
   //
   // Android reads no config file and takes no CLI, so cvars are otherwise

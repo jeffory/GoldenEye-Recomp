@@ -328,8 +328,8 @@ public class GoldenEyeActivity extends NativeActivity {
             while ((line = r.readLine()) != null) {
                 if (line.contains("Entrypoint XEX not found")) {
                     return "Game files not found (default.xex is missing).\n\n"
-                         + "Copy the complete GoldenEye 007 game dump into\n"
-                         + "Android/data/" + getPackageName() + "/files";
+                         + "Close and reopen the app to select the folder your\n"
+                         + "GoldenEye 007 dump is in.";
                 }
                 int idx = line.indexOf("GEMISSING total=");
                 if (idx >= 0) {
@@ -360,8 +360,10 @@ public class GoldenEyeActivity extends NativeActivity {
         if (total > listed) {
             msg.append("\n...and ").append(total - listed).append(" more");
         }
-        msg.append("\n\nCopy the complete GoldenEye 007 game dump into\n")
-           .append("Android/data/").append(getPackageName()).append("/files\n")
+        // Reopening lands on GameSetupActivity, not here: the native check left
+        // ge_missing_files.txt behind, which that screen treats as "the last
+        // launch was rejected" and offers the folder picker again.
+        msg.append("\n\nClose and reopen the app to select a complete dump.\n")
            .append("(full list: files/user/ge_missing_files.txt)");
         return msg.toString();
     }

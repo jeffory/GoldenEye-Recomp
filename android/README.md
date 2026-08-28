@@ -44,5 +44,15 @@ cd android
 
 - `arm64-v8a` only (the guest reserves a 4 GiB address space).
 - Render backend is Vulkan; SDL3 (GLES/AAudio) is bundled for audio/input.
-- Game assets/XEX delivery (APK assets vs app-scoped storage) is not yet wired —
-  see `OpenAndroidContentFileDescriptor` (Phase 2 TODO) and the SDK filesystem.
+- Game data comes from one of two places, resolved identically by
+  `GameSetupActivity.resolveGameRoot()` (Java) and `GeApp::ApplyChosenGameRoot`
+  (`src/ge_app.h`) — keep the two in step:
+  1. the folder recorded in `files/user/ge_game_path.txt` by the first-run
+     setup screen (`GameSetupActivity`, the launcher entry), read in place via
+     `MANAGE_EXTERNAL_STORAGE`; or
+  2. the app's external files dir, when no folder has been picked — the
+     `adb push` route, and the default `android_main` passes as
+     `--game_data_root`.
+
+  Only `game_data_root` moves; `log_file` / `cache_path` / `user_data_root`
+  stay in app-private storage because they must be writable.

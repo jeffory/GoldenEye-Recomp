@@ -101,6 +101,14 @@ bool RunStartupAssetCheck(const std::filesystem::path& game_root,
   if (missing.empty()) {
     REXLOG_INFO("Asset check OK: all {} required files present ({} ms)",
                 std::size(kGeRequiredAssets), ms);
+    // Clear any report left by an earlier failed boot. Beyond not leaving a
+    // misleading file around, its presence is a signal: Android's
+    // GameSetupActivity treats it as "the last launch was rejected for
+    // incomplete data" and shows the folder picker instead of forwarding
+    // straight into the game, which is the only way back out of the native
+    // error screen (that overlay is non-focusable and cannot host a button).
+    std::error_code rm_ec;
+    std::filesystem::remove(user_root / "ge_missing_files.txt", rm_ec);
     return true;
   }
 

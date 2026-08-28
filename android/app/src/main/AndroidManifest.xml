@@ -17,6 +17,24 @@
     <!-- Controllers are the intended input; optional so the app still installs. -->
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
 
+    <!--
+      Storage access for the on-device game-data setup (GameSetupActivity, issue
+      #16). The ~700 MB dump is read IN PLACE from wherever the user keeps it, by
+      ordinary POSIX calls from native code (the guest VFS mounts a host path),
+      so SAF alone is not enough: we need real filesystem access.
+
+      MANAGE_EXTERNAL_STORAGE is Play-Store-restricted; this app is sideload-only,
+      so that restriction does not apply. Users who would rather not grant it can
+      still stage the dump in Android/data/<pkg>/files with adb, which needs no
+      permission at all and is what the setup screen falls back to advising.
+
+      Android 10 (minSdk 29) gets no picker at all: MANAGE_EXTERNAL_STORAGE does
+      not exist there, requestLegacyExternalStorage is ignored above targetSdk 30,
+      and READ_EXTERNAL_STORAGE would only reach media files, never a .xex or a
+      sound bank. GameSetupActivity points those devices at adb instead.
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
     <application
         android:allowBackup="false"
         android:label="GoldenEye 007"
@@ -24,9 +42,29 @@
         android:resizeableActivity="false"
         android:hasCode="true">
 
+        <!--
+          Launcher entry: checks for game data and forwards to the game, or runs
+          the folder-picker setup. It is a plain Activity because GoldenEyeActivity
+          is a NativeActivity: it hands its window to native Vulkan
+          rendering and starts android_main from onCreate, so it cannot host
+          ordinary focusable Views.
+        -->
+        <activity
+            android:name="com.sunjaycy.goldeneye.GameSetupActivity"
+            android:exported="true"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|density|navigation|uiMode|smallestScreenSize"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@style/GeTheme">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name="com.sunjaycy.goldeneye.GoldenEyeActivity"
-            android:exported="true"
+            android:exported="false"
             android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|density|navigation|uiMode|smallestScreenSize"
             android:launchMode="singleTask"
             android:resizeableActivity="false"
@@ -34,11 +72,6 @@
             android:theme="@style/GeTheme">
 
             <meta-data android:name="android.app.lib_name" android:value="ge" />
-
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
         </activity>
     </application>
 </manifest>
